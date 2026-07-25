@@ -373,6 +373,30 @@ def _await_denied_sni(project: str, name: str, timeout: float = 20.0) -> bool:
     return False
 
 
+def _sni_log_diagnostics(project: str) -> str:
+    """What the proxy actually has, for when the polling above comes up empty.
+
+    A bare "never logged" says the entry is missing without saying whether the
+    file is empty, absent, or full of lines in a shape denied_names does not
+    recognise — three different bugs.
+    """
+    from abox import proxy
+
+    container = proxy.proxy_container(project)
+    state = dockerx.container_state(container)
+    parts = [f"container={container} running={state.running}"]
+    for cmd in (
+        ["ls", "-la", "/var/log/nginx"],
+        ["cat", "/var/log/nginx/sni.log"],
+        ["cat", "/var/log/nginx/error.log"],
+    ):
+        r = dockerx.docker("exec", container, *cmd, timeout=30)
+        body = (r.stdout or r.stderr).strip() or "(empty)"
+        parts.append(f"$ {' '.join(cmd)}\n{body[:1200]}")
+    parts.append(f"docker logs:\n{dockerx.logs(container, tail=20)[-800:]}")
+    return "\n\n".join(parts)
+
+
 def test_domain_fronting_is_refused(sni_agent) -> None:
     """The finding this whole component exists for: an allowed *address* with a
     forged server name must not get through. An ipset cannot tell these apart."""
@@ -385,7 +409,11 @@ def test_domain_fronting_is_refused(sni_agent) -> None:
     )
     assert not forged.ok
     # And the attempt is recorded with the name that was attempted.
-    assert _await_denied_sni("snitest", "pypi.org"), "refused, but never logged"
+    if not _await_denied_sni("snitest", "pypi.org"):
+        raise AssertionError(
+            "the fronting attempt was refused but never reached the review "
+            f"queue:\n\n{_sni_log_diagnostics('snitest')}"
+        )
 
 
 def test_no_sni_connection_is_refused(sni_agent) -> None:
