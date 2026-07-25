@@ -46,14 +46,59 @@ output, and web content — prompt injection is in scope, not an edge case. abox
 does not try to make the agent safe; it limits the blast radius if the agent
 does something hostile, across four axes:
 
-| Axis | What abox constrains |
-|---|---|
-| **Filesystem** | what the agent can read and write on the host |
-| **Network egress** | what the agent can reach off-box |
-| **Credentials** | what secrets the agent can obtain |
-| **Execution** | what the agent can run, and as whom |
+The adversary is **whoever controls the model's output** — via an injection in a
+file the agent read, a poisoned page, a hostile tool result, or a bad day. Assume
+they can run any command the agent can run and call any tool the agent has. The
+question is not whether that happens; it is how far it gets.
 
-Everything below is in service of those four. When a feature weakens one of
+### In scope — what that adversary cannot do
+
+| Axis | Cannot |
+|---|---|
+| **Filesystem** | read masked paths, write outside the workspace and its own containers, or modify the artifacts that define its sandbox |
+| **Network egress** | reach a host that is not allowlisted, resolve a name that is not allowlisted, or reach a *different* host at an allowed address (with the SNI proxy on) |
+| **Credentials** | obtain a secret abox did not explicitly attach, or reach the Docker daemon from its own container |
+| **Execution** | become root, keep anything running after the container exits, or open a port anything can connect to |
+
+Every one of those is enforced and mechanically checked — §4 names the `abox
+doctor` check per row, and [SECURITY.md](https://github.com/tr0mb1r/abox/blob/main/SECURITY.md)
+names the test per row.
+
+### Out of scope — non-goals
+
+- **Preventing prompt injection.** abox assumes it succeeds. Nothing here makes
+  the agent harder to manipulate; it limits what a manipulated agent reaches.
+  Treating injection as an edge case to be filtered out is how sandboxes end up
+  defending a boundary that was never the real one.
+- **Host compromise via Docker Desktop itself.** A container escape, a daemon
+  vulnerability, or a hostile Docker Desktop update is outside what a CLI that
+  drives that daemon can defend against.
+- **Malicious packages from allowlisted registries.** Allowlisting `pypi.org`
+  means the agent can install anything on PyPI, and it runs with the agent's
+  privileges inside the sandbox. Pinning images does not pin what a build pulls.
+- **Protecting the workspace from the agent.** `/workspace` is a read-write bind
+  of your real files, deliberately. If you want the agent unable to touch your
+  code, this is the wrong tool.
+- **Multi-tenancy.** One person's projects on one Docker host. abox does not try
+  to isolate you from yourself.
+
+### Residual risks
+
+Known, unfixed, and enumerated here so a skeptical reader does not have to
+reconstruct them from asides scattered through sixteen sections. `abox doctor`
+states each on every run.
+
+| Risk | Why it stands | Where |
+|---|---|---|
+| **MCP tool egress bypass** | server containers are not the agent, so they are outside the firewall, the SNI proxy and the scoped resolver at once | §7.0 |
+| **The gateway is trusted code** | the agent holds a bearer token for a container that mounts `docker.sock`; one parsing bug there is root-equivalent | §4 |
+| **The agent holds a Claude credential** | the `~/.claude` volume is readable by it and exfiltrable to any allowed domain; there is no opting out | §8 |
+| **`/workspace` is live** | files written there execute elsewhere later — CI, `make`, `npm install`, an editor | §6 |
+| **Attached secrets** | `secrets attach` hands the agent a value it can read and transmit | §8 |
+| **The SNI proxy answers the whole bridge** | any container without the agent firewall can relay through it to that project's allowlist | §9 |
+| **Shared CDN addresses** | ipset mode matches IPs, so one allowlisted domain allows everything else at those addresses; the SNI proxy closes it | §9 |
+
+Everything below is in service of the four axes. When a feature weakens one of
 them, abox says so on every run rather than hiding it.
 
 ---

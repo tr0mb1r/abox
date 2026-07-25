@@ -8,6 +8,59 @@ including whatever arrives through files, tool output, and web content, so the
 controls here limit blast radius on four axes: **filesystem**, **network
 egress**, **credentials**, and **execution**.
 
+## Threat model
+
+The adversary is **whoever controls the model's output** — through a prompt
+injection in a file the agent read, a poisoned web page, a hostile tool result,
+or a bad day. They are assumed to be able to run any command the agent can run
+and call any tool the agent has. The question abox answers is not *whether* that
+happens but *how far it gets*.
+
+### In scope — what that adversary cannot do
+
+| Axis | Cannot |
+|---|---|
+| **Filesystem** | read masked paths, write outside the workspace and its own containers, or modify the artifacts that define its sandbox |
+| **Network egress** | reach a host that is not allowlisted, resolve a name that is not allowlisted, or reach a *different* host at an allowed address (with the SNI proxy on) |
+| **Credentials** | obtain a secret abox did not explicitly attach, or reach the Docker daemon from its own container |
+| **Execution** | become root, keep anything running after the container exits, or open a port anything can connect to |
+
+Each of those is enforced and mechanically checked — see [Enforced
+invariants](#enforced-invariants), where every row names the `abox doctor` check
+that verifies it, and [SECURITY.md](SECURITY.md), where every row names the test.
+
+### Out of scope — non-goals
+
+- **Preventing prompt injection.** abox assumes it succeeds. Nothing here makes
+  the agent harder to manipulate; it limits what a manipulated agent reaches.
+- **Host compromise via Docker Desktop itself.** A container escape, a daemon
+  vulnerability, or a hostile Docker Desktop update is outside what a CLI that
+  drives that daemon can defend against.
+- **Malicious packages from allowlisted registries.** If `pypi.org` is on the
+  allowlist, the agent can install anything on PyPI, and it runs with the
+  agent's privileges inside the sandbox. Pinning images does not pin what a
+  build pulls.
+- **Protecting the workspace from the agent.** `/workspace` is a read-write bind
+  of your real files, deliberately. If you want the agent unable to touch your
+  code, this is the wrong tool.
+- **Multi-tenancy.** One person's projects on one Docker host. abox does not try
+  to isolate you from yourself.
+
+### Residual risks
+
+Known, unfixed, and listed here rather than scattered through the document.
+`abox doctor` states each one on every run.
+
+| Risk | Why it stands |
+|---|---|
+| **MCP tool egress bypass** | Server containers are not the agent, so they sit outside the firewall, the SNI proxy and the scoped resolver at once. A tool call carrying a URL reaches that URL. `server_network: none` closes it for servers that do not need the internet; for ones that do, nothing does. [Measured.](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md) |
+| **The gateway is trusted code** | The agent holds a bearer token for a container that mounts `docker.sock`. One parsing bug in third-party gateway code is root-equivalent on the host. abox pins it by digest; it cannot audit it. |
+| **The agent holds a Claude credential** | The per-project `~/.claude` volume is readable by the agent and exfiltrable to any allowed domain. There is no opting out — without it there is no agent. `run.connectors: true` extends its reach to the account's connectors. |
+| **`/workspace` is live** | Files the agent writes there run elsewhere later — CI, `make`, `npm install`, an editor. `mounts.watch` reports changes after the fact; it does not prevent them. |
+| **Attached secrets** | `secrets attach` hands the agent a value it can read and transmit. The egress allowlist stops being defence-in-depth and becomes the boundary. |
+| **The SNI proxy answers the whole bridge** | Any container without the agent firewall — including a gateway-spawned MCP server — can relay through it to that project's allowlist. Agents cannot. [Measured.](https://github.com/tr0mb1r/abox/blob/main/docs/notes/network-segmentation.md) |
+| **Shared CDN addresses (ipset mode only)** | The firewall matches IPs, so allowlisting `pypi.org` allows everything else on those Fastly addresses. Turning on the SNI proxy closes this; leaving it off does not. |
+
 ## Enforced invariants
 
 Every row here is verified mechanically, and the last column names the check
