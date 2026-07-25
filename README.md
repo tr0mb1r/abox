@@ -221,9 +221,10 @@ an isolation primitive, and it would happily sit on top of a stronger one.
 uv tool install git+https://github.com/tr0mb1r/abox
 ```
 
-No checkout needed. Once it is on PyPI that becomes `uv tool install abox`; the
-package is built and its metadata is release-ready, but nothing has been
-published yet — see [Releasing](#releasing).
+No checkout needed. Once it is on PyPI that becomes
+`uv tool install abox-cli` — the distribution is `abox-cli` because the bare
+name is held by an unrelated placeholder; the command it installs is `abox`
+either way. Nothing has been published yet — see [Releasing](#releasing).
 
 Working on abox itself? Install the checkout in place, from its own directory:
 
@@ -819,15 +820,15 @@ failure on a shared runner would more likely mean "the runner is different" than
 **abox is not on PyPI yet.** The distribution builds cleanly, the metadata is
 release-ready, and `.github/workflows/publish.yml` is wired for
 [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no API token
-exists in this repo and none should. What is missing is two one-time setup steps
-that only the project owner can do:
+exists in this repo and none should.
 
-1. On PyPI, register `abox` as a **pending publisher** for
-   `tr0mb1r/abox`, workflow `publish.yml`, environment `pypi`.
-2. In the repo settings, create a `pypi` **environment** so a release needs an
-   explicit approval rather than firing on any tag push.
+The `pypi` **environment** exists on the repo, gated on an approval and
+restricted to `v*` tags. The remaining step is on PyPI itself, and only the
+project owner can do it: register **`abox-cli`** as a
+[pending publisher](https://pypi.org/manage/account/publishing/) with owner
+`tr0mb1r`, repository `abox`, workflow `publish.yml`, environment `pypi`.
 
-Once those exist, a release is:
+Once that exists, a release is:
 
 ```bash
 uv version --bump patch          # or minor/major; edits pyproject

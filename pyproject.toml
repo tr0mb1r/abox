@@ -1,5 +1,9 @@
 [project]
-name = "abox"
+# The distribution is `abox-cli`; everything user-facing stays `abox`. The bare
+# name on PyPI is held by an unrelated 0.0.0 placeholder last touched in 2021.
+# The command is `abox` (see [project.scripts]) and the import package is `abox`
+# (see [tool.hatch.build.targets.wheel]) — do not rename either to match this.
+name = "abox-cli"
 version = "0.1.0"
 description = "Sandboxed, network-restricted Claude Code environments with MCP access via Docker MCP Gateway"
 readme = "README.md"

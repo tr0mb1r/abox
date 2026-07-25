@@ -219,9 +219,10 @@ for it.
 uv tool install git+https://github.com/tr0mb1r/abox
 ```
 
-No checkout needed. Once abox is on PyPI this becomes `uv tool install abox`;
-the distribution builds cleanly and its metadata is release-ready, but nothing
-has been published yet (§15.1).
+No checkout needed. Once it is on PyPI this becomes
+`uv tool install abox-cli` — the distribution is `abox-cli` because the bare
+name is held by an unrelated placeholder, and the command it installs is `abox`
+regardless. Nothing has been published yet.
 
 After editing abox's own source, reinstall the checkout in place, from inside
 it:

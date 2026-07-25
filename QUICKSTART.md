@@ -47,8 +47,9 @@ without it, and `abox doctor` will not nag you about a missing `op`.
 uv tool install git+https://github.com/tr0mb1r/abox
 ```
 
-No checkout required. (Once abox is on PyPI this becomes `uv tool install abox`
-— it is not published yet.)
+No checkout required. (Once it is on PyPI this becomes
+`uv tool install abox-cli` — the distribution is named `abox-cli`, the command
+it installs is `abox`. Not published yet.)
 
 ```bash
 abox --version
@@ -58,7 +59,8 @@ You should get `abox 0.1.0`, from `~/.local/bin/abox`. If the shell can't find
 it, add `~/.local/bin` to your `PATH` (or run `uv tool update-shell`).
 
 To upgrade later, re-run the install with `--reinstall`. To remove it:
-`uv tool uninstall abox`.
+`uv tool uninstall abox` (uv names the tool after the command, not the
+distribution).
 
 Hacking on abox itself? Install the checkout in place instead, from inside it:
 
