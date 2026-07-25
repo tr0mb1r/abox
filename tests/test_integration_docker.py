@@ -456,14 +456,20 @@ def test_domain_fronting_is_refused(sni_agent) -> None:
     forged = _exec(
         c, "bash", "-lc",
         'IP=$(getent hosts example.com | head -1 | cut -d" " -f1); '
-        'curl -sS -o /dev/null -m 15 --resolve pypi.org:443:$IP https://pypi.org',
+        'echo "resolved=[$IP]" >&2; '
+        'curl -sS -v -o /dev/null -m 15 --resolve pypi.org:443:$IP https://pypi.org',
     )
+    # Refusal alone is not evidence: curl failing because $IP came out empty
+    # looks identical from here, and would mean the proxy was never contacted.
     assert not forged.ok
+    client = (forged.stderr or forged.stdout)
+    assert "resolved=[]" not in client, f"the fronting target never resolved:\n{client}"
     # And the attempt is recorded with the name that was attempted.
     if not _await_denied_sni("snitest", "pypi.org"):
         raise AssertionError(
             "the fronting attempt was refused but never reached the review "
-            f"queue:\n\n{_sni_log_diagnostics('snitest')}"
+            f"queue.\n\nclient side:\n{client[-1500:]}\n\n"
+            f"{_sni_log_diagnostics('snitest')}"
         )
 
 
