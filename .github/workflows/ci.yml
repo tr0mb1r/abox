@@ -1,0 +1,55 @@
+# Lint and the test suite that does not need a Docker daemon.
+#
+# The `-m docker` tests are deliberately NOT run here. They build a ~1.3 GB
+# agent image, start a gateway, and assert against live iptables — that belongs
+# on a machine with Docker Desktop, not on a shared runner where a failure would
+# more likely mean "the runner is different" than "abox is broken". SECURITY.md
+# marks those rows (docker) for exactly this reason.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync
+        run: uv sync --all-extras --dev --python ${{ matrix.python-version }}
+
+      # `ruff check` is this project's gate, deliberately. `ruff format` is not
+      # run: the source is hand-wrapped around prose comments that carry the
+      # reasoning, and letting the formatter re-flow them would cost more than
+      # the consistency is worth here.
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Build the distribution
+        run: uv build
+
+      - name: Check the distribution metadata
+        run: uvx twine check dist/*

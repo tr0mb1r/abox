@@ -203,16 +203,21 @@ checksum-verified native binary. The only thing that ever installs Node is the
 `node` toolchain, and that lands *inside the container* because a project asked
 for it.
 
-**Install from the checkout:**
+**Install:**
 
 ```bash
-uv tool install --force ~/projects/abox
+uv tool install git+https://github.com/tr0mb1r/abox
 ```
 
-After editing abox's own source, reinstall before the next run:
+No checkout needed. Once abox is on PyPI this becomes `uv tool install abox`;
+the distribution builds cleanly and its metadata is release-ready, but nothing
+has been published yet (§15.1).
+
+After editing abox's own source, reinstall the checkout in place, from inside
+it:
 
 ```bash
-uv tool install --reinstall --force ~/projects/abox
+uv tool install --reinstall --force .
 ```
 
 **Docker disk.** The first agent build plus a few pre-pulled server images wants

@@ -4,14 +4,23 @@ version = "0.1.0"
 description = "Sandboxed, network-restricted Claude Code environments with MCP access via Docker MCP Gateway"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "tr0mb1r" }]
-keywords = ["mcp", "docker", "sandbox", "devcontainer", "claude"]
+keywords = ["mcp", "docker", "sandbox", "devcontainer", "claude", "agent", "security"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    # macOS only today. Linux is scoped, not shipped — see docs/notes/linux-support.md.
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
 ]
 dependencies = [
     "typer>=0.12",
@@ -26,7 +35,11 @@ dependencies = [
 abox = "abox.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/tr0mb1r/abox"
+Homepage = "https://tr0mb1r.github.io/abox/"
+Documentation = "https://tr0mb1r.github.io/abox/GUIDE/"
+Repository = "https://github.com/tr0mb1r/abox"
+Issues = "https://github.com/tr0mb1r/abox/issues"
+Security = "https://github.com/tr0mb1r/abox/blob/main/SECURITY.md"
 
 [dependency-groups]
 dev = [

@@ -43,11 +43,12 @@ without it, and `abox doctor` will not nag you about a missing `op`.
 
 ## 1. Install abox
 
-Not published to PyPI yet, so install from the checkout:
-
 ```bash
-uv tool install --force ~/projects/abox
+uv tool install git+https://github.com/tr0mb1r/abox
 ```
+
+No checkout required. (Once abox is on PyPI this becomes `uv tool install abox`
+— it is not published yet.)
 
 ```bash
 abox --version
@@ -56,8 +57,14 @@ abox --version
 You should get `abox 0.1.0`, from `~/.local/bin/abox`. If the shell can't find
 it, add `~/.local/bin` to your `PATH` (or run `uv tool update-shell`).
 
-To pick up code changes later, re-run the same install command with
-`--reinstall`. To remove it: `uv tool uninstall abox`.
+To upgrade later, re-run the install with `--reinstall`. To remove it:
+`uv tool uninstall abox`.
+
+Hacking on abox itself? Install the checkout in place instead, from inside it:
+
+```bash
+uv tool install --reinstall --force .
+```
 
 ---
 

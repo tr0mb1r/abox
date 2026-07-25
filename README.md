@@ -217,10 +217,18 @@ an isolation primitive, and it would happily sit on top of a stronger one.
 
 ## Install
 
-Not on PyPI yet, so install from the checkout:
+```bash
+uv tool install git+https://github.com/tr0mb1r/abox
+```
+
+No checkout needed. Once it is on PyPI that becomes `uv tool install abox`; the
+package is built and its metadata is release-ready, but nothing has been
+published yet — see [Releasing](#releasing).
+
+Working on abox itself? Install the checkout in place, from its own directory:
 
 ```bash
-uv tool install --force ~/projects/abox
+uv tool install --reinstall --force .
 ```
 
 See **[QUICKSTART.md](QUICKSTART.md)** for the full from-scratch walkthrough,
@@ -791,6 +799,40 @@ uv run pytest                  # hermetic; docker-dependent tests deselected
 uv run pytest -m docker        # the ones that need a live daemon
 uv run ruff check src tests
 ```
+
+CI runs the hermetic suite and the lint on 3.12 and 3.13, then builds the
+distribution and checks its metadata. The `-m docker` tests are deliberately not
+run there: they build a 1.3 GB image and assert against live iptables, so a
+failure on a shared runner would more likely mean "the runner is different" than
+"abox is broken". Those rows are marked *(docker)* in
+[SECURITY.md](SECURITY.md) for the same reason.
+
+## Releasing
+
+**abox is not on PyPI yet.** The distribution builds cleanly, the metadata is
+release-ready, and `.github/workflows/publish.yml` is wired for
+[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no API token
+exists in this repo and none should. What is missing is two one-time setup steps
+that only the project owner can do:
+
+1. On PyPI, register `abox` as a **pending publisher** for
+   `tr0mb1r/abox`, workflow `publish.yml`, environment `pypi`.
+2. In the repo settings, create a `pypi` **environment** so a release needs an
+   explicit approval rather than firing on any tag push.
+
+Once those exist, a release is:
+
+```bash
+uv version --bump patch          # or minor/major; edits pyproject
+git commit -am "chore: release vX.Y.Z" && git tag vX.Y.Z
+git push && git push --tags
+```
+
+The workflow re-runs the lint and the suite, **refuses a tag that disagrees with
+the version in `pyproject.toml`**, builds, checks the metadata, and only then
+publishes. `workflow_dispatch` with `dry_run` (the default) does everything
+except publish, which is the safe way to find out whether the release path works
+before committing a version number to PyPI forever.
 
 ## Deviations from the original plan
 
