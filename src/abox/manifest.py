@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Annotated, Any, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from . import paths
 from .errors import ConfigError, ManifestNotFoundError
@@ -152,19 +160,39 @@ def _check_host(value: str) -> str:
 
 
 class MountsConfig(StrictModel):
-    """Filesystem shaping for the agent container."""
+    """Filesystem shaping for the agent container.
+
+    ``mask`` and ``watch`` are two answers to the same question — what to do
+    about a workspace file that causes code to execute somewhere else, later —
+    and the difference is not a detail:
+
+    * **mask** shadows the path so the agent cannot read or write it. Nothing
+      gets through, and anything in the workspace that legitimately needs the
+      file stops working.
+    * **watch** leaves the path alone and fingerprints it, so a modification is
+      visible in ``abox doctor`` afterwards. The agent can still change it; you
+      find out that it did.
+
+    A poisoned CI workflow or build script is a host or CI compromise on a
+    delay, which argues for masking. Masking `Makefile` and `package.json`
+    outright breaks ordinary work, which argues against. So the recommended
+    defaults watch that class rather than mask it, and masking stays one line
+    away for anyone who wants it.
+    """
 
     mask: list[str] = Field(default_factory=list)
+    watch: list[str] = Field(default_factory=list)
     context: list[str] = Field(default_factory=list)
 
-    @field_validator("mask")
+    @field_validator("mask", "watch")
     @classmethod
-    def _validate_mask(cls, value: list[str]) -> list[str]:
+    def _validate_workspace_globs(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        field = info.field_name
         for glob in value:
             if glob.startswith("/"):
-                raise ValueError(f"mask globs are workspace-relative: {glob!r}")
+                raise ValueError(f"{field} globs are workspace-relative: {glob!r}")
             if ".." in Path(glob).parts:
-                raise ValueError(f"mask globs must not escape the workspace: {glob!r}")
+                raise ValueError(f"{field} globs must not escape the workspace: {glob!r}")
         return value
 
     @field_validator("context")
@@ -486,8 +514,27 @@ class ProfileConfig(StrictModel):
     description: str = ""
 
 
+#: Workspace paths that cause code to execute somewhere else, later — a CI
+#: runner, a build, an editor opening the project, a commit. The agent can write
+#: all of them, because /workspace is a live bind of real files; masking them
+#: outright breaks ordinary work. So they are watched: fingerprinted at render
+#: and re-checked by doctor, which reports a modification as its own finding.
+EXEC_ADJACENT_WATCH = [
+    ".github/workflows",
+    ".gitlab-ci.yml",
+    "Makefile",
+    "justfile",
+    "package.json",
+    ".pre-commit-config.yaml",
+    ".vscode/tasks.json",
+    ".idea",
+    "*.code-workspace",
+]
+
+
 class Defaults(StrictModel):
     mask: list[str] = Field(default_factory=lambda: [".env*", ".git/hooks"])
+    watch: list[str] = Field(default_factory=lambda: list(EXEC_ADJACENT_WATCH))
     egress_mandatory: list[str] = Field(default_factory=lambda: list(BASE_MANDATORY_EGRESS))
 
     @field_validator("egress_mandatory")
@@ -888,6 +935,21 @@ def merged_masks(manifest: Manifest, config: GlobalConfig) -> list[str]:
     out: list[str] = []
     for glob in (*config.defaults.mask, *manifest.mounts.mask):
         if glob not in out:
+            out.append(glob)
+    return out
+
+
+def merged_watch(manifest: Manifest, config: GlobalConfig) -> list[str]:
+    """Global default watches plus project watches, order-stable and de-duplicated.
+
+    A path that is masked is not also watched: the agent cannot reach it, so a
+    change to it is a change abox itself made, and reporting that as tampering
+    would train the reader to ignore the finding.
+    """
+    masked = set(merged_masks(manifest, config))
+    out: list[str] = []
+    for glob in (*config.defaults.watch, *manifest.mounts.watch):
+        if glob not in out and glob not in masked:
             out.append(glob)
     return out
 

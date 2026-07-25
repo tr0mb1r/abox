@@ -37,7 +37,7 @@ reconstruct them by subtracting the table above from the claims in the prose.
 |---|---|
 | **The gateway is trusted code.** | The agent's own container cannot reach the Docker daemon — that part is enforced above and checked every run. It is not the whole claim. The agent holds a bearer token for a network-reachable container that *does* mount `/var/run/docker.sock`, so the real boundary is that no crafted MCP request traverses third-party gateway code to that socket. One parsing bug there is root-equivalent on the host. abox pins the gateway by digest and verifies the running container against the pin; it does not audit the gateway's code, and cannot. |
 | **The Docker daemon keeps secrets out of the gateway process.** | abox never writes a secret value into the gateway's environment: it emits `se://docker/mcp/<name>` references the daemon resolves from the OS keychain at container start. That the daemon then hands the value only to the intended server container is the daemon's guarantee, not one abox can check. |
-| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver — outside the agent's firewall, the SNI proxy, and the scoped DNS. A tool call carrying a URL reaches that URL. Measured, not assumed: [docs/notes/mcp-egress-investigation.md](docs/notes/mcp-egress-investigation.md). |
+| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver — outside the agent's firewall, the SNI proxy, and the scoped DNS. A tool call carrying a URL reaches that URL. Measured, not assumed: [the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md). |
 
 ## How it fits together
 
@@ -146,7 +146,8 @@ tools:
   github-official: [list_issues, get_file_contents]   # optional narrowing
 toolchains: [python, go]
 mounts:
-  mask: [".env*", ".git/hooks", "secrets/"]
+  mask: [".env*", ".git/hooks", "secrets/"]       # shadowed: unreadable, unwritable
+  watch: ["Makefile", "deploy/"]                  # left alone, fingerprinted, diffed by doctor
   context: ["~/notes/dev"]                        # → /context/dev:ro
 egress:
   - github.com
@@ -605,7 +606,7 @@ rather than letting the sandbox look tighter than it is.
     runs.jsonl           run index
     dns-queries.jsonl    every name the agent looked up
     fw-counters.json     what the firewall dropped
-    git-snapshot.json    baseline for the git tamper check
+    git-snapshot.json    baselines for the git tamper and execution-adjacent checks
 ```
 
 **`/workspace` is a read-write bind of your real project directory.** Anything
@@ -613,6 +614,27 @@ the agent writes there lands on the host filesystem — that is the point of a
 coding sandbox, but it is not a copy. The masks shadow specific paths; they do
 not make the workspace immutable. If you want the agent unable to touch your
 files at all, that is a different tool.
+
+Some of those files cause code to execute **somewhere else, later**: a CI
+workflow on a runner, a `Makefile` target on your next `make`, a `package.json`
+script on the next install, an editor task when someone opens the project. None
+of them run in the container, so none of abox's controls apply. Masking the whole
+class would close that and break ordinary work, so abox **watches** it instead —
+`mounts.watch`, defaulting to `.github/workflows`, `.gitlab-ci.yml`, `Makefile`,
+`justfile`, `package.json`, `.pre-commit-config.yaml`, `.vscode/tasks.json`,
+`.idea`, `*.code-workspace`. They are fingerprinted into `git-snapshot.json` and
+a change is its own doctor finding, not part of an ordinary workspace diff:
+
+```
+! execution-adjacent files unchanged: changed: .github/workflows/ci.yml
+  ↳ these execute outside the sandbox … `abox doctor --accept-watch` to
+    re-baseline. Add the path to `mounts.mask` to stop the agent writing it
+```
+
+`mask` and `watch` are the two answers to the same question and you pick per
+path: mask shadows it so nothing gets through and anything needing the file
+breaks; watch leaves it and tells you afterwards. Masking wins where you can
+afford it.
 
 **The audit trail is not writable by the agent.** `/var/log/abox` is root-owned
 inside the container and deliberately *not* bind-mounted: Docker Desktop does not

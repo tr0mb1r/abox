@@ -54,6 +54,11 @@ nav:
   - Home: README.md
   - Quickstart: QUICKSTART.md
   - Complete Guide: GUIDE.md
+  # Investigation notes: measurements, including the ones whose result is
+  # "not defended". Published on purpose — see SECURITY.md.
+  - Notes:
+      - MCP server egress: notes/mcp-egress-investigation.md
+      - Network segmentation: notes/network-segmentation.md
 
 # docs/requirements.txt is CI tooling, not a page — keep it out of the built site.
 exclude_docs: |

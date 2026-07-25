@@ -187,7 +187,7 @@ in prose would be the dishonest way to present this. `abox run` refuses
 | **The gateway is trusted code.** | The agent's own container cannot reach the Docker daemon; that much is enforced above and checked at every run. It is not the whole claim. The agent holds a bearer token for a network-reachable container that *does* mount `/var/run/docker.sock`, so the boundary that actually matters is that no crafted MCP request traverses third-party gateway code to that socket. One parsing bug there is root-equivalent on the host. abox pins the gateway by digest and verifies the running container against that pin (§4 hardenings, `abox gateway update`); it does not audit the gateway's code, and cannot. |
 | **The Docker daemon keeps secret values out of the gateway process.** | abox never writes a secret value into the gateway's environment — it emits `se://docker/mcp/<name>` references that the daemon resolves from the OS keychain when it starts a server container. That the daemon then hands the value only to the intended container is the daemon's guarantee. abox can check that no value passes through its own hands; it cannot check the daemon's. |
 | **Hosted MCP servers are dialled by the gateway, not the agent.** | This is why a remote server adds no endpoint and no egress to the agent — and it holds only because the gateway makes the call. The single-endpoint half is enforced; the "the gateway holds the credential" half is a property of the gateway. |
-| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver, outside the agent's firewall, the SNI proxy, and the scoped DNS simultaneously. A tool call carrying a URL reaches that URL. Measured rather than assumed — see [the egress investigation](notes/mcp-egress-investigation.md). |
+| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver, outside the agent's firewall, the SNI proxy, and the scoped DNS simultaneously. A tool call carrying a URL reaches that URL. Measured rather than assumed — see [the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md). |
 
 ### Hardenings in depth
 
@@ -271,6 +271,16 @@ profiles:
 
 defaults:
   mask: [".env*", ".git/hooks"]                     # merged into every project's mask set
+  watch:                                            # fingerprinted, not shadowed — see below
+    - .github/workflows
+    - .gitlab-ci.yml
+    - Makefile
+    - justfile
+    - package.json
+    - .pre-commit-config.yaml
+    - .vscode/tasks.json
+    - .idea
+    - "*.code-workspace"
   egress_mandatory:                                 # injected into every project's allowlist
     - api.anthropic.com
     - platform.claude.com
@@ -329,7 +339,8 @@ tools:                              # optional per-server allowlist; default = a
 toolchains: [python, go]            # installed into the agent image (§10)
 
 mounts:
-  mask: [".env*", ".git/hooks", "secrets/"]   # workspace-relative globs; merged with defaults
+  mask: [".env*", ".git/hooks", "secrets/"]   # shadow it: the agent cannot read or write it
+  watch: ["Makefile", "deploy/"]              # leave it, fingerprint it, report changes
   context: ["~/notes/dev"]                # host dirs mounted read-only at /context/<name>
 
 egress:                             # outbound allowlist (bare hostnames, no scheme/port/path/wildcards)
@@ -367,6 +378,54 @@ run:
 You rarely edit this by hand — `abox mcp add`, `abox egress add`, `abox secrets
 attach`, etc. all edit it and re-render — but every one of those is just a typed
 mutation of this file.
+
+### `mounts.mask` vs `mounts.watch`
+
+`/workspace` is a read-write bind of the real project directory. That is the
+point — the agent is there to change your code — and it means the agent can also
+write files that cause code to execute **somewhere else, later**: a CI workflow
+that runs on the runner, a `Makefile` target that runs on your next `make`, a
+`package.json` script that runs on the next `npm install`, an editor task that
+runs when someone opens the project. None of those execute in the container, so
+none of abox's controls apply to them. A poisoned workflow is a CI compromise on
+a delay.
+
+There are two answers, and abox makes you pick per path:
+
+| | `mounts.mask` | `mounts.watch` |
+|---|---|---|
+| What it does | shadows the path with an empty overlay | leaves the path alone |
+| Agent can read it | no | yes |
+| Agent can write it | no | yes |
+| You find out about a change | there is nothing to find out | `abox doctor` names the file |
+| Cost | anything in the workspace that needs the file breaks | detection is after the fact |
+
+Masking is strictly stronger, and masking this whole class outright breaks
+ordinary work — you cannot mask `package.json` and still expect the agent to
+manage dependencies. So the **defaults watch rather than mask**, and masking
+stays one line away for anyone who wants it. A path listed in both is masked
+only: the agent cannot reach it, so a change to it is a change abox made, and
+reporting that as tampering would train you to ignore the finding.
+
+Watched paths are fingerprinted by sha256 into `git-snapshot.json` alongside the
+git-config baseline. Directories are walked, so a workflow added after the
+baseline is caught, not just an edited one. Symlinks are recorded by their target
+rather than followed — a symlink repointed at another file with identical
+contents is exactly the edit this exists to catch, and following it would hide
+the swap. Large trees are capped at 500 files per glob, and the check says which
+glob it stopped short on rather than quietly reporting less than it checked.
+
+The finding is a warning, not a failure, and that is deliberate: an agent editing
+`package.json` is normal work, and a check that fails on normal work is a check
+people learn to skip. What it must never do is stay silent.
+
+```
+! execution-adjacent files unchanged: changed: .github/workflows/ci.yml
+  ↳ these execute outside the sandbox — on a CI runner, on the next build, or
+    when an editor opens the project. Read the diff before you push or run
+    anything, then `abox doctor --accept-watch` to re-baseline. Add the path to
+    `mounts.mask` to stop the agent writing it at all
+```
 
 ---
 
@@ -842,7 +901,8 @@ abox nuke -y             # don't prompt
 
 `abox doctor` is the full audit. `--verbose`/`-v` shows passing checks too,
 `--json` is machine-readable, `--quick` skips secret source re-reads, `--accept-git`
-re-baselines the git tamper snapshot.
+re-baselines the git tamper snapshot, and `--accept-watch` re-baselines the
+execution-adjacent file snapshot after you have read the diff.
 
 | Check | What it verifies |
 |---|---|
@@ -866,6 +926,7 @@ re-baselines the git tamper snapshot.
 | egress proxy | if configured, the proxy is up; surfaces SNI refusals |
 | shared addresses | allowlisted domains that share an IP (domain-fronting exposure; moot when the proxy is on) |
 | git tamper | workspace `.git/config` checked for `core.hooksPath` / `alias.*` changes since the baseline |
+| execution-adjacent files | `mounts.watch` paths — CI workflows, `Makefile`, `package.json` scripts, editor tasks — fingerprinted and re-checked. These execute outside the sandbox, so a change is its own finding rather than part of an ordinary workspace diff (§6) |
 | egress review queue | looked-up-but-not-allowed domains, with counts |
 | agent hygiene | no `docker.sock` mount, no published ports in the runspec |
 | single MCP endpoint | one endpoint unless `run.connectors` deliberately turns on the claude.ai path |
@@ -940,7 +1001,7 @@ different tool.
 | `abox gateway down [profile]` | | stop a profile's gateway |
 | `abox gateway status [profile]` | `--tools` | health; `--tools` lists what it exposes live |
 | `abox gateway update` | `--tag`, `-y/--yes` | pull the gateway tag, show the digest diff, write it to the global config on confirmation |
-| `abox doctor` | `-v`, `--json`, `--accept-git`, `--quick` | the full audit |
+| `abox doctor` | `-v`, `--json`, `--accept-git`, `--accept-watch`, `--quick` | the full audit |
 | `abox logs` | `--runs`, `--dns`, `--gateway`, `--transcript`, `-n` | local telemetry |
 | `abox nuke` | `--keep-auth`, `-y` | remove containers and artifacts (prompts before the auth volume) |
 

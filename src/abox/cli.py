@@ -1429,6 +1429,13 @@ def doctor_cmd(
     accept_git: Annotated[
         bool, typer.Option("--accept-git", help="Re-baseline the git tamper snapshot.")
     ] = False,
+    accept_watch: Annotated[
+        bool,
+        typer.Option(
+            "--accept-watch",
+            help="Re-baseline the execution-adjacent file snapshot (mounts.watch).",
+        ),
+    ] = False,
     quick: Annotated[
         bool, typer.Option("--quick", help="Skip source re-reads for secrets.")
     ] = False,
@@ -1445,6 +1452,7 @@ def doctor_cmd(
             custom,
             SecretsConfig.load(),
             accept_git=accept_git,
+            accept_watch=accept_watch,
             deep_secrets=not quick,
         )
         if json_out:

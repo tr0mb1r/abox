@@ -9,8 +9,11 @@ worth least, so that check reads the rendered container config instead.
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
+import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -27,6 +30,7 @@ from .manifest import (
     SecretsConfig,
     effective_allowlist,
     merged_egress,
+    merged_watch,
 )
 
 
@@ -746,6 +750,163 @@ def _git_state_path(workspace: Path) -> Path:
     return paths.project_state_dir(workspace) / "git-snapshot.json"
 
 
+def _read_snapshot(workspace: Path) -> dict[str, Any]:
+    path = _git_state_path(workspace)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_snapshot(workspace: Path, **sections: Any) -> None:
+    """Merge sections into git-snapshot.json without dropping the others."""
+    paths.ensure_project_state(workspace)
+    data = _read_snapshot(workspace)
+    data.update(sections)
+    data["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    path = _git_state_path(workspace)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+# -- execution-adjacent surface -------------------------------------------
+
+#: Per-glob file cap. `.idea/` and friends can be enormous, and a fingerprint
+#: nobody can compute is worse than one that says where it stopped — so the
+#: overflow is reported rather than silently dropped.
+WATCH_FILE_CAP = 500
+
+
+def watch_snapshot(workspace: Path, globs: Iterable[str]) -> tuple[dict[str, str], list[str]]:
+    """sha256 every file matched by the watch globs. Returns (digests, capped globs).
+
+    Directories are walked, so `.github/workflows` covers a workflow added after
+    the baseline. Symlinks are recorded by their target text rather than
+    followed: a symlink swapped to point at something else is exactly the kind
+    of edit this exists to notice, and following it would hide the swap.
+    """
+    digests: dict[str, str] = {}
+    capped: list[str] = []
+
+    def record(path: Path) -> None:
+        try:
+            rel = path.relative_to(workspace).as_posix()
+        except ValueError:
+            return
+        try:
+            if path.is_symlink():
+                digests[rel] = "symlink:" + hashlib.sha256(
+                    os.readlink(path).encode("utf-8", "replace")
+                ).hexdigest()
+            elif path.is_file():
+                digests[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            digests[rel] = "unreadable"
+
+    for glob in globs:
+        seen = 0
+        for match in sorted(workspace.glob(glob)):
+            if match.is_dir() and not match.is_symlink():
+                for child in sorted(p for p in match.rglob("*") if not p.is_dir()):
+                    if seen >= WATCH_FILE_CAP:
+                        capped.append(glob)
+                        break
+                    record(child)
+                    seen += 1
+                else:
+                    continue
+                break
+            if seen >= WATCH_FILE_CAP:
+                capped.append(glob)
+                break
+            record(match)
+            seen += 1
+    return digests, sorted(set(capped))
+
+
+def check_exec_surface(
+    manifest: Manifest, config: GlobalConfig, workspace: Path, *, update: bool = False
+) -> Check:
+    """Did anything that executes *outside* this sandbox change while it ran?
+
+    /workspace is a live bind of real files, so the agent can write a CI
+    workflow, a Makefile target, or a package.json script. None of those run in
+    the container — they run on a CI runner, on the next `make`, on the next
+    `npm install`, on the machine of whoever opens the project next. That is a
+    compromise on a delay, and it is invisible to every control abox has,
+    because every control abox has is about this container's own execution.
+
+    Masking the whole class would close it and break ordinary work, so the
+    default is to watch. This is a warning rather than a failure on purpose: an
+    agent editing package.json is normal, and a check that fails on normal work
+    is a check people learn to skip. What it must not do is stay quiet.
+    """
+    globs = merged_watch(manifest, config)
+    if not globs:
+        return Check(
+            id="workspace.exec-surface",
+            title="execution-adjacent files unchanged",
+            status=Status.skip,
+            detail="nothing watched (mounts.watch and defaults.watch are both empty)",
+        )
+
+    current, capped = watch_snapshot(workspace, globs)
+    previous = dict(_read_snapshot(workspace).get("watch") or {})
+    first_run = "watch" not in _read_snapshot(workspace)
+
+    if update or first_run:
+        _write_snapshot(workspace, watch=current)
+
+    cap_note = (
+        f" — {', '.join(capped)} exceeded {WATCH_FILE_CAP} files and is only "
+        "fingerprinted up to that point"
+        if capped
+        else ""
+    )
+
+    if first_run:
+        return Check(
+            id="workspace.exec-surface",
+            title="execution-adjacent files unchanged",
+            status=Status.ok,
+            detail=f"baseline recorded ({len(current)} file(s)){cap_note}",
+            data={"watched": sorted(current), "capped": capped},
+        )
+
+    added = sorted(k for k in current if k not in previous)
+    changed = sorted(k for k in current if k in previous and previous[k] != current[k])
+    removed = sorted(set(previous) - set(current))
+    if added or changed or removed:
+        parts = []
+        if added:
+            parts.append("added: " + ", ".join(added))
+        if changed:
+            parts.append("changed: " + ", ".join(changed))
+        if removed:
+            parts.append("removed: " + ", ".join(removed))
+        return Check(
+            id="workspace.exec-surface",
+            title="execution-adjacent files unchanged",
+            status=Status.warn,
+            detail="; ".join(parts) + cap_note,
+            hint="these execute outside the sandbox — on a CI runner, on the next "
+            "build, or when an editor opens the project. Read the diff before you "
+            "push or run anything, then `abox doctor --accept-watch` to re-baseline. "
+            "Add the path to `mounts.mask` to stop the agent writing it at all",
+            data={"added": added, "changed": changed, "removed": removed, "capped": capped},
+        )
+    return Check(
+        id="workspace.exec-surface",
+        title="execution-adjacent files unchanged",
+        status=Status.ok,
+        detail=f"{len(current)} file(s), unchanged since last check{cap_note}",
+        data={"watched": sorted(current), "capped": capped},
+    )
+
+
 def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path) -> list[Check]:
     """The SNI proxy, when the operator has turned it on.
 
@@ -849,13 +1010,8 @@ def check_shared_addresses(manifest: Manifest, config: GlobalConfig) -> Check:
 
 def check_git_tamper(workspace: Path, *, update: bool = False) -> Check:
     current = git_config_snapshot(workspace)
-    path = _git_state_path(workspace)
-    previous: dict[str, str] = {}
-    if path.is_file():
-        try:
-            previous = dict(json.loads(path.read_text(encoding="utf-8")).get("keys") or {})
-        except (OSError, json.JSONDecodeError):
-            previous = {}
+    stored = _read_snapshot(workspace)
+    previous = dict(stored.get("keys") or {})
 
     if not (workspace / ".git").exists():
         return Check(
@@ -868,20 +1024,10 @@ def check_git_tamper(workspace: Path, *, update: bool = False) -> Check:
     added = {k: v for k, v in current.items() if k not in previous}
     changed = {k: v for k, v in current.items() if k in previous and previous[k] != v}
     removed = sorted(set(previous) - set(current))
-    first_run = not path.is_file()
+    first_run = "keys" not in stored
 
     if update or first_run:
-        paths.ensure_project_state(workspace)
-        path.write_text(
-            json.dumps(
-                {"keys": current, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        path.chmod(0o600)
+        _write_snapshot(workspace, keys=current)
 
     if first_run:
         return Check(
@@ -1138,6 +1284,7 @@ def full(
     secrets_config: SecretsConfig,
     *,
     accept_git: bool = False,
+    accept_watch: bool = False,
     deep_secrets: bool = True,
 ) -> Report:
     report = Report()
@@ -1161,6 +1308,7 @@ def full(
         report.add(check)
     report.add(check_shared_addresses(manifest, config))
     report.add(check_git_tamper(workspace, update=accept_git))
+    report.add(check_exec_surface(manifest, config, workspace, update=accept_watch))
     queue_check, denied = check_egress_queue(manifest, config, workspace)
     report.add(queue_check)
     report.denied = denied
