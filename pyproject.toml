@@ -4,7 +4,7 @@
 # The command is `abox` (see [project.scripts]) and the import package is `abox`
 # (see [tool.hatch.build.targets.wheel]) — do not rename either to match this.
 name = "abox-cli"
-version = "0.1.1"
+version = "0.1.2"
 description = "Sandboxed, network-restricted Claude Code environments with MCP access via Docker MCP Gateway"
 readme = "README.md"
 requires-python = ">=3.12"
