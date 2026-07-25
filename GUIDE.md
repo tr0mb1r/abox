@@ -1038,6 +1038,39 @@ abox nuke --keep-auth    # never touch the Claude auth volume
 abox nuke -y             # don't prompt
 ```
 
+### Running abox in CI
+
+`abox run` is headless and GitHub Actions is headless, so this looks like an
+obvious fit. **Don't, yet** — and the reason is not effort.
+
+CI would want `permission_mode: bypassPermissions`, since a permission prompt in
+a headless job is a hang. That mode is gated on the firewall being present. What
+is not established is that the firewall *bites* on a Linux runner: the image
+installs `iptables` from apt with no backend selection, and an nft/legacy
+mismatch leaves rules that are accepted and match nothing (§3, and the Linux
+note). The `firewall-ok` marker will not catch it — it proves the script ran,
+and the script's assertions read back through the same binary that wrote the
+rules. A job like that runs an agent in the least-restricted mode behind an
+unmeasured firewall and reports green, which is worse than not running it.
+
+Two more things worth knowing before anyone tries:
+
+- **Auth means handing the agent an API key.** There is no API-key path of
+  abox's own; the agent uses the `~/.claude` OAuth volume, which a fresh runner
+  does not have. The supported route is `env_secrets: {ANTHROPIC_API_KEY: …}`,
+  which is exactly the weakening `agent.env-secrets` reports — in CI the egress
+  allowlist becomes the only thing between a live API key and an attacker.
+- **A runner is already a disposable VM.** Ephemerality is what it is for, so
+  abox buys that property twice. What would still be worth having is the egress
+  allowlist, the review queue, and MCP behind one endpoint — and all three
+  depend on the firewall working, which is the open question.
+
+The right first step is not `abox run` in Actions. It is running
+`uv run pytest -m docker` on a Linux host once and seeing what the firewall
+assertions do. Full working-through, including the plugin build and the
+dind caveat, in
+[the CI note](https://github.com/tr0mb1r/abox/blob/main/docs/notes/ci-usage.md).
+
 ---
 
 ## 13. `abox doctor` — every check

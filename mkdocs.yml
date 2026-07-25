@@ -61,6 +61,7 @@ nav:
       - MCP server egress: notes/mcp-egress-investigation.md
       - Network segmentation: notes/network-segmentation.md
       - Linux support: notes/linux-support.md
+      - abox in CI: notes/ci-usage.md
 
 # docs/requirements.txt is CI tooling, not a page — keep it out of the built site.
 exclude_docs: |
