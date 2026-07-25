@@ -361,6 +361,21 @@ def test_image_wraps_claude_so_an_interactive_shell_gets_the_gateway(
     assert '*" --mcp-config "*)' in dockerfile
 
 
+def test_the_shell_banner_has_no_backticks(manifest, config, workspace, spec) -> None:
+    """A backtick in the generated profile script is a command substitution.
+
+    They do not survive the trip: written escaped in the Dockerfile, they reach
+    the file as backslash-backtick, and bash then runs the word instead of
+    printing it. The banner shipped in 0.1.2 saying `bash: claude\\: command not
+    found` twice on every shell.
+    """
+    dockerfile = _render(manifest, config, workspace, spec).artifacts[
+        render.ARTIFACT_DOCKERFILE
+    ]
+    block = dockerfile.split("/etc/profile.d/abox-claude.sh")[0].rsplit("RUN printf", 1)[-1]
+    assert "`" not in block, "backtick in the generated profile script"
+
+
 def test_wrapper_drops_strict_when_connectors_are_on(
     manifest, config, workspace, spec
 ) -> None:

@@ -179,8 +179,12 @@ RUN (SUDO_FORCE_REMOVE=yes DEBIAN_FRONTEND=noninteractive apt-get purge -y sudo 
 # The config is mounted at a path Claude Code does not search, precisely so that
 # passing it explicitly is what makes "exactly one endpoint" true. This wrapper
 # passes it, and says so, rather than leaving the flags to be guessed.
+#
+# No backticks anywhere in this block. They survive into the generated file as
+# an escaped pair, bash collapses that to a literal backslash plus a backtick,
+# and the banner then opens a command substitution instead of printing.
 RUN printf '%s\n' \
-  '# Installed by abox. `claude` needs the gateway config passed explicitly.' \
+  '# Installed by abox. claude needs the gateway config passed explicitly.' \
   'claude() {' \
   '  case " $* " in' \
   '    *" --mcp-config "*) command claude "$@" ;;' \
@@ -189,8 +193,8 @@ RUN printf '%s\n' \
   '}' \
   'if [ -n "${PS1-}" ] && [ -z "${ABOX_SHELL_BANNER-}" ]; then' \
   '  export ABOX_SHELL_BANNER=1' \
-  '  printf "abox: \\`claude\\` runs with --mcp-config {{ mcp_config }}{% if single_mcp_endpoint %} --strict-mcp-config{% endif %} (gateway: ${ABOX_GATEWAY_URL:-unset}).\\n"' \
-  '  printf "      \\`command claude\\` bypasses that and sees no MCP servers.\\n"' \
+  '  printf "abox: claude is wrapped to pass --mcp-config {{ mcp_config }}{% if single_mcp_endpoint %} --strict-mcp-config{% endif %} (gateway: ${ABOX_GATEWAY_URL:-unset}).\\n"' \
+  '  printf "      Run: command claude   to bypass the wrapper and see no MCP servers.\\n"' \
   'fi' \
   > /etc/profile.d/abox-claude.sh \
  && chmod 0644 /etc/profile.d/abox-claude.sh
