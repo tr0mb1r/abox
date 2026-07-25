@@ -880,6 +880,19 @@ an oversight:
   was a container. Remote servers go through the gateway instead of into the
   agent's `.mcp.json`, so "exactly one MCP endpoint" survives contact with
   Context7 and friends.
+- **Execution-adjacent files are watched, not masked.** The plan's answer to a
+  dangerous workspace path was to mask it, and masking is strictly stronger. It
+  is also unusable for this class: you cannot mask `package.json` and still have
+  the agent manage dependencies. So `mounts.watch` fingerprints CI workflows,
+  `Makefile`, editor tasks and the rest instead, and doctor reports a change as
+  its own finding. Masking stays one line away for anyone who can afford it.
+- **The audit trail keeps its macOS shape on every platform.** The log dir is
+  container-internal and harvested at teardown because Docker Desktop does not
+  enforce uid or mode on a bind. Verified during the Linux scoping that a native
+  Linux bind *would* enforce it, making the workaround unnecessary there — and
+  kept anyway, because it is not weaker, and two code paths for where the audit
+  trail lives (with colima needing to be detected as not-Linux) is more surface
+  than the simplification saves.
 - **Server isolation is `--network none` or nothing, and catalog entries are
   shadowed to get it.** The plan had no position on MCP server egress. The
   gateway turns out to offer no per-server network flag — it applies its own
