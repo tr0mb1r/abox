@@ -137,6 +137,23 @@ def test_gateway_image_pinned_detection() -> None:
     assert not GlobalConfig(gateway_image="docker/mcp-gateway:v2").gateway_image_pinned
 
 
+def test_server_network_must_reference_a_declared_server() -> None:
+    with pytest.raises(ConfigError, match="undeclared server"):
+        Manifest.parse_yaml(
+            "project: a\nprofile: b\nservers: [git]\nserver_network:\n  brave: none\n"
+        )
+
+
+def test_server_network_is_refused_for_remote_servers() -> None:
+    """The gateway dials these in-process; there is no container to place."""
+    with pytest.raises(ConfigError, match="does not apply to remote"):
+        Manifest.parse_yaml(
+            "project: a\nprofile: b\n"
+            "remote_servers:\n  ctx:\n    url: https://mcp.context7.com/mcp\n"
+            "server_network:\n  ctx: none\n"
+        )
+
+
 def test_merged_masks_keeps_order_and_dedupes(manifest: Manifest, config: GlobalConfig) -> None:
     config.defaults.mask = [".env*", ".git/hooks"]
     manifest.mounts.mask = ["secrets/", ".env*"]

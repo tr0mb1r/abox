@@ -443,6 +443,88 @@ def test_bare_secret_names_get_an_env_var(config: GlobalConfig) -> None:
     assert server.secrets[0].env == "SOME_TOKEN"
 
 
+def test_custom_server_network_none_renders_disable_network(config: GlobalConfig) -> None:
+    """disableNetwork is what the gateway turns into `docker run --network none`."""
+    from abox.manifest import ServerNetwork
+
+    path = gateway.write_abox_catalog(
+        "dev", {}, {"mine": _custom(network=ServerNetwork.none)}
+    )
+    entry = yaml.safe_load(path.read_text())["registry"]["mine"]  # type: ignore[union-attr]
+    assert entry["disableNetwork"] is True
+
+
+def test_custom_server_defaults_to_the_shared_network(config: GlobalConfig) -> None:
+    path = gateway.write_abox_catalog("dev", {}, {"mine": _custom()})
+    entry = yaml.safe_load(path.read_text())["registry"]["mine"]  # type: ignore[union-attr]
+    assert "disableNetwork" not in entry
+
+
+def test_catalog_server_is_shadowed_verbatim_plus_disable_network(
+    config: GlobalConfig,
+) -> None:
+    """abox does not own the upstream entry, so it re-emits it rather than
+    hand-copying a spec that would then drift."""
+    from abox.catalog import Catalog, CatalogServer
+
+    raw = {
+        "type": "server",
+        "image": "mcp/git@sha256:" + "b" * 64,
+        "description": "upstream text",
+        "secrets": [{"name": "a.b", "env": "A_B"}],
+        "allowHosts": ["github.com:443"],
+    }
+    cat = Catalog(servers={"git": CatalogServer(name="git", image=raw["image"], raw=raw)})
+    path = gateway.write_abox_catalog("dev", {}, {}, ["git"], cat)
+    entry = yaml.safe_load(path.read_text())["registry"]["git"]  # type: ignore[union-attr]
+    assert entry["disableNetwork"] is True
+    assert entry["image"] == raw["image"]
+    assert entry["description"] == "upstream text"
+    assert entry["secrets"] == raw["secrets"]
+    # --network none and allowHosts cannot coexist: docker refuses to attach
+    # both a user-defined and a non-user-defined network mode.
+    assert "allowHosts" not in entry
+
+
+def test_no_stub_is_emitted_for_a_server_with_no_catalog_entry(config: GlobalConfig) -> None:
+    """Replacing a working server with a broken one is worse than not isolating it."""
+    from abox.catalog import Catalog
+
+    path = gateway.write_abox_catalog("dev", {}, {}, ["nonesuch"], Catalog())
+    assert path is None
+
+
+def test_custom_server_is_not_also_shadowed(config: GlobalConfig) -> None:
+    """abox writes its entry directly; a second entry would fight it."""
+    from abox.catalog import Catalog, CatalogServer
+    from abox.manifest import ServerNetwork
+
+    cat = Catalog(servers={"mine": CatalogServer(name="mine", raw={"image": "other"})})
+    path = gateway.write_abox_catalog(
+        "dev", {}, {"mine": _custom(network=ServerNetwork.none)}, ["mine"], cat
+    )
+    entry = yaml.safe_load(path.read_text())["registry"]["mine"]  # type: ignore[union-attr]
+    assert entry["image"].startswith("ghcr.io/me/thing@sha256:")
+    assert entry["disableNetwork"] is True
+
+
+def test_a_project_can_isolate_a_custom_server_it_did_not_declare(
+    config: GlobalConfig,
+) -> None:
+    """`server_network` must reach custom servers too — the shadow path skips
+    them, so without this the manifest setting would silently do nothing."""
+    path = gateway.write_abox_catalog("dev", {}, {"mine": _custom()}, ["mine"], None)
+    entry = yaml.safe_load(path.read_text())["registry"]["mine"]  # type: ignore[union-attr]
+    assert entry["disableNetwork"] is True
+
+
+def test_network_placement_is_in_the_gateway_fingerprint(config: GlobalConfig) -> None:
+    """The catalog is only re-read at start, so a changed placement must recreate."""
+    base = gateway.build_spec("dev", config, servers=["git"])
+    isolated = gateway.build_spec("dev", config, servers=["git"], network_none=["git"])
+    assert base.fingerprint() != isolated.fingerprint()
+
+
 def test_custom_and_remote_share_one_catalog(config: GlobalConfig) -> None:
     path = gateway.write_abox_catalog("dev", {"ctx": CONTEXT7}, {"mine": _custom()})
     registry = yaml.safe_load(path.read_text())["registry"]  # type: ignore[union-attr]

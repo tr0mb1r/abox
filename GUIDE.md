@@ -448,6 +448,70 @@ abox gateway status --tools          # live: every tool the agent will see
 abox mcp cost                        # per-turn token cost of that tool set
 ```
 
+### 7.0 Where a server container sits on the network
+
+Read this before the three kinds, because it applies to all of them and it is
+the largest residual risk in the design.
+
+A gateway-spawned server container is **not the agent**. The agent's firewall,
+the SNI proxy and the scoped resolver all live inside the agent container, so a
+server container is outside all three simultaneously. It runs on `abox-net` with
+normal egress and Docker's own resolver. A tool call carrying a URL — `fetch`,
+`curl`, a search tool, anything with a URL parameter — reaches that URL. This is
+measured, not inferred: [the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md).
+
+The gateway offers no `--network` flag. It applies every network its *own*
+container is on to every server it spawns, so this is one lever with a coarse
+blast radius, not a per-server dial. There is exactly one per-server setting
+Docker enforces:
+
+```yaml
+server_network:
+  git: none          # → disableNetwork → `docker run --network none`
+  serena: none
+```
+
+```yaml
+# custom-servers.yaml — same thing, declared with the server itself
+serena:
+  image: serena:local
+  pin: false
+  network: none
+```
+
+`none` is enforced by Docker, not by convention. abox writes it into the catalog
+it mounts into the gateway: directly for its own custom servers, and for catalog
+servers by re-emitting the upstream entry under the same key with the flag added
+(catalogs merge by key, later wins). The gateway logs the overwrite by name and
+`abox doctor` reports it, so it is not a silent substitution. The copy is taken
+fresh on every render, so it cannot drift further than one `abox up`.
+
+Use it for anything that only touches the filesystem or the repo — `git`,
+`filesystem`, an LSP server like Serena. Verified: Serena serves all 22 of its
+tools with no network at all.
+
+Two things this does **not** do, stated plainly:
+
+- **A server that needs the internet cannot be constrained.** `brave`,
+  `github-official`, `aws-documentation`, `playwright` need egress to be useful,
+  and there is no configuration of the current gateway that narrows them while
+  keeping them working. `none` makes them useless; nothing else binds. That is a
+  residual risk, listed as one.
+- **The catalog's `allowHosts` is not a control.** It exists, and on abox's
+  topology it is advisory: the gateway keeps the server on its unrestricted
+  network and merely *adds* a proxy alongside, which a server is free to ignore.
+  It was empirically bypassed during the Phase 0 investigation. abox strips it
+  when it renders `disableNetwork`, because Docker refuses to start a container
+  asked for both a user-defined and a non-user-defined network mode.
+
+`abox doctor` states the position of every declared server on every run:
+
+```
+! MCP server containers are network-constrained as declared: unconstrained
+  egress: aws-documentation, brave, context7, github-official, playwright
+  (isolated: git, serena)
+```
+
 ### 7.1 Catalog servers
 
 The Docker MCP Toolkit catalog. Name one and it runs behind the gateway,
@@ -913,6 +977,8 @@ execution-adjacent file snapshot after you have read the diff.
 | operator-supplied images | custom images — the digest is their only integrity anchor (gateway signs only `docker.io/mcp/*`) |
 | unpinned local images | `pin: false` servers — no digest, no signature, must be built locally |
 | boundary-spanning servers | names servers (`curl`, `filesystem`, custom, …) whose tools reach past the agent's firewall/masks |
+| server network placement | read from the *rendered catalog*, not the manifest: which spawned servers run `--network none` and which have unrestricted egress. **Fails** if a declared `network: none` did not render. The warning names all three controls the unconstrained ones defeat at once — the firewall, the SNI proxy and the scoped DNS (§7.0) |
+| SNI proxy source restriction | the proxy listens on the bridge with no source filter, so an unfirewalled container (a gateway-spawned MCP server) can relay through it. A firewalled agent cannot — measured in the segmentation note |
 | remote servers | third-party trust story; `https`; no digest to pin |
 | secrets | every mapped name is in the Docker store; salted digests match the source |
 | agent env-secrets | the deliberate weakening — which secrets the agent holds, and the egress consequence |

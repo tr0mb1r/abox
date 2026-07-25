@@ -584,9 +584,24 @@ abox egress ignore telemetry.vendor.io # still blocked, no longer asked about
 ```
 
 **MCP tools are not covered by this.** They run in the gateway's own server
-containers, so a server like `curl` or `filesystem` reaches past the agent's
-firewall and masks by design. `abox doctor` names those servers explicitly
-rather than letting the sandbox look tighter than it is.
+containers, which are not the agent — so they are outside the firewall, the SNI
+proxy **and** the scoped resolver, all three at once. A tool call carrying a URL
+reaches that URL. Measured, not inferred:
+[the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md).
+
+There is one per-server setting Docker enforces, and abox exposes it:
+
+```yaml
+server_network:
+  git: none          # → `docker run --network none`
+  serena: none
+```
+
+Use it for anything that only touches the filesystem or the repo. It cannot help
+a server that needs the internet — `brave`, `github-official`, `playwright` — and
+nothing else can either; the catalog's `allowHosts` is advisory on this topology
+and was empirically bypassed. `abox doctor` names the position of every declared
+server on every run rather than letting the sandbox look tighter than it is.
 
 ## State on disk
 
@@ -694,6 +709,16 @@ an oversight:
   was a container. Remote servers go through the gateway instead of into the
   agent's `.mcp.json`, so "exactly one MCP endpoint" survives contact with
   Context7 and friends.
+- **Server isolation is `--network none` or nothing, and catalog entries are
+  shadowed to get it.** The plan had no position on MCP server egress. The
+  gateway turns out to offer no per-server network flag — it applies its own
+  container's networks to everything it spawns — so the only enforced setting is
+  `disableNetwork`, and abox reaches catalog servers it does not own by
+  re-emitting their entry under the same key. The alternative, moving the
+  gateway to an internal network, was measured and rejected: it requires
+  `--verify-signatures=false` and deletes remote/hosted MCP servers, because the
+  gateway pre-resolves every remote URL on its own resolver before any request,
+  so no proxy can rescue it.
 - **The gateway image ships digest-pinned, resolved by pulling.** The plan left
   it on the `:v2` tag. It is the one container that mounts `docker.sock`, so it
   is now pinned like everything else, and `abox gateway update` re-resolves the

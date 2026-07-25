@@ -109,6 +109,26 @@ class OutputFormat(StrEnum):
     text = "text"
 
 
+class ServerNetwork(StrEnum):
+    """Where a gateway-spawned MCP server container sits on the network.
+
+    ``shared`` is the gateway's own network, which is how the Docker MCP gateway
+    behaves by default and cannot be narrowed per server: it applies every
+    network its own container is on to every server it spawns. That network has
+    unrestricted egress, so a server there is outside the agent's firewall, the
+    SNI proxy, and the scoped resolver — all three at once.
+
+    ``none`` renders ``disableNetwork: true``, which the gateway turns into
+    ``docker run --network none``. Docker enforces that; it is not advisory.
+    Use it for servers that only touch the filesystem or the repo (``git``,
+    ``filesystem``, an LSP server). A server that needs the internet cannot use
+    it and is unconstrained — that residual risk is stated, not papered over.
+    """
+
+    shared = "shared"
+    none = "none"
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -328,6 +348,11 @@ class Manifest(StrictModel):
     #: the gateway will expose them under.
     remote_servers: dict[str, RemoteServer] = Field(default_factory=dict)
     tools: dict[str, list[str]] = Field(default_factory=dict)
+    #: Per-server network placement for gateway-spawned containers, as
+    #: ``name: none``. Absent means ``shared`` — today's behaviour. Custom
+    #: servers carry their own ``network:`` in custom-servers.yaml; this is for
+    #: catalog servers, which abox shadows by key to add the setting.
+    server_network: dict[str, ServerNetwork] = Field(default_factory=dict)
     toolchains: list[str] = Field(default_factory=list)
     mounts: MountsConfig = Field(default_factory=MountsConfig)
     egress: list[str] = Field(default_factory=list)
@@ -398,6 +423,25 @@ class Manifest(StrictModel):
             raise ValueError(
                 f"tools filter references undeclared server(s): {', '.join(stray)} — "
                 "add them to `servers` or drop the filter"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _server_network_references_declared_servers(self) -> Self:
+        stray = sorted(set(self.server_network) - set(self.all_servers))
+        if stray:
+            raise ValueError(
+                f"server_network references undeclared server(s): {', '.join(stray)} — "
+                "add them to `servers` or drop the entry"
+            )
+        # A remote server is dialled by the gateway process, not spawned as a
+        # container, so there is no container network to place. Saying `none`
+        # would silently do nothing.
+        remote = sorted(set(self.server_network) & set(self.remote_servers))
+        if remote:
+            raise ValueError(
+                f"server_network does not apply to remote server(s): {', '.join(remote)} — "
+                "the gateway dials these itself, there is no container to place"
             )
         return self
 
@@ -819,6 +863,12 @@ class CustomServer(StrictModel):
     #: the ``docker.io/mcp/*`` namespace alone, so an out-of-namespace image runs
     #: unverified either way.
     pin: bool = True
+    #: ``none`` renders ``disableNetwork: true``, which the gateway turns into
+    #: ``docker run --network none``. That is Docker enforcing it, not a
+    #: convention the server can ignore. ``shared`` (the default) leaves the
+    #: server on the gateway's network, where it has unrestricted egress —
+    #: outside the agent's firewall, the SNI proxy and the scoped resolver.
+    network: ServerNetwork = ServerNetwork.shared
     secrets: list[ServerSecret] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=lambda: ["*"])
     description: str = ""
@@ -841,6 +891,8 @@ class CustomServer(StrictModel):
             "type": "server",
             "image": self.image,
         }
+        if self.network is ServerNetwork.none:
+            entry["disableNetwork"] = True
         if self.secrets:
             entry["secrets"] = [{"name": s.name, "env": s.env} for s in self.secrets]
         if self.env:

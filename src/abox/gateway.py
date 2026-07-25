@@ -114,6 +114,7 @@ class ProfileRegistry:
         tools: dict[str, list[str]],
         remote_servers: dict[str, Any] | None = None,
         custom_servers: dict[str, Any] | None = None,
+        server_network: dict[str, Any] | None = None,
     ) -> None:
         def dump(mapping: dict[str, Any] | None) -> dict[str, Any]:
             return {
@@ -128,6 +129,10 @@ class ProfileRegistry:
             "tools": {k: sorted(set(v)) for k, v in tools.items()},
             "remote_servers": dump(remote_servers),
             "custom_servers": dump(custom_servers),
+            "server_network": {
+                name: getattr(mode, "value", str(mode))
+                for name, mode in (server_network or {}).items()
+            },
         }
 
     def forget(self, project_hash: str) -> None:
@@ -138,6 +143,36 @@ class ProfileRegistry:
         out: set[str] = set()
         for entry in self.projects.values():
             out.update(entry.get("servers") or [])
+        return sorted(out)
+
+    def network_none(self) -> list[str]:
+        """Servers any bound project wants on ``--network none``.
+
+        Most-restrictive-wins. One gateway serves every project on the profile
+        and a container has one network placement, so a disagreement has to
+        resolve somehow; resolving it towards the narrower answer is the only
+        direction that cannot quietly widen another project's sandbox.
+        `network_conflicts` names the disagreements so the loser is not
+        surprised.
+        """
+        out: set[str] = set()
+        for entry in self.projects.values():
+            out.update(
+                name
+                for name, mode in (entry.get("server_network") or {}).items()
+                if mode == "none"
+            )
+        return sorted(out)
+
+    def network_conflicts(self) -> list[str]:
+        """Servers one project pins to `none` while another leaves shared."""
+        restricted = set(self.network_none())
+        out: set[str] = set()
+        for entry in self.projects.values():
+            declared = entry.get("server_network") or {}
+            for name in entry.get("servers") or []:
+                if name in restricted and declared.get(name) != "none":
+                    out.add(name)
         return sorted(out)
 
     def remote_servers(self) -> dict[str, Any]:
@@ -274,10 +309,42 @@ remote_catalog_name = abox_catalog_name
 remote_catalog_path = abox_catalog_path
 
 
+def _network_none_shadows(
+    names: Iterable[str],
+    custom_servers: dict[str, Any],
+    catalog: Catalog | None,
+) -> dict[str, Any]:
+    """Shadow entries that put catalog servers on ``--network none``.
+
+    Custom servers are skipped: abox writes their entry itself, so the flag goes
+    in directly rather than through a second entry that would then fight it.
+    A name abox has no catalog entry for is skipped too — emitting a stub would
+    replace a working server with a broken one, which is a worse failure than
+    leaving it on the shared network and saying so.
+    """
+    out: dict[str, Any] = {}
+    for name in sorted(set(names)):
+        if name in custom_servers:
+            continue
+        entry = catalog.get(name) if catalog is not None else None
+        if entry is None or not entry.raw or entry.is_remote:
+            continue
+        shadow = dict(entry.raw)
+        shadow["disableNetwork"] = True
+        # allowHosts and --network none are mutually exclusive: the gateway
+        # would emit `--network none --network docker-mcp-proxies-int` and
+        # Docker refuses to start the container at all.
+        shadow.pop("allowHosts", None)
+        out[name] = shadow
+    return out
+
+
 def write_abox_catalog(
     profile: str,
     remote_servers: dict[str, Any] | None = None,
     custom_servers: dict[str, Any] | None = None,
+    network_none: Iterable[str] = (),
+    catalog: Catalog | None = None,
 ) -> Path | None:
     """Render everything the stock catalog does not carry into one v3 catalog.
 
@@ -285,17 +352,36 @@ def write_abox_catalog(
     file is what makes two things work at all: internet-hosted servers (which it
     proxies, keeping the agent to one endpoint) and the operator's own images
     from ``custom-servers.yaml``.
+
+    It is also where ``network: none`` lands. For a custom server abox writes
+    the whole entry anyway, so the flag is one more key. For a *catalog* server
+    abox does not own the entry, so it re-emits the upstream entry verbatim
+    under the same key with ``disableNetwork: true`` added — catalogs merge by
+    key and the later one wins. The gateway logs the overwrite by name, and
+    doctor reports it, so it is not a silent substitution. The copy is taken
+    from the catalog on every render, so it cannot drift further than one
+    ``abox up``.
     """
     path = abox_catalog_path(profile)
     remote_servers = remote_servers or {}
     custom_servers = custom_servers or {}
-    if not remote_servers and not custom_servers:
+    shadows = _network_none_shadows(network_none, custom_servers, catalog)
+    if not remote_servers and not custom_servers and not shadows:
         path.unlink(missing_ok=True)
         return None
 
-    registry: dict[str, Any] = {}
+    registry: dict[str, Any] = dict(shadows)
+    wanted_none = set(network_none)
     for name, server in sorted(custom_servers.items()):
-        registry[name] = server.catalog_entry(name)
+        entry = server.catalog_entry(name)
+        # A custom server can be pinned to `none` from either side: its own
+        # `network:` in custom-servers.yaml, or a project's `server_network`.
+        # The second one has to land here, because the shadow path deliberately
+        # skips custom servers rather than emit a duplicate entry to fight this.
+        if name in wanted_none:
+            entry["disableNetwork"] = True
+            entry.pop("allowHosts", None)
+        registry[name] = entry
 
     for name, server in sorted(remote_servers.items()):
         transport = getattr(server, "transport", "")
@@ -395,6 +481,11 @@ class GatewaySpec:
     #: (name, CustomServer) pairs from custom-servers.yaml that the stock
     #: catalog does not carry, so the gateway needs them written out.
     custom_servers: tuple[tuple[str, Any], ...] = ()
+    #: Servers to spawn with ``--network none``. Most-restrictive-wins across
+    #: the projects bound to this profile: one gateway serves all of them, so a
+    #: server cannot be on two networks at once, and the safe answer to a
+    #: disagreement is the narrower one. doctor reports the disagreement.
+    network_none: tuple[str, ...] = ()
 
     @property
     def url(self) -> str:
@@ -410,7 +501,7 @@ class GatewaySpec:
 
     @property
     def needs_catalog(self) -> bool:
-        return bool(self.remote_servers or self.custom_servers)
+        return bool(self.remote_servers or self.custom_servers or self.network_none)
 
     @property
     def all_servers(self) -> tuple[str, ...]:
@@ -492,6 +583,10 @@ class GatewaySpec:
                 "tools": list(self.tools),
                 "bind_writable": writable,
                 "bind_ro": readonly,
+                # The catalog the gateway reads is written at `up` time and only
+                # re-read on start, so a changed network placement must recreate
+                # the container or the old catalog keeps serving.
+                "network_none": list(self.network_none),
                 "custom": {
                     name: server.model_dump(mode="json")
                     if hasattr(server, "model_dump")
@@ -522,8 +617,19 @@ def build_spec(
     image: str | None = None,
     remote_servers: dict[str, Any] | None = None,
     custom_servers: dict[str, Any] | None = None,
+    network_none: Iterable[str] = (),
 ) -> GatewaySpec:
     profile_cfg = config.profile(profile)
+    custom = custom_servers or {}
+    # A custom server declaring `network: none` needs no separate opt-in: the
+    # declaration is the opt-in, and its entry already carries the flag.
+    from .manifest import ServerNetwork
+
+    declared_none = {
+        name
+        for name, server in custom.items()
+        if getattr(server, "network", ServerNetwork.shared) is ServerNetwork.none
+    }
     return GatewaySpec(
         profile=profile,
         container=paths.gateway_container(profile),
@@ -534,7 +640,8 @@ def build_spec(
         tools=tuple(sorted(set(tools or []))),
         token=ensure_token(profile),
         remote_servers=tuple(sorted((remote_servers or {}).items())),
-        custom_servers=tuple(sorted((custom_servers or {}).items())),
+        custom_servers=tuple(sorted(custom.items())),
+        network_none=tuple(sorted(set(network_none) | declared_none)),
     )
 
 
@@ -790,6 +897,7 @@ def up(
     tools: list[str] | None = None,
     remote_servers: dict[str, Any] | None = None,
     custom_servers: dict[str, Any] | None = None,
+    network_none: Iterable[str] | None = None,
     force: bool = False,
     pull_images: bool = True,
 ) -> GatewayStatus:
@@ -803,6 +911,7 @@ def up(
     wanted_custom = (
         custom_servers if custom_servers is not None else registry.custom_servers()
     )
+    wanted_none = network_none if network_none is not None else registry.network_none()
     spec = build_spec(
         profile,
         config,
@@ -810,9 +919,12 @@ def up(
         tools=wanted_tools,
         remote_servers=wanted_remotes,
         custom_servers=wanted_custom,
+        network_none=wanted_none,
     )
 
-    write_abox_catalog(profile, wanted_remotes, wanted_custom)
+    write_abox_catalog(
+        profile, wanted_remotes, wanted_custom, spec.network_none, catalog
+    )
     dockerx.ensure_network(spec.network)
     if pull_images:
         ensure_server_images(spec, catalog)
@@ -877,6 +989,7 @@ def bind_project(
     tools: dict[str, list[str]],
     remote_servers: dict[str, Any] | None = None,
     custom_servers: dict[str, Any] | None = None,
+    server_network: dict[str, Any] | None = None,
 ) -> ProfileRegistry:
     """Record this project's demands on the shared profile gateway."""
     registry = ProfileRegistry.load(profile)
@@ -888,6 +1001,7 @@ def bind_project(
         tools=tools,
         remote_servers=remote_servers,
         custom_servers=custom_servers,
+        server_network=server_network,
     )
     registry.save()
     return registry

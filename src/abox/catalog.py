@@ -42,8 +42,13 @@ class CatalogServer:
     #: Docker secret names the server expects (``github.personal_access_token``).
     secrets: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
-    #: Hosts the catalog says the server talks to — informational, the gateway
-    #: enforces its own egress, the agent never talks to these directly.
+    #: Hosts the catalog says the server talks to. **Informational only, and not
+    #: a control.** The gateway's allowHosts machinery only constrains anything
+    #: when the gateway itself sits on an internal network; on abox's topology
+    #: it merely adds a proxy alongside the server's existing unrestricted
+    #: network, and was empirically bypassed — see
+    #: docs/notes/mcp-egress-investigation.md. `server_network: none` is the
+    #: setting that Docker actually enforces.
     allow_hosts: tuple[str, ...] = ()
     source: str = "catalog"
     #: Set for ``type: remote`` entries — the gateway proxies these over the
@@ -62,6 +67,11 @@ class CatalogServer:
     #: the narrower "do not pull, require local presence" intent, and it stays
     #: False for an ordinary unpinned *catalog* tag, which abox still pulls.
     local_image: bool = False
+    #: The catalog entry exactly as read. Kept so abox can *shadow* an entry —
+    #: re-emit it under the same key with one field added — without hand-copying
+    #: a spec that would then drift. It is re-read on every render, so the copy
+    #: is never older than the last `abox up`.
+    raw: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def is_remote(self) -> bool:
@@ -162,6 +172,7 @@ def _parse_v3_registry(data: dict, source: str) -> dict[str, CatalogServer]:
             remote_transport=str(remote.get("transport_type") or ""),
             oauth_providers=providers,
             kind=str(entry.get("type") or "server"),
+            raw=dict(entry),
         )
     return out
 

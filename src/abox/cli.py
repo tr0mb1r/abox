@@ -32,6 +32,7 @@ from .manifest import (
     RemoteTransport,
     RunConfig,
     SecretsConfig,
+    ServerNetwork,
     effective_allowlist,
     format_errors,
     merged_egress,
@@ -108,6 +109,11 @@ def _spec(manifest: Manifest, config: GlobalConfig) -> gateway.GatewaySpec:
         tools=sorted({t for tools in manifest.tools.values() for t in tools}),
         remote_servers=manifest.remote_servers,
         custom_servers=_custom_for(manifest),
+        network_none=[
+            name
+            for name, mode in manifest.server_network.items()
+            if mode is ServerNetwork.none
+        ],
     )
 
 
@@ -120,6 +126,7 @@ def _bind(workspace: Path, manifest: Manifest) -> gateway.ProfileRegistry:
         tools=manifest.tools,
         remote_servers=manifest.remote_servers,
         custom_servers=_custom_for(manifest),
+        server_network=manifest.server_network,
     )
 
 

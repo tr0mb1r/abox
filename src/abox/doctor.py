@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from . import dockerx, gateway, paths, render, secrets, shell, telemetry
 from .catalog import Catalog
 from .errors import AboxError
@@ -194,6 +196,7 @@ def check_servers(
     checks.extend(check_remote_servers(manifest, catalog, remote_catalog))
     checks.extend(check_custom_servers(manifest, custom))
     checks.extend(check_boundary_spanning_servers(manifest))
+    checks.append(check_server_network(manifest, config, catalog))
     checks.append(
         Check(
             id="servers.pinned",
@@ -306,6 +309,88 @@ def check_boundary_spanning_servers(manifest: Manifest) -> list[Check]:
             data={"servers": sorted(hits)},
         )
     ]
+
+
+def check_server_network(
+    manifest: Manifest, config: GlobalConfig, catalog: Catalog | None = None
+) -> Check:
+    """Which spawned server containers have egress, read from the rendered catalog.
+
+    This reads the file abox actually mounts into the gateway rather than the
+    manifest, for the same reason `agent.no-docker-sock` reads the runspec: the
+    manifest is the intent and the catalog is the instruction. A `network: none`
+    that failed to render is exactly the case worth catching.
+
+    Every server not pinned to `none` sits on the gateway's network with normal
+    egress and Docker's default resolver. That is not one control bypassed, it
+    is three at once — the agent's firewall, the SNI proxy, and the scoped DNS —
+    because all three live inside the agent container and a server container is
+    not the agent. Measured, not inferred: docs/notes/mcp-egress-investigation.md.
+    """
+    from . import gateway as gw
+
+    path = gw.abox_catalog_path(manifest.profile)
+    rendered: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            rendered = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get(
+                "registry"
+            ) or {}
+        except (OSError, yaml.YAMLError):
+            rendered = {}
+
+    isolated = sorted(
+        name
+        for name, entry in rendered.items()
+        if isinstance(entry, dict) and entry.get("disableNetwork")
+    )
+    spawned = [
+        name
+        for name in manifest.all_servers
+        if name not in manifest.remote_servers
+        and not (catalog and (e := catalog.get(name)) and e.is_remote)
+    ]
+    unconstrained = sorted(set(spawned) - set(isolated))
+
+    asked = sorted(
+        name for name, mode in manifest.server_network.items() if mode.value == "none"
+    )
+    unrendered = sorted(set(asked) - set(isolated))
+    if unrendered:
+        return Check(
+            id="servers.network",
+            title="MCP server containers are network-constrained as declared",
+            status=Status.fail,
+            detail=f"declared network: none but not rendered that way: {', '.join(unrendered)}",
+            hint="`abox up` re-renders the catalog. If it persists, abox has no "
+            "catalog entry to shadow for that name — it will not emit a stub, "
+            "because replacing a working server with a broken one is worse",
+            data={"declared": asked, "isolated": isolated, "unrendered": unrendered},
+        )
+
+    if not unconstrained:
+        return Check(
+            id="servers.network",
+            title="MCP server containers are network-constrained as declared",
+            status=Status.ok,
+            detail=f"all {len(isolated)} spawned server(s) run with --network none",
+            data={"isolated": isolated, "unconstrained": []},
+        )
+
+    return Check(
+        id="servers.network",
+        title="MCP server containers are network-constrained as declared",
+        status=Status.warn,
+        detail=f"unconstrained egress: {', '.join(unconstrained)}"
+        + (f" (isolated: {', '.join(isolated)})" if isolated else ""),
+        hint="these run on "
+        f"{config.network} with normal egress and Docker's own resolver, so they "
+        "are outside the agent's firewall, the SNI proxy AND the scoped DNS at "
+        "the same time — a tool call carrying a URL reaches that URL. Set "
+        "`server_network: {<name>: none}` for any server that does not need the "
+        "internet; there is no setting that constrains one that does",
+        data={"isolated": isolated, "unconstrained": unconstrained},
+    )
 
 
 def check_custom_servers(manifest: Manifest, custom: CustomServers) -> list[Check]:
@@ -941,6 +1026,28 @@ def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path
                 detail=", ".join(status.published_ports),
             )
         )
+    # Measured in docs/notes/network-segmentation.md: nginx listens on the
+    # bridge with no source restriction, so anything on the network that is not
+    # behind the agent firewall — a gateway-spawned MCP server container, most
+    # concretely — can relay through it to this project's allowlist. A
+    # firewalled agent cannot: its OUTPUT policy drops everything but its own
+    # proxy. There is no `allow`/`deny` that fixes this without also breaking
+    # the agent, whose source address is not knowable at render time.
+    checks.append(
+        Check(
+            id="egress.proxy-open-to-the-bridge",
+            title="the SNI proxy accepts connections from the whole bridge",
+            status=Status.warn,
+            detail=f"{proxy_mod.proxy_container(manifest.project)} listens on "
+            f"{config.network} with no source restriction",
+            hint="agents cannot exploit it — their OUTPUT policy permits only "
+            "their own proxy — but unfirewalled containers on the network can, "
+            "and gateway-spawned MCP server containers are unfirewalled. They "
+            "already have unrestricted egress, so this grants no new reach; it "
+            "does mean this project's allowlist is not a boundary for them",
+            data={"container": proxy_mod.proxy_container(manifest.project)},
+        )
+    )
     denied = proxy_mod.denied_names(manifest.project)
     if denied:
         names = sorted({d["sni"] for d in denied})

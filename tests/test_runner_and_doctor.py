@@ -457,6 +457,54 @@ def test_auth_credential_names_the_connector_blast_radius(manifest, config, work
     assert "connectors on that account reach" in check.hint
 
 
+def test_server_network_names_all_three_defeated_controls(manifest, config) -> None:
+    """Not one control bypassed — the firewall, the SNI proxy and the DNS scoping."""
+    manifest.servers = ["brave"]
+    check = doctor.check_server_network(manifest, config)
+    assert check.status is doctor.Status.warn
+    assert "brave" in check.detail
+    assert "firewall" in check.hint
+    assert "SNI proxy" in check.hint
+    assert "scoped DNS" in check.hint
+
+
+def test_server_network_reads_the_rendered_catalog_not_the_manifest(
+    manifest, config
+) -> None:
+    """The manifest is the intent; the catalog is the instruction the gateway reads."""
+    manifest.servers = ["git"]
+    gateway.write_abox_catalog(
+        manifest.profile,
+        {},
+        {},
+        ["git"],
+        _one_entry_catalog("git"),
+    )
+    check = doctor.check_server_network(manifest, config)
+    assert check.status is doctor.Status.ok
+    assert check.data["isolated"] == ["git"]
+
+
+def test_server_network_fails_when_a_declared_isolation_did_not_render(
+    manifest, config
+) -> None:
+    from abox.manifest import ServerNetwork
+
+    manifest.servers = ["git"]
+    manifest.server_network = {"git": ServerNetwork.none}
+    gateway.abox_catalog_path(manifest.profile).unlink(missing_ok=True)
+    check = doctor.check_server_network(manifest, config)
+    assert check.status is doctor.Status.fail
+    assert check.data["unrendered"] == ["git"]
+
+
+def _one_entry_catalog(name: str):
+    from abox.catalog import Catalog, CatalogServer
+
+    raw = {"type": "server", "image": f"mcp/{name}@sha256:" + "c" * 64}
+    return Catalog(servers={name: CatalogServer(name=name, image=raw["image"], raw=raw)})
+
+
 def test_report_exit_code_reflects_failures() -> None:
     report = doctor.Report()
     report.add(doctor.Check(id="a", title="a", status=doctor.Status.warn))
