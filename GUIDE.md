@@ -643,6 +643,41 @@ value it can exfiltrate to anywhere the firewall allows, and a value in a
 container's environment is visible to anyone with host Docker access. Here the
 egress allowlist stops being defence-in-depth and becomes the actual boundary.
 
+### The credential the agent already holds
+
+`env_secrets` is opt-in. One credential is not, and the section above would be
+telling only the flattering half if it stopped there.
+
+Claude Code authenticates with an OAuth credential, and that credential lives in
+the per-project `~/.claude` volume (`abox-claude-<hash>`, mounted at
+`/home/<remote_user>/.claude`). The agent runs as the user that owns that
+directory, so **the agent can read it**. Every sentence above about attached
+secrets applies here unchanged, including the exfiltration one, and there is no
+`detach` — remove it and there is no agent. Doctor states it on every run:
+
+```
+! the agent holds a Claude credential: abox-claude-f7452ac18279 mounted at
+  /home/vscode/.claude — readable by the agent
+  ↳ the agent can read and transmit it to any allowed domain (4 currently
+    allowed), exactly as with an attached secret
+```
+
+Two things bound it and one thing widens it:
+
+- **Per-project volume.** Each project gets its own `~/.claude`, so a compromised
+  agent yields that project's session — not one credential shared by every
+  sandbox on the host. This is the reason the volume is keyed by project hash.
+- **The egress allowlist.** Same as for attached secrets: it is the boundary, not
+  a second line behind one.
+- **`run.connectors: true` widens it past the sandbox.** The credential then
+  reaches whatever the connectors on that account reach — systems abox has no
+  visibility into and no ability to constrain — and those tool calls do not
+  traverse the gateway, so they never appear in `abox logs --gateway`. Doctor
+  appends that consequence to the same line when the flag is on.
+
+`abox nuke` prompts before deleting the auth volume precisely because deleting it
+means logging in again; `--keep-auth` skips it. Neither changes the fact above.
+
 ---
 
 ## 9. Egress control
@@ -821,6 +856,7 @@ re-baselines the git tamper snapshot.
 | remote servers | third-party trust story; `https`; no digest to pin |
 | secrets | every mapped name is in the Docker store; salted digests match the source |
 | agent env-secrets | the deliberate weakening — which secrets the agent holds, and the egress consequence |
+| agent Claude credential | the credential the agent holds whether or not you attached one: the `~/.claude` volume is readable by it, exfiltrable to any allowed domain, and with `run.connectors` its reach is the account's, not the sandbox's |
 | gateway | container running; `/mcp` responds on `abox-net` |
 | gateway image digest-pinned | **fails** on a tag. The gateway is the container that mounts `docker.sock`; a mutable reference there is the same finding as an unpinned server image, not a lesser one. `abox gateway update` resolves and writes the digest |
 | running gateway matches the pin | **fails** when the container already holding the socket was started from a different digest than the config now pins — an older config, a tag that moved under it, or a hand-started container. Compares the running image *id*, not the reference it was given |

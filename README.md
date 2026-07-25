@@ -491,6 +491,31 @@ in a container's environment is visible to anyone with host Docker access. The
 egress allowlist stops being defence-in-depth here and becomes the actual
 boundary. `abox secrets detach DATABASE_URL` takes it back.
 
+### The credential the agent already holds
+
+Attaching a secret is opt-in. One credential is not. Claude Code's OAuth
+credential lives in the per-project `~/.claude` volume, the agent runs as the
+user that owns it, and so the agent can read it. Every sentence above about
+attached secrets applies to it unchanged — including the exfiltration one — and
+there is no `detach` for it, because without it there is no agent. Doctor says
+so on every run:
+
+```
+! the agent holds a Claude credential: abox-claude-<hash> mounted at
+  /home/vscode/.claude — readable by the agent
+  ↳ the agent can read and transmit it to any allowed domain (4 currently
+    allowed), exactly as with an attached secret
+```
+
+With `run.connectors: true` the blast radius stops being this sandbox: the
+credential reaches whatever the connectors on that account reach, and those tool
+calls do not pass through the gateway, so they are absent from
+`abox logs --gateway` too. Doctor appends that to the same line when it applies.
+
+Keeping the credential per-project is what bounds this: a compromise of one
+project's agent yields that project's session, not a credential shared across
+every sandbox on the host.
+
 ## Commands
 
 | Command | What it does |

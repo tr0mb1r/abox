@@ -16,6 +16,7 @@ from abox.manifest import (
     Manifest,
     PermissionMode,
     SecretsConfig,
+    merged_egress,
 )
 
 
@@ -323,6 +324,27 @@ def test_gateway_drift_check_skips_when_nothing_is_running(config, runner) -> No
     runner.expect(r"docker container inspect", "", returncode=1)
     check = doctor.check_gateway_image_drift("dev", config)
     assert check.status is doctor.Status.skip
+
+
+def test_auth_credential_is_reported_even_with_no_attached_secrets(
+    manifest, config, workspace
+) -> None:
+    """The one credential the agent holds whether or not you attached anything."""
+    assert not manifest.env_secrets
+    check = doctor.check_auth_credential(manifest, config, workspace)
+    assert check.status is doctor.Status.warn
+    assert paths.claude_volume(workspace) in check.detail
+    assert f"/home/{config.remote_user}/.claude" in check.detail
+    # The allowed-domain count is the number that makes the risk concrete.
+    assert str(len(merged_egress(manifest, config))) in check.hint
+    assert "connectors" not in check.hint
+
+
+def test_auth_credential_names_the_connector_blast_radius(manifest, config, workspace) -> None:
+    manifest.run.connectors = True
+    check = doctor.check_auth_credential(manifest, config, workspace)
+    assert check.data["connectors"] is True
+    assert "connectors on that account reach" in check.hint
 
 
 def test_report_exit_code_reflects_failures() -> None:

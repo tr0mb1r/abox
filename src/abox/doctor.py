@@ -989,6 +989,43 @@ def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> li
     ]
 
 
+def check_auth_credential(manifest: Manifest, config: GlobalConfig, workspace: Path) -> Check:
+    """The credential the agent holds whether or not you attached anything.
+
+    ``~/.claude`` is a per-project volume, and Claude Code's OAuth credential
+    lives in it. The agent runs as the user that owns it, so the agent can read
+    it — and everything the env-secrets check says about exfiltration to an
+    allowed domain applies here unchanged. Reporting attached secrets loudly
+    while staying silent about this one would be picking the flattering half.
+    """
+    allowed = merged_egress(manifest, config)
+    detail = (
+        f"{paths.claude_volume(workspace)} mounted at "
+        f"/home/{config.remote_user}/.claude — readable by the agent"
+    )
+    hint = (
+        f"the agent can read and transmit it to any allowed domain "
+        f"({len(allowed)} currently allowed), exactly as with an attached secret"
+    )
+    if not manifest.run.single_mcp_endpoint:
+        hint += (
+            ". run.connectors is on, so its blast radius is not just this "
+            "sandbox — it is whatever the connectors on that account reach"
+        )
+    return Check(
+        id="agent.auth-credential",
+        title="the agent holds a Claude credential",
+        status=Status.warn,
+        detail=detail,
+        hint=hint,
+        data={
+            "volume": paths.claude_volume(workspace),
+            "allowed_domains": len(allowed),
+            "connectors": not manifest.run.single_mcp_endpoint,
+        },
+    )
+
+
 def check_agent_secrets(manifest: Manifest, config: GlobalConfig) -> list[Check]:
     """The one place abox hands the agent a credential. Report it every time.
 
@@ -1119,6 +1156,7 @@ def full(
         report.add(check)
     for check in check_agent_secrets(manifest, config):
         report.add(check)
+    report.add(check_auth_credential(manifest, config, workspace))
     for check in check_egress_proxy(manifest, config, workspace):
         report.add(check)
     report.add(check_shared_addresses(manifest, config))
