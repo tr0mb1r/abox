@@ -21,6 +21,7 @@ from . import shell as shell_mod
 from .errors import AboxError
 from .manifest import (
     BASE_MANDATORY_EGRESS,
+    GATEWAY_IMAGE_TAG,
     CustomServers,
     GlobalConfig,
     Manifest,
@@ -1322,6 +1323,57 @@ def gateway_down(
             f"[green]✔[/] {paths.gateway_container(name)} removed"
             if removed
             else f"[dim]{paths.gateway_container(name)} was not running[/]"
+        )
+    except AboxError as exc:
+        _fail(exc)
+
+
+@gateway_app.command("update")
+def gateway_update(
+    tag: Annotated[
+        str | None,
+        typer.Option("--tag", help=f"Tag to resolve (default: {GATEWAY_IMAGE_TAG})."),
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation.")] = False,
+) -> None:
+    """Resolve the gateway tag to a digest and pin it in the global config.
+
+    Pulls the tag first: the digest abox writes is the one the daemon actually
+    has, not one asserted by a registry lookup abox would then have to trust
+    separately.
+    """
+    try:
+        config = GlobalConfig.load()
+        reference = tag or GATEWAY_IMAGE_TAG
+        console.print(f"pulling [bold]{reference}[/] …")
+        result = dockerx.pull(reference)
+        if not result.ok:
+            raise AboxError(
+                f"could not pull {reference}: {result.stderr.strip()[:200]}",
+                hint="check the tag and that the daemon can reach the registry",
+            )
+        resolved = dockerx.image_digest(reference)
+        if not resolved:
+            raise AboxError(f"{reference} carries no repo digest to pin")
+
+        current = config.gateway_image
+        if current == resolved:
+            console.print(f"[green]✔[/] already pinned to {resolved}")
+            return
+
+        console.print(f"  [red]- {current}[/]")
+        console.print(f"  [green]+ {resolved}[/]")
+        if not yes and not typer.confirm(
+            "write this digest to the global config?", default=False
+        ):
+            console.print("[dim]left unchanged[/]")
+            return
+
+        config.gateway_image = resolved
+        target = config.save()
+        console.print(f"[green]✔[/] pinned in {target}")
+        console.print(
+            "  [dim]`abox gateway up --force` to recreate running gateways from it[/]"
         )
     except AboxError as exc:
         _fail(exc)

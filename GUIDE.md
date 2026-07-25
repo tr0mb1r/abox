@@ -94,7 +94,7 @@ The same topology as text, with the exact mounts and ports:
 Host (macOS)
 ├── Docker Desktop (MCP Toolkit)
 │   ├── network: abox-net              user bridge, nothing published anywhere
-│   ├── abox-gw-<profile>              docker/mcp-gateway:v2
+│   ├── abox-gw-<profile>              docker/mcp-gateway@sha256:… (digest-pinned)
 │   │     ├─ mounts /var/run/docker.sock
 │   │     ├─ --transport=streaming --port=<profile port> --host=0.0.0.0
 │   │     └─ bearer token, minted per profile by abox
@@ -225,7 +225,7 @@ back to the value shown.
 
 ```yaml
 network: abox-net                                   # the user bridge abox creates
-gateway_image: docker/mcp-gateway:v2                # doctor nudges you to pin the digest
+gateway_image: docker/mcp-gateway@sha256:54dd518e… # digest-pinned; `abox gateway update` re-resolves it
 agent_base_image: mcr.microsoft.com/devcontainers/base:ubuntu
 claude_version: latest                              # or an exact x.y.z to pin Claude Code
 toolchain_versions:                                 # fetched from upstream tarballs at build
@@ -808,7 +808,9 @@ re-baselines the git tamper snapshot.
 | secrets | every mapped name is in the Docker store; salted digests match the source |
 | agent env-secrets | the deliberate weakening — which secrets the agent holds, and the egress consequence |
 | gateway | container running; `/mcp` responds on `abox-net` |
-| gateway image / verify-signatures | gateway image pinned; the running container carries `--verify-signatures` |
+| gateway image digest-pinned | **fails** on a tag. The gateway is the container that mounts `docker.sock`; a mutable reference there is the same finding as an unpinned server image, not a lesser one. `abox gateway update` resolves and writes the digest |
+| running gateway matches the pin | **fails** when the container already holding the socket was started from a different digest than the config now pins — an older config, a tag that moved under it, or a hand-started container. Compares the running image *id*, not the reference it was given |
+| gateway verify-signatures | the running container carries `--verify-signatures` |
 | artifacts | rendered artifacts hash-match the manifest (drift ⇒ re-render) |
 | boundary gate | `bypassPermissions` ⇒ firewall script + `NET_ADMIN`/`NET_RAW` present |
 | egress proxy | if configured, the proxy is up; surfaces SNI refusals |
@@ -887,6 +889,7 @@ different tool.
 | `abox gateway up [profile]` | `--force` | start/reconcile a profile's gateway |
 | `abox gateway down [profile]` | | stop a profile's gateway |
 | `abox gateway status [profile]` | `--tools` | health; `--tools` lists what it exposes live |
+| `abox gateway update` | `--tag`, `-y/--yes` | pull the gateway tag, show the digest diff, write it to the global config on confirmation |
 | `abox doctor` | `-v`, `--json`, `--accept-git`, `--quick` | the full audit |
 | `abox logs` | `--runs`, `--dns`, `--gateway`, `--transcript`, `-n` | local telemetry |
 | `abox nuke` | `--keep-auth`, `-y` | remove containers and artifacts (prompts before the auth volume) |

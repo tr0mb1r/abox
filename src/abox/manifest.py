@@ -496,11 +496,25 @@ class Defaults(StrictModel):
         return [_check_host(h) for h in value]
 
 
+#: The tag the shipped gateway digest was resolved from. `abox gateway update`
+#: re-resolves this; doctor names it when the running gateway has drifted.
+GATEWAY_IMAGE_TAG = "docker/mcp-gateway:v2"
+
+#: Digest-pinned by default. The gateway is the most privileged container abox
+#: runs — it is the one that mounts ``/var/run/docker.sock`` — so leaving it on
+#: a mutable tag while every MCP server image is pinned was an inconsistency,
+#: not a convenience. Re-resolve with `abox gateway update`.
+DEFAULT_GATEWAY_IMAGE = (
+    "docker/mcp-gateway@sha256:"
+    "54dd518ee51b5c4641b02ddd4790b88cc0dafa59d76b6d07bc441d896a23bbea"
+)
+
+
 class GlobalConfig(StrictModel):
     """``~/.config/abox/config.yaml``."""
 
     network: str = "abox-net"
-    gateway_image: str = "docker/mcp-gateway:v2"
+    gateway_image: str = DEFAULT_GATEWAY_IMAGE
     #: Base image for the agent container.
     agent_base_image: str = "mcr.microsoft.com/devcontainers/base:ubuntu"
     #: Claude Code release to bake in: "latest" or an exact x.y.z to pin.

@@ -219,22 +219,27 @@ def check_servers(
             )
         )
 
+    # The gateway is the one container that mounts the Docker socket. A mutable
+    # tag there is a standing offer to swap the most privileged process in the
+    # system, so this is a failure on the same footing as `servers.pinned`.
     pinned_gw = config.gateway_image_pinned
     digest = dockerx.image_digest(config.gateway_image) if not pinned_gw else config.gateway_image
     checks.append(
         Check(
             id="gateway.image-pinned",
             title="gateway image is digest-pinned",
-            status=Status.ok if pinned_gw else Status.warn,
+            status=Status.ok if pinned_gw else Status.fail,
             detail=config.gateway_image
             if pinned_gw
             else f"{config.gateway_image} (resolves to {digest or 'not pulled yet'})",
-            hint=f"pin it: set gateway_image: {digest} in {paths.global_config_path()}"
-            if not pinned_gw and digest
+            hint="`abox gateway update` resolves the tag and writes the digest"
+            if not pinned_gw
             else "",
             data={"resolved": digest or ""},
         )
     )
+
+    checks.append(check_gateway_image_drift(manifest.profile, config))
 
     # --verify-signatures is a gateway argument; confirm the running container
     # actually carries it rather than trusting that abox started it.
@@ -511,6 +516,49 @@ def check_secrets(
         )
     )
     return checks
+
+
+def check_gateway_image_drift(profile: str, config: GlobalConfig) -> Check:
+    """Is the gateway that is *running* the one the config pins?
+
+    Pinning the reference in config.yaml settles what abox will start next time.
+    It says nothing about the container already holding the Docker socket, which
+    may have been started from an older config, from a tag that has since moved,
+    or by hand. So compare the running container's image id — resolved to its
+    repo digest, because ``Config.Image`` only echoes whatever was typed.
+    """
+    container = paths.gateway_container(profile)
+    running = dockerx.container_image_digest(container)
+    if running is None:
+        return Check(
+            id="gateway.image-digest",
+            title="running gateway matches the pinned digest",
+            status=Status.skip,
+            detail=f"{container} is not running",
+        )
+    configured = (
+        config.gateway_image
+        if config.gateway_image_pinned
+        else dockerx.image_digest(config.gateway_image)
+    )
+    if not configured:
+        return Check(
+            id="gateway.image-digest",
+            title="running gateway matches the pinned digest",
+            status=Status.skip,
+            detail=f"{config.gateway_image} is not pulled, so there is nothing to compare",
+        )
+    match = running == configured
+    return Check(
+        id="gateway.image-digest",
+        title="running gateway matches the pinned digest",
+        status=Status.ok if match else Status.fail,
+        detail=running if match else f"running {running}, configured {configured}",
+        hint="`abox gateway up --force` recreates it from the pinned image"
+        if not match
+        else "",
+        data={"running": running, "configured": configured},
+    )
 
 
 def check_gateway(manifest: Manifest, config: GlobalConfig, *, deep: bool = True) -> list[Check]:

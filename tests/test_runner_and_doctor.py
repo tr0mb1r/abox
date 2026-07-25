@@ -269,16 +269,60 @@ def test_unknown_server_fails(manifest, config, catalog_file, runner) -> None:
     assert checks["servers.declared"].status is doctor.Status.fail
 
 
-def test_unpinned_gateway_image_offers_the_digest(manifest, config, catalog_file, runner) -> None:
+def test_unpinned_gateway_image_is_a_failure(manifest, config, catalog_file, runner) -> None:
+    """The gateway mounts the Docker socket; a mutable tag there is not a warning."""
     from abox import catalog as catalog_mod
 
+    config.gateway_image = "docker/mcp-gateway:v2"
     digest = "docker/mcp-gateway@sha256:" + "e" * 64
     runner.expect(r"docker image inspect", json.dumps({"RepoDigests": [digest]}))
     cat = catalog_mod.load(allow_oci_fallback=False)
     checks = {c.id: c for c in doctor.check_servers(manifest, cat, CustomServers(), config)}
     check = checks["gateway.image-pinned"]
-    assert check.status is doctor.Status.warn
-    assert digest in check.hint
+    assert check.status is doctor.Status.fail
+    assert "abox gateway update" in check.hint
+
+
+def test_pinned_gateway_image_passes(manifest, config, catalog_file, runner) -> None:
+    from abox import catalog as catalog_mod
+
+    cat = catalog_mod.load(allow_oci_fallback=False)
+    checks = {c.id: c for c in doctor.check_servers(manifest, cat, CustomServers(), config)}
+    assert checks["gateway.image-pinned"].status is doctor.Status.ok
+
+
+def test_running_gateway_on_a_different_digest_fails(config, runner) -> None:
+    """Pinning settles the next start. This is about the container already up."""
+    running = "docker/mcp-gateway@sha256:" + "b" * 64
+    runner.expect(
+        r"docker container inspect",
+        json.dumps({"Image": "sha256:" + "c" * 64}),
+    )
+    runner.expect(r"docker image inspect", json.dumps({"RepoDigests": [running]}))
+    check = doctor.check_gateway_image_drift("dev", config)
+    assert check.status is doctor.Status.fail
+    assert running in check.detail
+    assert config.gateway_image in check.detail
+    assert "--force" in check.hint
+
+
+def test_running_gateway_on_the_pinned_digest_passes(config, runner) -> None:
+    runner.expect(
+        r"docker container inspect",
+        json.dumps({"Image": "sha256:" + "c" * 64}),
+    )
+    runner.expect(
+        r"docker image inspect",
+        json.dumps({"RepoDigests": [config.gateway_image]}),
+    )
+    check = doctor.check_gateway_image_drift("dev", config)
+    assert check.status is doctor.Status.ok
+
+
+def test_gateway_drift_check_skips_when_nothing_is_running(config, runner) -> None:
+    runner.expect(r"docker container inspect", "", returncode=1)
+    check = doctor.check_gateway_image_drift("dev", config)
+    assert check.status is doctor.Status.skip
 
 
 def test_report_exit_code_reflects_failures() -> None:

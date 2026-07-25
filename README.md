@@ -61,7 +61,7 @@ The same topology as text, with the exact mounts and ports:
 Host (macOS)
 ├── Docker Desktop (MCP Toolkit)
 │   ├── network: abox-net              user bridge, nothing published anywhere
-│   ├── abox-gw-<profile>              docker/mcp-gateway:v2
+│   ├── abox-gw-<profile>              docker/mcp-gateway@sha256:… (digest-pinned)
 │   │     ├─ mounts /var/run/docker.sock
 │   │     ├─ --transport=streaming --port=8811 --host=0.0.0.0
 │   │     └─ bearer token, minted per profile by abox
@@ -497,6 +497,7 @@ boundary. `abox secrets detach DATABASE_URL` takes it back.
 | `abox secrets attach/detach` | hand a stored secret to the agent as an env var (weakens an invariant; doctor reports it) |
 | `abox secrets rm` | revoke; refuses while a project still references it |
 | `abox gateway up/down/status` | per-profile gateway lifecycle (`--tools` lists what it exposes) |
+| `abox gateway update` | re-resolve the gateway tag to a digest and pin it, after showing the diff |
 | `abox doctor` | the full audit |
 | `abox logs --runs/--dns/--gateway` | local telemetry |
 | `abox nuke` | remove containers and artifacts (prompts before the auth volume) |
@@ -632,3 +633,11 @@ an oversight:
   was a container. Remote servers go through the gateway instead of into the
   agent's `.mcp.json`, so "exactly one MCP endpoint" survives contact with
   Context7 and friends.
+- **The gateway image ships digest-pinned, resolved by pulling.** The plan left
+  it on the `:v2` tag. It is the one container that mounts `docker.sock`, so it
+  is now pinned like everything else, and `abox gateway update` re-resolves the
+  tag by pulling it and reading the daemon's own `RepoDigests` rather than by
+  asking a registry — the digest abox writes is then the one the daemon actually
+  holds, with no second resolution path to trust. Verified arch-independent:
+  `docker buildx imagetools inspect docker/mcp-gateway:v2` returns the same
+  manifest-list digest that a local pull records.

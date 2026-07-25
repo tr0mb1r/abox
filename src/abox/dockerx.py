@@ -196,6 +196,22 @@ def image_digest(image: str) -> str | None:
     return None
 
 
+def container_image_digest(name: str) -> str | None:
+    """Return the ``repo@sha256:…`` a running container was actually started from.
+
+    ``Config.Image`` records the reference the operator typed, which is exactly
+    the thing that can lie when it is a tag. The image *id* cannot, so resolve
+    through it.
+    """
+    data = inspect("container", name)
+    if not data:
+        return None
+    image_id = str(data.get("Image") or "")
+    if not image_id:
+        return None
+    return image_digest(image_id)
+
+
 # -- volumes --------------------------------------------------------------
 
 

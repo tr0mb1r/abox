@@ -8,6 +8,8 @@ import pytest
 
 from abox.errors import ConfigError
 from abox.manifest import (
+    DEFAULT_GATEWAY_IMAGE,
+    GATEWAY_IMAGE_TAG,
     CustomServer,
     CustomServers,
     GlobalConfig,
@@ -125,9 +127,14 @@ def test_global_config_saves_private(config: GlobalConfig) -> None:
 
 
 def test_gateway_image_pinned_detection() -> None:
-    assert not GlobalConfig().gateway_image_pinned
+    # The shipped default is pinned: the gateway holds the Docker socket, so it
+    # gets the same treatment as every MCP server image.
+    assert GlobalConfig().gateway_image_pinned
+    assert GlobalConfig().gateway_image == DEFAULT_GATEWAY_IMAGE
+    assert DEFAULT_GATEWAY_IMAGE.startswith(GATEWAY_IMAGE_TAG.split(":")[0] + "@sha256:")
     pinned = GlobalConfig(gateway_image="docker/mcp-gateway@sha256:" + "a" * 64)
     assert pinned.gateway_image_pinned
+    assert not GlobalConfig(gateway_image="docker/mcp-gateway:v2").gateway_image_pinned
 
 
 def test_merged_masks_keeps_order_and_dedupes(manifest: Manifest, config: GlobalConfig) -> None:
