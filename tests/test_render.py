@@ -277,6 +277,35 @@ def test_mandatory_egress_covers_claude_auth(manifest, config, workspace, spec) 
         assert f'"{host}"' in result.artifacts[render.ARTIFACT_FIREWALL]
 
 
+def test_mandatory_egress_survives_an_operator_supplied_list(
+    manifest, config, workspace, spec
+) -> None:
+    """The case the test above misses, and the one every real host is in.
+
+    `config` in these tests is a default GlobalConfig, whose egress_mandatory
+    *is* BASE_MANDATORY_EGRESS. A config.yaml that spells out its own list
+    replaces that default — so an install written before abox added
+    platform.claude.com kept working until a token needed refreshing, then
+    failed inside the container as a bare ENOTFOUND. The base set is unioned in
+    regardless now; "mandatory" means mandatory.
+    """
+    config.defaults.egress_mandatory = ["api.anthropic.com"]
+    result = _render(manifest, config, workspace, spec)
+    for host in ("api.anthropic.com", "platform.claude.com", "claude.ai", "claude.com"):
+        assert host in result.egress, host
+        assert f'"{host}"' in result.artifacts[render.ARTIFACT_FIREWALL], host
+
+
+def test_operator_additions_to_mandatory_egress_still_apply(
+    manifest, config, workspace, spec
+) -> None:
+    """Unioning the base set must not stop the operator adding to it."""
+    config.defaults.egress_mandatory = ["proxy.corp.internal"]
+    result = _render(manifest, config, workspace, spec)
+    assert "proxy.corp.internal" in result.egress
+    assert "platform.claude.com" in result.egress
+
+
 def test_optional_claude_traffic_is_turned_off_not_just_blocked(
     manifest, config, workspace, spec
 ) -> None:

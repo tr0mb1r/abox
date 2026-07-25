@@ -25,6 +25,7 @@ from . import dockerx, gateway, paths, render, secrets, shell, telemetry
 from .catalog import Catalog
 from .errors import AboxError
 from .manifest import (
+    BASE_MANDATORY_EGRESS,
     CustomServers,
     GlobalConfig,
     Manifest,
@@ -1065,6 +1066,41 @@ def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path
     return checks
 
 
+def check_mandatory_egress(manifest: Manifest, config: GlobalConfig, workspace: Path) -> Check:
+    """Are the hosts Claude Code cannot run without actually in the allowlist?
+
+    Read from the *rendered firewall script*, not from the model, because the
+    model is what abox intends and the script is what the container enforces.
+    A name missing here does not fail loudly: with scoped DNS the agent gets
+    NXDOMAIN, and Claude Code reports `ENOTFOUND` with no hint that an
+    allowlist was involved.
+    """
+    script = render.artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    if not script.is_file():
+        return Check(
+            id="egress.mandatory",
+            title="Claude Code's own endpoints are allowlisted",
+            status=Status.skip,
+            detail="nothing rendered yet",
+        )
+    body = script.read_text(encoding="utf-8", errors="replace")
+    missing = [host for host in BASE_MANDATORY_EGRESS if f'"{host}"' not in body]
+    return Check(
+        id="egress.mandatory",
+        title="Claude Code's own endpoints are allowlisted",
+        status=Status.ok if not missing else Status.fail,
+        detail="all present"
+        if not missing
+        else f"missing from the rendered firewall: {', '.join(missing)}",
+        hint="`abox up` re-renders. These are not optional — without them the "
+        "agent cannot authenticate or refresh a token, and scoped DNS turns "
+        "that into a bare ENOTFOUND inside the container"
+        if missing
+        else "",
+        data={"missing": missing},
+    )
+
+
 def check_shared_addresses(manifest: Manifest, config: GlobalConfig) -> Check:
     """Allowlisted domains that resolve to the same address.
 
@@ -1413,6 +1449,7 @@ def full(
     report.add(check_auth_credential(manifest, config, workspace))
     for check in check_egress_proxy(manifest, config, workspace):
         report.add(check)
+    report.add(check_mandatory_egress(manifest, config, workspace))
     report.add(check_shared_addresses(manifest, config))
     report.add(check_git_tamper(workspace, update=accept_git))
     report.add(check_exec_surface(manifest, config, workspace, update=accept_watch))

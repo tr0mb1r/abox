@@ -505,6 +505,30 @@ def _one_entry_catalog(name: str):
     return Catalog(servers={name: CatalogServer(name=name, image=raw["image"], raw=raw)})
 
 
+def test_mandatory_egress_check_reads_the_rendered_firewall(
+    manifest, config, workspace, rendered
+) -> None:
+    check = doctor.check_mandatory_egress(manifest, config, workspace)
+    assert check.status is doctor.Status.ok
+    assert check.data["missing"] == []
+
+
+def test_mandatory_egress_check_fails_on_a_hand_edited_firewall(
+    manifest, config, workspace, rendered
+) -> None:
+    """The symptom this exists to name: scoped DNS turns a missing allowlist
+    entry into a bare ENOTFOUND with no mention of an allowlist."""
+    script = render.artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    script.chmod(0o600)
+    script.write_text(
+        script.read_text().replace('"platform.claude.com"', '"nope.invalid"')
+    )
+    check = doctor.check_mandatory_egress(manifest, config, workspace)
+    assert check.status is doctor.Status.fail
+    assert check.data["missing"] == ["platform.claude.com"]
+    assert "ENOTFOUND" in check.hint
+
+
 def test_report_exit_code_reflects_failures() -> None:
     report = doctor.Report()
     report.add(doctor.Check(id="a", title="a", status=doctor.Status.warn))

@@ -1009,9 +1009,27 @@ def merged_watch(manifest: Manifest, config: GlobalConfig) -> list[str]:
 def merged_egress(
     manifest: Manifest, config: GlobalConfig, *, extra: list[str] | None = None
 ) -> list[str]:
-    """Project egress, plus mandatory egress, plus caller-injected entries."""
+    """Project egress, plus mandatory egress, plus caller-injected entries.
+
+    BASE_MANDATORY_EGRESS is unioned in unconditionally, not merely used as the
+    default for ``defaults.egress_mandatory``. Those two are different things
+    and the difference bit: a config.yaml that spells out its own
+    ``egress_mandatory`` *replaces* the default, so an install written before
+    abox added ``platform.claude.com`` kept working right up until a token
+    needed refreshing — and then failed inside the container as a bare
+    ENOTFOUND, because scoped DNS NXDOMAINs a name that is not allowlisted.
+
+    ``defaults.egress_mandatory`` remains the operator's way to add hosts to
+    every project. It is not a way to drop the four Claude Code cannot run
+    without; "mandatory" now means what it says.
+    """
     out: list[str] = []
-    for host in (*manifest.egress, *config.defaults.egress_mandatory, *(extra or [])):
+    for host in (
+        *manifest.egress,
+        *BASE_MANDATORY_EGRESS,
+        *config.defaults.egress_mandatory,
+        *(extra or []),
+    ):
         h = host.strip().lower()
         if h and h not in out:
             out.append(h)
