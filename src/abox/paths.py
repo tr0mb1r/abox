@@ -90,6 +90,20 @@ def devcontainer_dir(workspace: Path) -> Path:
     return workspace / DEVCONTAINER_DIR
 
 
+def mcp_volume(workspace: Path) -> str:
+    """Per-project volume carrying mcp.json — and with it the gateway token.
+
+    Not a bind. Everything else abox mounts is a bind of a host file, which
+    means the host mode has to satisfy two parties at once: the container, which
+    reads as its own uid, and every other account on the machine, which should
+    not read a bearer token for a service that holds the Docker socket. Those
+    pull opposite ways, and Docker Desktop hid the conflict by ignoring the mode
+    entirely. A volume has no such tension: the host copy stays 0400, and the
+    copy the agent reads is owned by the agent inside Docker's own storage.
+    """
+    return f"abox-mcp-{project_hash(workspace)}"
+
+
 def claude_volume(workspace: Path) -> str:
     """Per-project named volume holding ``~/.claude`` (auth + session state)."""
     return f"abox-claude-{project_hash(workspace)}"

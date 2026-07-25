@@ -1276,6 +1276,7 @@ def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> li
         ),
         _mcp_endpoint_check(manifest),
         check_interactive_claude(workspace),
+        check_token_not_world_readable(workspace),
     ]
 
 
@@ -1367,6 +1368,56 @@ def check_agent_secrets(manifest: Manifest, config: GlobalConfig) -> list[Check]
     return checks
 
 
+def check_token_not_world_readable(workspace: Path) -> Check:
+    """The gateway bearer token is the only thing gating a container that mounts
+    the Docker socket, so it must not be readable by other accounts on the host.
+
+    It used to ride the /opt/abox bind with everything else. That bind has to be
+    readable by whatever uid a container runs as — Linux enforces that where
+    Docker Desktop does not — so making the bind work made the token world
+    readable as a side effect. It is staged through a volume instead; this
+    confirms the host copy stayed private and the volume is actually mounted.
+    """
+    source = render.artifacts_dir(workspace) / render.ARTIFACT_MCP
+    if not source.is_file():
+        return Check(
+            id="agent.token-private",
+            title="the gateway token is not world-readable",
+            status=Status.skip,
+            detail="nothing rendered yet",
+        )
+    mode = source.stat().st_mode
+    exposed = bool(mode & 0o077)
+    rendered = render.inspect_rendered(workspace) or {}
+    mounted = any(
+        paths.mcp_volume(workspace) in str(a) for a in (rendered.get("run_args") or [])
+    )
+    if exposed:
+        return Check(
+            id="agent.token-private",
+            title="the gateway token is not world-readable",
+            status=Status.fail,
+            detail=f"{source} is mode {oct(mode & 0o777)}",
+            hint="the token gates a container holding the Docker socket; it "
+            "must stay owner-only. `abox up` re-renders it 0400",
+        )
+    if not mounted:
+        return Check(
+            id="agent.token-private",
+            title="the gateway token is not world-readable",
+            status=Status.fail,
+            detail="host copy is private, but the runspec does not mount the "
+            "volume the agent reads it from",
+            hint="`abox up` stages it — without the volume the agent has no MCP config",
+        )
+    return Check(
+        id="agent.token-private",
+        title="the gateway token is not world-readable",
+        status=Status.ok,
+        detail=f"host copy {oct(mode & 0o777)}, staged via {paths.mcp_volume(workspace)}",
+    )
+
+
 def check_interactive_claude(workspace: Path) -> Check:
     """Does an interactive shell get the gateway, or a Claude with no tools?
 
@@ -1419,7 +1470,7 @@ def _mcp_endpoint_check(manifest: Manifest | None) -> Check:
         id="agent.single-mcp-endpoint",
         title="agent has exactly one MCP endpoint",
         status=Status.ok,
-        detail="claude is invoked with --mcp-config /opt/abox/mcp.json "
+        detail=f"claude is invoked with --mcp-config {render.MCP_CONFIG_PATH} "
         "--strict-mcp-config",
     )
 

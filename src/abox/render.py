@@ -52,8 +52,10 @@ ARTIFACT_MCP = "mcp.json"
 
 #: Where the MCP config is mounted inside the container. Deliberately not a
 #: path Claude Code searches: passing it explicitly is what makes "exactly one
-#: endpoint" true rather than hopeful.
-MCP_CONFIG_PATH = "/opt/abox/mcp.json"
+#: endpoint" true rather than hopeful. It lives on its own volume rather than in
+#: the /opt/abox bind because it carries the gateway bearer token — see
+#: paths.mcp_volume.
+MCP_CONFIG_PATH = "/run/abox/mcp.json"
 ARTIFACT_SETTINGS = "settings.json"
 ARTIFACT_PROXY = "proxy.conf"
 MANIFEST_OF_ARTIFACTS = "artifacts.json"
@@ -280,6 +282,10 @@ def build_runspec(
         f"type=bind,source={workspace},target=/workspace",
         f"type=volume,source={volume},target=/home/{user}/.claude",
         f"type=bind,source={artifacts_dir(workspace)},target=/opt/abox,readonly",
+        # mcp.json is staged here instead of riding the bind above: it carries
+        # the gateway bearer token, and the bind has to be world-readable so
+        # containers running as their own uid can read it at all.
+        f"type=volume,source={paths.mcp_volume(workspace)},target=/run/abox,readonly",
         # /var/log/abox is deliberately NOT bind-mounted. Docker Desktop does not
         # enforce uid or mode on a bind, so an agent could truncate its own audit
         # trail through one — the egress review queue is only worth reading if the
@@ -511,7 +517,13 @@ def write(result: RenderResult, *, workspace_copy: bool = True) -> dict[str, Pat
         if path.exists():
             path.chmod(0o600)
         path.write_text(body, encoding="utf-8")
-        path.chmod(0o555 if name.endswith(".sh") else 0o444)
+        # mcp.json is the exception: it holds the gateway bearer token, so the
+        # host copy stays owner-only. The container reads it from a volume
+        # (paths.mcp_volume), not through the bind, so nothing needs it here.
+        if name == ARTIFACT_MCP:
+            path.chmod(0o400)
+        else:
+            path.chmod(0o555 if name.endswith(".sh") else 0o444)
         written[name] = path
 
     state = {

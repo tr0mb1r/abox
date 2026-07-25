@@ -186,10 +186,36 @@ def test_artifacts_are_readable_by_a_different_uid(
     written = render.write(_render(manifest, config, workspace, spec))
     assert render.artifacts_dir(workspace).stat().st_mode & 0o005 == 0o005, "dir needs o+rx"
     for name, path in written.items():
+        if name == render.ARTIFACT_MCP:
+            continue  # covered by the test below — it must NOT be readable
         mode = path.stat().st_mode
         assert mode & 0o004, f"{name} is not readable by another uid"
         if name.endswith(".sh"):
             assert mode & 0o001, f"{name} is not executable by another uid"
+
+
+def test_the_gateway_token_is_the_one_artifact_kept_private(
+    manifest, config, workspace, spec
+) -> None:
+    """Widening the bind so containers can read it must not widen this.
+
+    mcp.json carries the bearer token for a container that mounts the Docker
+    socket. It reaches the agent through a volume instead, so the host copy has
+    no reason to be readable by anyone else.
+    """
+    written = render.write(_render(manifest, config, workspace, spec))
+    mode = written[render.ARTIFACT_MCP].stat().st_mode
+    assert mode & 0o077 == 0, f"token is mode {oct(mode & 0o777)}"
+
+
+def test_the_runspec_mounts_the_token_volume(manifest, config, workspace, spec) -> None:
+    from abox import paths
+
+    result = _render(manifest, config, workspace, spec)
+    runspec = json.loads(result.artifacts[render.ARTIFACT_RUNSPEC])
+    args = " ".join(str(a) for a in runspec["run_args"])
+    assert paths.mcp_volume(workspace) in args
+    assert "/run/abox" in args
 
 
 def test_mask_sources_are_readable_by_a_different_uid(workspace) -> None:

@@ -376,6 +376,10 @@ def up(
             paths.claude_volume(workspace),
             labels={dockerx.LABEL_PROJECT: manifest.project},
         )
+        # The token never rides the /opt/abox bind: that bind has to be readable
+        # by whatever uid a container runs as, and this file is a bearer token
+        # for a service holding the Docker socket.
+        runner.stage_mcp_config(config, workspace)
 
         if no_build:
             console.print("[dim]skipping image build[/]")
@@ -1606,6 +1610,14 @@ def nuke(
 
         removed = render_mod.clean(workspace)
         console.print(f"[green]✔[/] removed {len(removed)} generated artifact(s)")
+
+        # Dropped unconditionally, unlike the auth volume: `abox up` rebuilds it
+        # in a second, and leaving a bearer token behind on a teardown that the
+        # operator asked for would be the wrong default in both directions.
+        token_volume = paths.mcp_volume(workspace)
+        if dockerx.volume_exists(token_volume):
+            dockerx.remove_volume(token_volume)
+            console.print(f"[green]✔[/] removed volume {token_volume}")
 
         volume = paths.claude_volume(workspace)
         if keep_auth or not dockerx.volume_exists(volume):

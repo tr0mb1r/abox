@@ -413,6 +413,51 @@ def exec_in_container(
     )
 
 
+def stage_mcp_config(config: GlobalConfig, workspace: Path) -> None:
+    """Copy mcp.json into its volume, owned by the user the agent runs as.
+
+    Run on every `abox up` rather than once: the file changes whenever the
+    gateway token or URL does, and a stale copy would point the agent at an
+    endpoint that now 401s.
+
+    The helper runs as root so it can read a host file the invoking user owns
+    0400, and writes the copy owned by the container user at the same mode.
+    The gateway image is reused because it is already present and ships busybox
+    — a dedicated image would be one more thing to pull and pin.
+    """
+    from . import render
+
+    source = render.artifacts_dir(workspace) / render.ARTIFACT_MCP
+    if not source.is_file():
+        raise BoundaryError(
+            f"no MCP config rendered at {source}",
+            hint="`abox up` renders the artifacts before staging them",
+        )
+    volume = paths.mcp_volume(workspace)
+    dockerx.ensure_volume(volume, labels={dockerx.LABEL_ROLE: "mcp-config"})
+    target = render.MCP_CONFIG_PATH
+    result = dockerx.docker(
+        "run", "--rm",
+        "--network", "none",
+        "-v", f"{volume}:/dst",
+        "-v", f"{source}:/src:ro",
+        "--entrypoint", "sh",
+        config.gateway_image,
+        "-c",
+        # `id -u <user>` inside the *gateway* image would be wrong — the uid has
+        # to be the agent image's. It is the devcontainer base's fixed 1000.
+        f"cp /src /dst/{Path(target).name} && chown 1000:1000 /dst/{Path(target).name} "
+        f"&& chmod 0400 /dst/{Path(target).name}",
+        timeout=120,
+    )
+    if not result.ok:
+        raise BoundaryError(
+            f"could not stage the MCP config into {volume}: "
+            f"{(result.stderr or result.stdout).strip()[:200]}",
+            hint="the agent cannot reach the gateway without it",
+        )
+
+
 def interactive_shell(manifest: Manifest, provisioned: Provisioned) -> int:
     """Hand the terminal to the container. Used by ``abox shell``."""
     import subprocess

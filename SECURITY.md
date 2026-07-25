@@ -39,7 +39,11 @@ host.
 Every row names the test that proves it. Rows whose result is **succeeds** are
 here on purpose — a matrix that only lists wins is marketing.
 
-Tests marked *(docker)* need a live Docker daemon and are deselected by default:
+Tests marked *(docker)* need a live Docker daemon and are deselected by default.
+**They are run on both macOS (Docker Desktop) and Linux** — the latter via
+`.github/workflows/linux-docker.yml` on an `ubuntu-latest` runner, which is
+where several of the rows below were found to be false. A control tested only on
+the platform where it cannot fail is not tested.
 
 ```bash
 uv run pytest -m docker          # the ones that build images and run containers
@@ -58,6 +62,7 @@ coverage that does not exist.
 | TLS with no SNI at all, forged `Host:` header, straight to an allowed IP | SNI proxy has no name to match, fails closed | **refused** | `tests/test_integration_docker.py::test_no_sni_connection_is_refused` *(docker)* |
 | Reach a host nobody allowlisted | default-deny iptables + ipset | **refused** | `tests/test_integration_docker.py::test_default_deny_egress` *(docker)* |
 | Exfiltrate via DNS query names | dnsmasq scoped to the allowlist | **NXDOMAIN**, and the refused lookup is still logged | `tests/test_integration_docker.py::test_dns_resolution_is_scoped_to_the_allowlist` *(docker)* |
+| **Reach anything at all over IPv6** | `ip6tables` INPUT/FORWARD/OUTPUT DROP, loopback only; `filter-AAAA` so the resolver stops offering v6 | **refused.** Until 2026-07-25 this **succeeded**: every rule was IPv4, and an unconfigured `ip6tables` defaults to ACCEPT, so on any v6-enabled network the allowlist, default-deny and the SNI proxy were all bypassed by a client that simply preferred AAAA. Invisible on macOS — Docker Desktop has no IPv6 | `tests/test_render.py::test_ipv6_egress_is_denied_not_merely_unmentioned`, and the firewall refuses to certify itself without it |
 | Downgrade to plaintext on port 80 | `egress_ports: [443]` by default | **refused** unless 80 is opted in | `tests/test_render.py::test_port_80_is_opt_in` |
 | Reach the agent, gateway or proxy from the host network | nothing is published | **no port bindings exist** | `test_gateway_publishes_nothing_to_the_host`, `test_the_proxy_publishes_nothing` *(docker)* |
 | Allowlist `pypi.org`, reach everything else on those Fastly addresses | ipset matches IPs, not names | **succeeds in ipset mode** — the SNI proxy is the fix; doctor names the shared addresses either way | `tests/test_runner_and_doctor.py` → `egress.shared-addresses` |
@@ -75,7 +80,7 @@ coverage that does not exist.
 
 | Attack | Control | Result | Test |
 |---|---|---|---|
-| Read a masked file (`.env`, `secrets/`) | empty overlay mounted over the path | **empty inside**, untouched on the host | `tests/test_integration_docker.py::test_masked_file_is_empty_inside_the_container` *(docker)* |
+| Read a masked file (`.env`, `secrets/`) | empty overlay mounted over the path | **empty inside**, untouched on the host — on Linux this returned `Permission denied` until the artifact modes were fixed, which hid rather than leaked, but broke the contract | `tests/test_integration_docker.py::test_masked_file_is_empty_inside_the_container` *(docker)* |
 | Edit the firewall script to widen the allowlist | authoritative artifacts live outside the workspace, mounted read-only | **no effect**, and drift is a doctor finding | `tests/test_render.py::test_authoritative_artifacts_live_outside_the_workspace`, `test_drift_detects_a_tampered_mounted_artifact` |
 | Truncate `dns.log` to erase the egress review queue | log dir is container-internal and root-owned, never bind-mounted | **not writable** | `tests/test_integration_docker.py::test_the_agent_cannot_edit_its_own_audit_trail` *(docker)* |
 | Plant a git hook or `core.hooksPath` alias | `.git/hooks` masked by default; `.git/config` fingerprinted | **doctor fails** | `tests/test_runner_and_doctor.py::test_git_tamper_notices_a_planted_hook` |
@@ -107,6 +112,7 @@ coverage that does not exist.
 |---|---|---|---|
 | Read a secret abox routed to an MCP server | the daemon injects `se://` references into the server container; neither gateway nor agent holds a value | **not reachable from the agent** | `tests/test_secrets.py::test_env_secrets_reach_the_runspec_as_references_not_values` |
 | Exfiltrate a secret from `secrets attach` to an allowed domain | none — this is the documented weakening | **succeeds.** The egress allowlist is the boundary, and doctor says so every run | `tests/test_runner_and_doctor.py` → `agent.env-secrets` |
+| Read the gateway bearer token from the host | the host copy stays `0400`; the agent reads a staged volume instead | **not readable by other accounts.** Widening the artifact bind so containers could read it as their own uid would otherwise have exposed the token as a side effect | `tests/test_render.py::test_the_gateway_token_is_the_one_artifact_kept_private`, doctor `agent.token-private` |
 | Exfiltrate the Claude OAuth credential from `~/.claude` | none — the agent must be able to read it | **succeeds.** Bounded only by the per-project volume and the allowlist; `run.connectors: true` removes the bound | `tests/test_runner_and_doctor.py::test_auth_credential_is_reported_even_with_no_attached_secrets` |
 | Reach the host Docker daemon through a crafted MCP request | none — the gateway is trusted third-party code that mounts the socket | **untested and undefended.** abox pins the gateway by digest; it cannot audit it | — |
 
@@ -125,6 +131,12 @@ Named so the matrix is not read as complete:
 - **The gateway spawning a container outside the intended set.** If a compromised
   agent could induce that, the container would land on the bridge unfirewalled.
   Not attempted.
-- **macOS-only.** Every result above was measured on Docker Desktop for macOS.
-  Linux behaviour differs in at least one relevant way — bind-mount uid/mode
-  *are* enforced there — and has not been measured.
+- **Distro integration.** The suite passes on macOS and on `ubuntu-latest`, but
+  SELinux (Fedora/RHEL), AppArmor confinement beyond Ubuntu's default,
+  `systemd-resolved` on `127.0.0.53`, rootless Docker and Podman are all
+  untested. Running on Linux is what turned up the IPv6 bypass and the artifact
+  modes; assume the same holds for the platforms still unmeasured.
+- **The gateway image on the runner is whatever `nginx:alpine` and
+  `docker/mcp-gateway:v2` resolve to that day** for the proxy — the proxy image
+  is not digest-pinned, and nginx behaviour differences are exactly what the
+  deny-path bug turned on.

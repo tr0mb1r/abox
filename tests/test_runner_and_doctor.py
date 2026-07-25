@@ -64,7 +64,9 @@ def test_runspec_is_the_authoritative_config(manifest, config, rendered) -> None
     runspec = runner.load_runspec(rendered)
     assert runspec["image"].startswith("abox-agent-demo:")
     assert runspec["firewall"] == "/opt/abox/init-firewall.sh"
-    assert runspec["mcp_config"] == "/opt/abox/mcp.json"
+    # Not under /opt/abox: that bind must be readable by whatever uid a
+    # container runs as, and this file is the gateway bearer token.
+    assert runspec["mcp_config"] == "/run/abox/mcp.json"
 
 
 def test_missing_runspec_points_at_abox_up(manifest, config, workspace) -> None:
