@@ -44,12 +44,13 @@ without it, and `abox doctor` will not nag you about a missing `op`.
 ## 1. Install abox
 
 ```bash
-uv tool install git+https://github.com/tr0mb1r/abox
+uv tool install abox-cli
 ```
 
-No checkout required. (Once it is on PyPI this becomes
-`uv tool install abox-cli` — the distribution is named `abox-cli`, the command
-it installs is `abox`. Not published yet.)
+The distribution is named `abox-cli` — the bare `abox` name on PyPI belongs to
+an unrelated placeholder — but **the command it installs is `abox`**. To track
+the repo instead of the last release, use
+`uv tool install git+https://github.com/tr0mb1r/abox`.
 
 ```bash
 abox --version

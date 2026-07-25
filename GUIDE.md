@@ -216,13 +216,13 @@ for it.
 **Install:**
 
 ```bash
-uv tool install git+https://github.com/tr0mb1r/abox
+uv tool install abox-cli
 ```
 
-No checkout needed. Once it is on PyPI this becomes
-`uv tool install abox-cli` — the distribution is `abox-cli` because the bare
-name is held by an unrelated placeholder, and the command it installs is `abox`
-regardless. Nothing has been published yet.
+The distribution is [`abox-cli`](https://pypi.org/project/abox-cli/) — the bare
+`abox` name on PyPI is held by an unrelated placeholder — and **the command it
+installs is `abox`**. To track the repo rather than the last release:
+`uv tool install git+https://github.com/tr0mb1r/abox`.
 
 After editing abox's own source, reinstall the checkout in place, from inside
 it:
