@@ -325,7 +325,7 @@ def check_server_network(
     egress and Docker's default resolver. That is not one control bypassed, it
     is three at once — the agent's firewall, the SNI proxy, and the scoped DNS —
     because all three live inside the agent container and a server container is
-    not the agent. Measured, not inferred: docs/notes/mcp-egress-investigation.md.
+    not the agent. Confirmed by capturing what the gateway spawns, not inferred.
     """
     from . import gateway as gw
 
@@ -1026,8 +1026,8 @@ def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path
                 detail=", ".join(status.published_ports),
             )
         )
-    # Measured in docs/notes/network-segmentation.md: nginx listens on the
-    # bridge with no source restriction, so anything on the network that is not
+    # Measured with two projects on one profile: nginx listens on the bridge
+    # with no source restriction, so anything on the network that is not
     # behind the agent firewall — a gateway-spawned MCP server container, most
     # concretely — can relay through it to this project's allowlist. A
     # firewalled agent cannot: its OUTPUT policy drops everything but its own

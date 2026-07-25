@@ -53,12 +53,12 @@ Known, unfixed, and listed here rather than scattered through the document.
 
 | Risk | Why it stands |
 |---|---|
-| **MCP tool egress bypass** | Server containers are not the agent, so they sit outside the firewall, the SNI proxy and the scoped resolver at once. A tool call carrying a URL reaches that URL. `server_network: none` closes it for servers that do not need the internet; for ones that do, nothing does. [Measured.](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md) |
+| **MCP tool egress bypass** | Server containers are not the agent, so they sit outside the firewall, the SNI proxy and the scoped resolver at once. A tool call carrying a URL reaches that URL — reproduced against a live gateway, not inferred from the design. `server_network: none` closes it for servers that do not need the internet; for ones that do, nothing does. |
 | **The gateway is trusted code** | The agent holds a bearer token for a container that mounts `docker.sock`. One parsing bug in third-party gateway code is root-equivalent on the host. abox pins it by digest; it cannot audit it. |
 | **The agent holds a Claude credential** | The per-project `~/.claude` volume is readable by the agent and exfiltrable to any allowed domain. There is no opting out — without it there is no agent. `run.connectors: true` extends its reach to the account's connectors. |
 | **`/workspace` is live** | Files the agent writes there run elsewhere later — CI, `make`, `npm install`, an editor. `mounts.watch` reports changes after the fact; it does not prevent them. |
 | **Attached secrets** | `secrets attach` hands the agent a value it can read and transmit. The egress allowlist stops being defence-in-depth and becomes the boundary. |
-| **The SNI proxy answers the whole bridge** | Any container without the agent firewall — including a gateway-spawned MCP server — can relay through it to that project's allowlist. Agents cannot. [Measured.](https://github.com/tr0mb1r/abox/blob/main/docs/notes/network-segmentation.md) |
+| **The SNI proxy answers the whole bridge** | Any container without the agent firewall — including a gateway-spawned MCP server — can relay through it to that project's allowlist. Agents cannot: their `OUTPUT` policy permits only their own proxy. Both halves were reproduced with two projects on one profile. |
 | **Shared CDN addresses (ipset mode only)** | The firewall matches IPs, so allowlisting `pypi.org` allows everything else on those Fastly addresses. Turning on the SNI proxy closes this; leaving it off does not. |
 
 ## Enforced invariants
@@ -90,7 +90,7 @@ reconstruct them by subtracting the table above from the claims in the prose.
 |---|---|
 | **The gateway is trusted code.** | The agent's own container cannot reach the Docker daemon — that part is enforced above and checked every run. It is not the whole claim. The agent holds a bearer token for a network-reachable container that *does* mount `/var/run/docker.sock`, so the real boundary is that no crafted MCP request traverses third-party gateway code to that socket. One parsing bug there is root-equivalent on the host. abox pins the gateway by digest and verifies the running container against the pin; it does not audit the gateway's code, and cannot. |
 | **The Docker daemon keeps secrets out of the gateway process.** | abox never writes a secret value into the gateway's environment: it emits `se://docker/mcp/<name>` references the daemon resolves from the OS keychain at container start. That the daemon then hands the value only to the intended server container is the daemon's guarantee, not one abox can check. |
-| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver — outside the agent's firewall, the SNI proxy, and the scoped DNS. A tool call carrying a URL reaches that URL. Measured, not assumed: [the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md). |
+| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver — outside the agent's firewall, the SNI proxy, and the scoped DNS. A tool call carrying a URL reaches that URL. Confirmed by capturing what the gateway actually spawns: every server container runs with `NetworkMode=abox-net` and no scoped resolver. |
 
 ## How it fits together
 
@@ -245,10 +245,10 @@ Host prerequisites:
 **Linux and colima are not supported yet**, and the reason is not portability
 alone: off Docker Desktop, secrets fall back from the OS keychain to a `.env`
 file on disk, which changes a security claim rather than an install step. The
-scoping — including the `iptables` backend risk and why colima behaves more like
-Docker Desktop than like Linux — is in
-[the Linux support note](https://github.com/tr0mb1r/abox/blob/main/docs/notes/linux-support.md).
-Nothing in it has been run on Linux; it is a plan, not a result.
+two other blockers are the `iptables` backend (the image installs it from apt
+with no `nft`/`legacy` selection, so rules could be accepted and match nothing)
+and colima, which behaves more like Docker Desktop than like Linux because its
+bind mounts cross a filesystem shim. None of this has been run on Linux.
 
 **No npm, no Node, no `@devcontainers/cli` on the host.** abox drives the Docker
 CLI itself and bakes Claude Code into the image from its checksum-verified
@@ -723,8 +723,7 @@ abox egress ignore telemetry.vendor.io # still blocked, no longer asked about
 **MCP tools are not covered by this.** They run in the gateway's own server
 containers, which are not the agent — so they are outside the firewall, the SNI
 proxy **and** the scoped resolver, all three at once. A tool call carrying a URL
-reaches that URL. Measured, not inferred:
-[the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md).
+reaches that URL.
 
 There is one per-server setting Docker enforces, and abox exposes it:
 

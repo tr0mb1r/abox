@@ -200,11 +200,12 @@ matters for "boundary-spanning" servers (§7.3, §13).
 **Linux and colima are not supported yet.** What abox actually needs is the
 `docker mcp` CLI plugin, which is buildable anywhere — Docker Desktop is just
 the easy way to get it on macOS. But at least one security claim changes off
-Desktop: secrets fall back from the OS keychain to a `.env` file on disk. The
-full scoping, including the `iptables` backend risk and why colima behaves more
-like Docker Desktop than like Linux, is in
-[the Linux support note](https://github.com/tr0mb1r/abox/blob/main/docs/notes/linux-support.md).
-It is a plan, not a measurement: nothing in it has been run on Linux.
+Desktop: secrets fall back from the OS keychain to a `.env` file on disk.
+
+Two other blockers: the image installs `iptables` from apt with no
+`nft`/`legacy` selection, so rules could be accepted and match nothing; and
+colima behaves more like Docker Desktop than like Linux, because its bind mounts
+cross a filesystem shim. None of this has been run on Linux.
 
 There is **no npm, no Node, no `@devcontainers/cli`** on the host. abox drives
 the Docker CLI directly and bakes Claude Code into the agent image from its
@@ -266,7 +267,7 @@ in prose would be the dishonest way to present this. `abox run` refuses
 | **The gateway is trusted code.** | The agent's own container cannot reach the Docker daemon; that much is enforced above and checked at every run. It is not the whole claim. The agent holds a bearer token for a network-reachable container that *does* mount `/var/run/docker.sock`, so the boundary that actually matters is that no crafted MCP request traverses third-party gateway code to that socket. One parsing bug there is root-equivalent on the host. abox pins the gateway by digest and verifies the running container against that pin (§4 hardenings, `abox gateway update`); it does not audit the gateway's code, and cannot. |
 | **The Docker daemon keeps secret values out of the gateway process.** | abox never writes a secret value into the gateway's environment — it emits `se://docker/mcp/<name>` references that the daemon resolves from the OS keychain when it starts a server container. That the daemon then hands the value only to the intended container is the daemon's guarantee. abox can check that no value passes through its own hands; it cannot check the daemon's. |
 | **Hosted MCP servers are dialled by the gateway, not the agent.** | This is why a remote server adds no endpoint and no egress to the agent — and it holds only because the gateway makes the call. The single-endpoint half is enforced; the "the gateway holds the credential" half is a property of the gateway. |
-| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver, outside the agent's firewall, the SNI proxy, and the scoped DNS simultaneously. A tool call carrying a URL reaches that URL. Measured rather than assumed — see [the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md). |
+| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver, outside the agent's firewall, the SNI proxy, and the scoped DNS simultaneously. A tool call carrying a URL reaches that URL. Confirmed by capturing what the gateway actually spawns: every server container runs with `NetworkMode=abox-net` and no scoped resolver. |
 
 ### Hardenings in depth
 
@@ -537,7 +538,8 @@ the SNI proxy and the scoped resolver all live inside the agent container, so a
 server container is outside all three simultaneously. It runs on `abox-net` with
 normal egress and Docker's own resolver. A tool call carrying a URL — `fetch`,
 `curl`, a search tool, anything with a URL parameter — reaches that URL. This is
-measured, not inferred: [the egress investigation](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md).
+confirmed by capturing what the gateway actually spawns, not inferred from the
+design.
 
 The gateway offers no `--network` flag. It applies every network its *own*
 container is on to every server it spawns, so this is one lever with a coarse
@@ -1067,9 +1069,7 @@ Two more things worth knowing before anyone tries:
 
 The right first step is not `abox run` in Actions. It is running
 `uv run pytest -m docker` on a Linux host once and seeing what the firewall
-assertions do. Full working-through, including the plugin build and the
-dind caveat, in
-[the CI note](https://github.com/tr0mb1r/abox/blob/main/docs/notes/ci-usage.md).
+assertions do.
 
 ---
 

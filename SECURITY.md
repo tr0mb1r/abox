@@ -46,8 +46,9 @@ uv run pytest -m docker          # the ones that build images and run containers
 uv run pytest                    # everything else, no daemon needed
 ```
 
-Rows marked *(manual)* were measured by hand and written up in `docs/notes/`;
-they have no automated test, and saying so is the point.
+Rows marked *(manual)* were measured by hand against live containers. They have
+no automated test, and saying so is the point — an unmarked row would imply
+coverage that does not exist.
 
 ### Egress
 
@@ -94,10 +95,10 @@ they have no automated test, and saying so is the point.
 
 | Attack | Control | Result | Test |
 |---|---|---|---|
-| Agent A reaches agent B on a shared profile | A's `OUTPUT DROP`; B's `INPUT DROP` as a second layer | **blocked**, by A's OUTPUT first | *(manual)* [`docs/notes/network-segmentation.md`](https://github.com/tr0mb1r/abox/blob/main/docs/notes/network-segmentation.md) |
-| Agent A relays through project B's SNI proxy | A's `OUTPUT DROP` permits only its own proxy; `:443` is DNAT'd there | **blocked** | *(manual)* [`docs/notes/network-segmentation.md`](https://github.com/tr0mb1r/abox/blob/main/docs/notes/network-segmentation.md) |
-| An MCP server container reaches an arbitrary host on the agent's behalf | none — server containers are outside the firewall, the SNI proxy and the scoped resolver at once | **succeeds.** `server_network: none` closes it for servers that do not need the internet; nothing closes it for ones that do | *(manual)* [`docs/notes/mcp-egress-investigation.md`](https://github.com/tr0mb1r/abox/blob/main/docs/notes/mcp-egress-investigation.md) |
-| An MCP server container relays through any project's SNI proxy | none — nginx has no source restriction on the bridge | **succeeds.** It already has unrestricted egress, so this grants no new reach; it does mean the allowlist is not a boundary for it | *(manual)* [`docs/notes/network-segmentation.md`](https://github.com/tr0mb1r/abox/blob/main/docs/notes/network-segmentation.md) |
+| Agent A reaches agent B on a shared profile | A's `OUTPUT DROP`; B's `INPUT DROP` as a second layer | **blocked**, by A's OUTPUT first | *(manual)* — two projects on one profile |
+| Agent A relays through project B's SNI proxy | A's `OUTPUT DROP` permits only its own proxy; `:443` is DNAT'd there | **blocked** | *(manual)* — two projects on one profile |
+| An MCP server container reaches an arbitrary host on the agent's behalf | none — server containers are outside the firewall, the SNI proxy and the scoped resolver at once | **succeeds.** `server_network: none` closes it for servers that do not need the internet; nothing closes it for ones that do | *(manual)* — reproduced against a live gateway |
+| An MCP server container relays through any project's SNI proxy | none — nginx has no source restriction on the bridge | **succeeds.** It already has unrestricted egress, so this grants no new reach; it does mean the allowlist is not a boundary for it | *(manual)* — relayed to a real host through another project's proxy |
 | Isolate a server from the network entirely | `server_network: none` → `disableNetwork` → `docker run --network none` | **enforced by Docker.** Verified live: `git` and `serena` spawn with `--network none`, and Serena still serves all its tools | `tests/test_remote_servers.py::test_catalog_server_is_shadowed_verbatim_plus_disable_network` |
 
 ### Credentials

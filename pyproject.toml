@@ -13,7 +13,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    # macOS only today. Linux is scoped, not shipped — see docs/notes/linux-support.md.
+    # macOS only today; Linux is scoped but not shipped (see GUIDE section 3).
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

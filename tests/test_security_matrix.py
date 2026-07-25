@@ -74,7 +74,7 @@ _IMPERSONAL_ACCOUNTS = {"vscode", "root", "you", "user", "me", "youruser"}
 
 
 def _published_files() -> list[Path]:
-    return [REPO / name for name in _PUBLISHED] + sorted((REPO / "docs" / "notes").glob("*.md"))
+    return [REPO / name for name in _PUBLISHED]
 
 
 def test_no_contact_email_is_published() -> None:

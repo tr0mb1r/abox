@@ -46,9 +46,8 @@ class CatalogServer:
     #: a control.** The gateway's allowHosts machinery only constrains anything
     #: when the gateway itself sits on an internal network; on abox's topology
     #: it merely adds a proxy alongside the server's existing unrestricted
-    #: network, and was empirically bypassed — see
-    #: docs/notes/mcp-egress-investigation.md. `server_network: none` is the
-    #: setting that Docker actually enforces.
+    #: network, and was empirically bypassed. `server_network: none` is the
+    #: setting Docker actually enforces.
     allow_hosts: tuple[str, ...] = ()
     source: str = "catalog"
     #: Set for ``type: remote`` entries — the gateway proxies these over the
