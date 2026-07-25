@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# internal planning docs (not published)
+proj_docs/
+
+# abox generated artifacts in this repo when dogfooding
+.devcontainer/
+agentbox.yaml
+
+# mkdocs build output
+site/

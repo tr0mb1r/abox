@@ -1,0 +1,90 @@
+# MkDocs Material configuration for the abox documentation site.
+#
+# Single source of truth: the pages under docs/ are symlinks to the canonical
+# markdown at the repo root (README.md, QUICKSTART.md, GUIDE.md), so
+# there is nothing to keep in sync — edit the root files and the site follows.
+#
+# Preview locally:   uvx --with mkdocs-material mkdocs serve
+# Build:             uvx --with mkdocs-material mkdocs build
+#
+# Before the first deploy, enable Pages: Settings → Pages → Source: GitHub Actions.
+
+site_name: abox
+site_description: >-
+  Disposable, network-restricted Claude Code environments — one per project,
+  with MCP access only through a Docker MCP Gateway.
+
+site_url: https://tr0mb1r.github.io/abox/
+repo_url: https://github.com/tr0mb1r/abox
+repo_name: tr0mb1r/abox
+edit_uri: ""            # docs/ pages are symlinks; the edit button would be misleading
+
+theme:
+  name: material
+  icon:
+    logo: material/cube-outline
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+
+nav:
+  - Home: README.md
+  - Quickstart: QUICKSTART.md
+  - Complete Guide: GUIDE.md
+
+# docs/requirements.txt is CI tooling, not a page — keep it out of the built site.
+exclude_docs: |
+  requirements.txt
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  # GitHub-compatible heading slugs, so the in-page table of contents that
+  # GUIDE.md ships (written for GitHub) resolves on the site too.
+  - toc:
+      permalink: true
+      slugify:
+        !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true

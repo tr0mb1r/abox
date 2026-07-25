@@ -1,0 +1,69 @@
+"""Error hierarchy for abox.
+
+Every failure path that a user can plausibly hit raises an ``AboxError`` subclass
+carrying a human-readable ``hint``. ``cli.py`` catches ``AboxError`` at the top
+level and renders it without a traceback; anything else is a bug and keeps its
+traceback.
+"""
+
+from __future__ import annotations
+
+
+class AboxError(Exception):
+    """Base class for expected, user-facing failures."""
+
+    exit_code = 1
+
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+
+
+class ConfigError(AboxError):
+    """Global config or project manifest is missing, malformed, or invalid."""
+
+
+class ManifestNotFoundError(ConfigError):
+    """No ``agentbox.yaml`` in the project directory."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(
+            f"no agentbox.yaml found at {path}",
+            hint="run `abox init` in the project directory first",
+        )
+
+
+class HostToolError(AboxError):
+    """A required host binary is missing or the wrong version."""
+
+    def __init__(self, tool: str, *, hint: str | None = None) -> None:
+        super().__init__(f"required host tool not found: {tool}", hint=hint)
+        self.tool = tool
+
+
+class DockerError(AboxError):
+    """A ``docker`` invocation failed."""
+
+
+class GatewayError(AboxError):
+    """Gateway container is missing, unhealthy, or refused to start."""
+
+
+class SecretsError(AboxError):
+    """1Password read or docker secret write failed."""
+
+
+class BoundaryError(AboxError):
+    """A security boundary check failed; abox refuses to proceed.
+
+    This is the one error class that must never be downgraded to a warning:
+    it is raised when the sandbox would run without the isolation the manifest
+    claims (e.g. ``bypassPermissions`` with no firewall).
+    """
+
+    exit_code = 3
+
+
+class RenderError(AboxError):
+    """Template rendering or artifact drift detection failed."""

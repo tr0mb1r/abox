@@ -1,0 +1,918 @@
+# abox — Complete Guide
+
+The full reference for abox: every setting, every hardening, and how to add each
+kind of MCP server — including self-hosted custom images end to end.
+
+For a five-minute path from nothing to a running agent, read
+**[QUICKSTART.md](QUICKSTART.md)** first. For the one-page overview and the
+rationale behind the design choices, read **[README.md](README.md)**. This
+document is the deep reference that sits under both.
+
+---
+
+## Contents
+
+1. [What abox is, and the threat model](#1-what-abox-is-and-the-threat-model)
+2. [Architecture](#2-architecture)
+3. [Installation & prerequisites](#3-installation--prerequisites)
+4. [The security model — invariants & hardenings](#4-the-security-model--invariants--hardenings)
+5. [Global configuration — `config.yaml`](#5-global-configuration--configyaml)
+6. [The project manifest — `agentbox.yaml`](#6-the-project-manifest--agentboxyaml)
+7. [MCP servers — the three kinds](#7-mcp-servers--the-three-kinds)
+   - [7.1 Catalog servers](#71-catalog-servers)
+   - [7.2 Remote / hosted servers](#72-remote--hosted-servers)
+   - [7.3 Custom image servers (self-hosted)](#73-custom-image-servers-self-hosted)
+8. [Secrets](#8-secrets)
+9. [Egress control](#9-egress-control)
+10. [Toolchains](#10-toolchains)
+11. [Filtering command output (rtk)](#11-filtering-command-output-rtk)
+12. [Running: up, run, shell, lifecycle](#12-running-up-run-shell-lifecycle)
+13. [`abox doctor` — every check](#13-abox-doctor--every-check)
+14. [State on disk](#14-state-on-disk)
+15. [Command reference](#15-command-reference)
+16. [Troubleshooting](#16-troubleshooting)
+
+---
+
+## 1. What abox is, and the threat model
+
+`abox` is a host-side macOS CLI that provisions **disposable, network-restricted
+Claude Code environments**, one per project, with MCP access exclusively through
+a Docker MCP Gateway.
+
+The governing assumption is that **the agent is untrusted.** It executes
+model-influenced instructions, including whatever arrives through files, tool
+output, and web content — prompt injection is in scope, not an edge case. abox
+does not try to make the agent safe; it limits the blast radius if the agent
+does something hostile, across four axes:
+
+| Axis | What abox constrains |
+|---|---|
+| **Filesystem** | what the agent can read and write on the host |
+| **Network egress** | what the agent can reach off-box |
+| **Credentials** | what secrets the agent can obtain |
+| **Execution** | what the agent can run, and as whom |
+
+Everything below is in service of those four. When a feature weakens one of
+them, abox says so on every run rather than hiding it.
+
+---
+
+## 2. Architecture
+
+```mermaid
+flowchart LR
+  subgraph host["Host — macOS"]
+    abox["abox CLI<br/>generates · orchestrates · audits"]
+    subgraph docker["Docker Desktop — abox-net · nothing published"]
+      gw["abox-gw per profile<br/>MCP gateway — TRUSTED<br/>docker.sock + secrets · bearer"]
+      srv["mcp servers<br/>gateway-spawned · digest-pinned"]
+      proxy["abox-proxy<br/>SNI egress filter · optional"]
+      agent["agent per project — UNTRUSTED<br/>no sudo · no docker.sock · no ports<br/>default-deny egress"]
+    end
+  end
+  hosted["hosted MCP<br/>Context7, Notion…"]
+  net(["allowed internet"])
+
+  abox -->|build / run / exec| docker
+  agent -->|one endpoint · bearer| gw
+  gw -->|spawns · injects secrets| srv
+  gw -->|https · holds creds| hosted
+  agent -->|egress · default-deny| proxy
+  proxy -->|by TLS server name| net
+  srv -. not behind agent firewall .-> net
+
+  classDef trusted stroke:#0b7c8a,stroke-width:2px
+  classDef untrusted stroke:#c0392b,stroke-width:2px,stroke-dasharray:6 4
+  class gw trusted
+  class agent untrusted
+```
+
+The same topology as text, with the exact mounts and ports:
+
+```
+Host (macOS)
+├── Docker Desktop (MCP Toolkit)
+│   ├── network: abox-net              user bridge, nothing published anywhere
+│   ├── abox-gw-<profile>              docker/mcp-gateway:v2
+│   │     ├─ mounts /var/run/docker.sock
+│   │     ├─ --transport=streaming --port=<profile port> --host=0.0.0.0
+│   │     └─ bearer token, minted per profile by abox
+│   ├── mcp/<server> containers        spawned by the gateway, digest-pinned
+│   ├── abox-proxy-<project>           nginx, optional — SNI-filtered egress
+│   └── agent-<project>-<runid>        ephemeral; the agent + Claude Code
+│         RW  /workspace               your project, bind-mounted
+│         RO  /opt/abox                firewall script + mcp.json (agent can't edit)
+│         RO  /context/*               declared read-only context dirs
+│         RO  masked paths             empty overlays over .env* and friends
+│         VOL abox-claude-<hash>       ~/.claude auth + session state, per project
+└── abox (Python CLI)                  generates, orchestrates, audits
+```
+
+**One gateway per profile.** Multiple projects that share a profile share its
+gateway; abox reconciles the union of what they each declare. The agent reaches
+`http://abox-gw-<profile>:8811/mcp` by container DNS on `abox-net`. Nothing is
+ever published to the host or the LAN.
+
+**The gateway is the trusted component.** It holds the Docker socket and the
+secrets; it runs only the servers abox writes into its catalog. The agent holds
+neither.
+
+**Two containers, two jobs.** MCP servers run in the *gateway's* containers, not
+the agent's. That is why an MCP server's network and filesystem access are
+governed by the gateway, not by the agent's firewall — a distinction that
+matters for "boundary-spanning" servers (§7.3, §13).
+
+---
+
+## 3. Installation & prerequisites
+
+**Host prerequisites — the whole list:**
+
+- **Docker Desktop ≥ 4.48** with the MCP Toolkit enabled.
+- **`op`** (1Password CLI) — *optional*, only if a secret points at `op://…`.
+
+There is **no npm, no Node, no `@devcontainers/cli`** on the host. abox drives
+the Docker CLI directly and bakes Claude Code into the agent image from its
+checksum-verified native binary. The only thing that ever installs Node is the
+`node` toolchain, and that lands *inside the container* because a project asked
+for it.
+
+**Install from the checkout:**
+
+```bash
+uv tool install --force ~/projects/abox
+```
+
+After editing abox's own source, reinstall before the next run:
+
+```bash
+uv tool install --reinstall --force ~/projects/abox
+```
+
+**Docker disk.** The first agent build plus a few pre-pulled server images wants
+headroom. Give the Docker Desktop VM 40–60 GB (Settings → Resources). A build
+that dies mid-way with a disk error is almost always this.
+
+---
+
+## 4. The security model — invariants & hardenings
+
+These are enforced against the machine, not documented aspirations. `abox
+doctor` checks each, and `abox run` refuses `bypassPermissions` if any boundary
+check fails.
+
+| Invariant | How it is enforced |
+|---|---|
+| The agent cannot reach the Docker daemon | no `docker.sock` mount in the rendered runspec; checked at every run and by doctor |
+| The agent publishes nothing | no `-p`, no `appPort`, no `forwardPorts` in the runspec |
+| Default-deny egress | in-container iptables + ipset; only addresses resolved from the allowlist, on port 443 by default |
+| Domain-level egress (optional) | the SNI proxy decides by TLS server name, so a shared CDN address grants nothing (§9) |
+| Exactly one MCP endpoint | `claude --mcp-config /opt/abox/mcp.json --strict-mcp-config`, bearer-authenticated |
+| The agent cannot rewrite its own sandbox | the firewall script and `mcp.json` are mounted read-only from outside the workspace |
+| The agent cannot escalate | `sudo` is **purged** from the image (the build fails if it is present); abox applies the firewall as root itself, through the socket it already holds |
+| Secrets never reach the agent | the Docker daemon injects them into MCP server containers; neither gateway process nor agent ever holds a value |
+| Hosted MCPs don't widen the sandbox | the gateway dials them; the agent gets a tool, not a network path |
+| The audit trail is not agent-writable | `/var/log/abox` is root-owned inside the container and *not* bind-mounted; logs are harvested through the socket at teardown |
+
+### Hardenings in depth
+
+- **No sudo.** The agent image is built with `sudo` purged (`SUDO_FORCE_REMOVE`
+  plus explicit removal), and the Dockerfile asserts `! command -v sudo` and
+  that dpkg no longer lists it. A present-but-neutered setuid binary is one
+  config mistake from working again; abox removes it. The firewall still needs
+  root — abox runs `init-firewall.sh` as root itself, through the Docker socket
+  it holds on the host, so the agent never needs a path to root.
+
+- **Firewall proven live, not assumed.** `init-firewall.sh` writes a marker into
+  the (non-mounted) log dir. `abox run` reads that marker back through the
+  socket; **no marker, no agent.** A container whose `postStart` silently failed
+  looks identical from the host to one where it worked — this check is why that
+  can't pass unnoticed.
+
+- **Artifacts outside the workspace.** The authoritative artifact is
+  `runspec.json` in the per-project state dir — the literal `docker run` argv
+  abox executes. `.devcontainer/` in your repo is a *review copy*: readable,
+  diffable, committable, and never read back. An agent that rewrites the
+  firewall script in the workspace changes nothing except a `doctor` finding.
+
+- **Root-owned audit trail.** Docker Desktop does not enforce uid or mode on a
+  bind mount, so a shared log dir would let the agent truncate `dns.log` and with
+  it the egress review queue. The log dir is container-internal, root-owned,
+  `0755`, and copied out at teardown.
+
+- **Scoped DNS.** dnsmasq is the container's only resolver and forwards only
+  allowlisted names, returning NXDOMAIN for everything else. Arbitrary resolution
+  is a covert channel that survives default-deny egress, because the query name
+  itself carries data; scoping closes it. Refused lookups are still logged, so
+  the review queue keeps working.
+
+- **Digest pinning & signatures — the honest version.** abox requires catalog
+  and custom server images to be digest-pinned, and runs the gateway with
+  `--verify-signatures`. But the gateway only signature-verifies images in the
+  `docker.io/mcp/*` namespace — a custom or local image is never
+  signature-checked regardless. So for a custom image the **digest is the only
+  integrity anchor**, which is exactly why `pin: false` (§7.3) is called out as a
+  deliberate weakening.
+
+---
+
+## 5. Global configuration — `config.yaml`
+
+Lives at `~/.config/abox/config.yaml` (or `$ABOX_CONFIG_HOME/config.yaml`).
+`abox init` scaffolds one with these defaults; every field is optional and falls
+back to the value shown.
+
+```yaml
+network: abox-net                                   # the user bridge abox creates
+gateway_image: docker/mcp-gateway:v2                # doctor nudges you to pin the digest
+agent_base_image: mcr.microsoft.com/devcontainers/base:ubuntu
+claude_version: latest                              # or an exact x.y.z to pin Claude Code
+toolchain_versions:                                 # fetched from upstream tarballs at build
+  go: "1.24.5"
+  node: "22.14.0"
+remote_user: vscode                                 # the unprivileged user in the agent image
+egress_ports: [443]                                 # ports opened to allowlisted addresses; 80 is opt-in
+scoped_dns: true                                    # resolve only allowlisted names (NXDOMAIN else)
+
+agent_env:                                          # env abox sets in the agent to stop it retrying blocked hosts
+  DISABLE_AUTOUPDATER: "1"
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  ENABLE_CLAUDEAI_MCP_SERVERS: "false"
+
+rtk:                                                # output-filtering proxy inside the agent (§11)
+  enabled: false
+  version: "0.43.0"
+  repo: rtk-ai/rtk
+
+egress_proxy:                                       # SNI-aware domain-level egress (§9)
+  enabled: false
+  image: nginx:alpine
+  port: 8443
+  timeout: 300                                      # idle timeout (s) for a proxied connection
+
+profiles:
+  default: { port: 8811 }                           # one gateway per profile; ports must be unique
+  # secops: { port: 8812, description: "high-sensitivity" }
+
+defaults:
+  mask: [".env*", ".git/hooks"]                     # merged into every project's mask set
+  egress_mandatory:                                 # injected into every project's allowlist
+    - api.anthropic.com
+    - platform.claude.com
+    - claude.ai
+    - claude.com
+```
+
+**Field notes**
+
+- **`claude_version`** — `latest` fetches the current Claude Code release and
+  verifies its published sha256; an exact version pins it. Either way the binary
+  goes to `/usr/local/bin`, where the `~/.claude` volume can't shadow it.
+- **`agent_env`** — these three switches turn *off* the traffic abox
+  deliberately blocks (auto-updater, Datadog telemetry, claude.ai MCP
+  connectors), so the agent stops retrying and the review queue stays meaningful.
+  Re-enable any of them here **and** add the matching domain to
+  `defaults.egress_mandatory`, or the agent will just retry a blocked host.
+- **`egress_mandatory`** — `platform.claude.com` is the one people miss: OAuth
+  token *refresh* goes there for both claude.ai and Console accounts, so a
+  session that works today fails when the token rolls over without it.
+- **`profiles`** — a profile is a named gateway on a fixed port. Two profiles may
+  not share a port. Projects on the same profile share one gateway container.
+
+Also in `~/.config/abox/`: **`secrets.yaml`** (§8) and **`custom-servers.yaml`**
+(§7.3).
+
+---
+
+## 6. The project manifest — `agentbox.yaml`
+
+The manifest is the project's declaration of its sandbox, and the single source
+of truth: `abox init` writes it, every other command reads it, and `abox doctor`
+validates it against the same schema. Safe to hand-edit.
+
+```yaml
+version: 1                          # only 1 is understood
+project: demo-app                # lowercase; becomes Docker object names
+profile: dev                    # which gateway profile this project uses
+
+servers:                            # catalog + custom-server names (see §7)
+  - github-official
+  - duckduckgo
+  - serena                          # resolved via custom-servers.yaml
+
+remote_servers:                     # internet-hosted, proxied by the gateway (§7.2)
+  context7:
+    url: https://mcp.context7.com/mcp
+    transport: streamable-http      # or: sse
+    headers: {}                     # values may use ${ENV} from secrets below
+    secrets: []                     # ServerSecret entries the gateway injects
+    description: ""
+
+tools:                              # optional per-server allowlist; default = all tools
+  github-official: [list_issues, get_file_contents]
+
+toolchains: [python, go]            # installed into the agent image (§10)
+
+mounts:
+  mask: [".env*", ".git/hooks", "secrets/"]   # workspace-relative globs; merged with defaults
+  context: ["~/notes/dev"]                # host dirs mounted read-only at /context/<name>
+
+egress:                             # outbound allowlist (bare hostnames, no scheme/port/path/wildcards)
+  - github.com
+  - api.github.com
+  - pypi.org
+
+env_secrets: {}                     # ENV_VAR: docker-secret-name — hands the AGENT a secret (§8)
+egress_ignored: []                  # domains you've decided against; keeps the review queue clean
+
+run:
+  permission_mode: bypassPermissions   # default | acceptEdits | bypassPermissions | plan
+  output: stream-json                  # stream-json | json | text
+  connectors: false                    # allow claude.ai MCP connectors (weakens single-endpoint)
+  timeout: 3600                        # wall-clock ceiling per headless run (30..86400 s)
+```
+
+**Validation the schema enforces (so `doctor` and `init` agree):**
+
+- `project` / `profile` must be lowercase `[a-z0-9._-]` (they become Docker
+  object names). Server names may be mixed case (`SQLite` is a real catalog key).
+- `egress` / `egress_ignored` entries are **bare hostnames** — no scheme, port,
+  path, or wildcard. Wildcards are rejected because the firewall resolves each
+  name into an ipset; every host must be explicit. A domain cannot appear in both
+  `egress` and `egress_ignored`.
+- `toolchains` must be from the known set (§10).
+- `tools:` may only reference declared servers; `remote_servers` names may not
+  collide with `servers` names.
+- `env_secrets` env var names must be valid and must not shadow a reserved one
+  (`PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `ABOX_*`).
+- **`permission_mode: bypassPermissions`** is refused unless the firewall script
+  and `NET_ADMIN`/`NET_RAW` are present — the boundary gate. Use it only behind a
+  proven sandbox.
+
+You rarely edit this by hand — `abox mcp add`, `abox egress add`, `abox secrets
+attach`, etc. all edit it and re-render — but every one of those is just a typed
+mutation of this file.
+
+---
+
+## 7. MCP servers — the three kinds
+
+abox starts a project with **nothing**: no servers, no connectors. Everything is
+declared explicitly. There are three ways a tool reaches the agent, all through
+the one gateway endpoint.
+
+| Kind | Runs where | Declared in | Pin |
+|---|---|---|---|
+| **Catalog** | a gateway-spawned container | `servers:` | digest, by the catalog |
+| **Remote / hosted** | the operator's server, dialed by the gateway | `remote_servers:` | no image; it's third-party |
+| **Custom image** | a gateway-spawned container from your image | `servers:` + `custom-servers.yaml` | digest, or `pin: false` |
+
+See what any project actually exposes:
+
+```bash
+abox gateway status --tools          # live: every tool the agent will see
+abox mcp cost                        # per-turn token cost of that tool set
+```
+
+### 7.1 Catalog servers
+
+The Docker MCP Toolkit catalog. Name one and it runs behind the gateway,
+digest-pinned and fully logged.
+
+```bash
+abox mcp list --all                  # browse the catalog
+abox mcp add github-official         # declare it
+abox mcp add github-official --tool list_issues --tool get_file_contents   # narrow at add time
+abox secrets set github.personal_access_token    # if the server needs a secret
+abox up                              # pre-pull + reconcile the gateway
+```
+
+Import what this host already has:
+
+```bash
+abox mcp import          # inventory: catalog servers (importable), MCP_DOCKER (is the gateway), local stdio (can't cross in)
+abox mcp import --apply  # declare the importable ones
+```
+
+### 7.2 Remote / hosted servers
+
+Context7, Notion, Asana, Atlassian, Linear and ~75 others are internet-hosted.
+abox reaches them **through the gateway** — the gateway makes the outbound call
+and holds any credential, so the agent gains a tool, not a network path, and
+every invariant stays intact.
+
+**Already in the catalog** (type `remote`):
+
+```bash
+abox mcp add asana
+abox mcp oauth asana                 # host-side OAuth; token lands in the OS keychain
+```
+
+**Anything else, by URL** (`https` is required):
+
+```bash
+abox mcp add-remote context7 --url https://mcp.context7.com/mcp
+abox mcp add-remote acme \
+  --url https://mcp.acme.com/mcp \
+  --secret acme.api_key=ACME_TOKEN \
+  --header 'Authorization: Bearer ${ACME_TOKEN}'
+abox up
+```
+
+`--transport` is `streamable-http` (default) or `sse`. Header values may
+interpolate `${ENV}` from a declared `--secret` (`docker-secret-name=ENV_VAR`),
+which the gateway injects; the schema rejects a header that references an
+undeclared secret. `doctor` says the quiet part: a remote server is third-party
+operated, there is no digest to pin, and the operator can change what its tools
+do at any time — review them like dependencies.
+
+### 7.3 Custom image servers (self-hosted)
+
+A server image outside the Docker catalog — your own build, or an open-source one
+like [Serena](https://github.com/oraios/serena). You declare it once in
+`~/.config/abox/custom-servers.yaml` (a **bare `name → server` mapping**), then
+reference it by name in any project's `servers:`.
+
+**The full schema:**
+
+```yaml
+# ~/.config/abox/custom-servers.yaml
+my-server:
+  image: registry/name@sha256:<64-hex>   # digest-pinned by default (see `pin` below)
+  pin: true                              # false ⇒ accept a local tag you built; abox won't pull it
+  description: "what it is"
+  env:                                   # non-secret environment for the server container
+    SOME_FLAG: "1"
+  secrets:                               # docker secrets the gateway injects as env vars
+    - some.token                         #   short form: SOME_TOKEN is derived
+    # - { name: some.token, env: CUSTOM_ENV }   # long form
+  command: [binary, --flag, value]       # args appended to the image entrypoint
+  volumes:                               # host or named binds for the server's own container
+    - /abs/host/path:/container/path         # writable
+    - /abs/host/path:/container/path:ro      # read-only
+  tools: ["*"]                           # or an explicit allowlist
+```
+
+Then, in a project:
+
+```bash
+abox mcp add my-server && abox up
+```
+
+#### `pin: true` (default) vs `pin: false`
+
+- **`pin: true`** requires `image` to be `registry/name@sha256:<digest>`. This is
+  the integrity anchor for a custom image (the gateway does not sign-verify
+  images outside `docker.io/mcp/*`). To use a published image, pull it and read
+  the digest: `docker inspect --format '{{index .RepoDigests 0}}' <image>`.
+- **`pin: false`** accepts a plain local tag (e.g. `serena:local`) that you built
+  and never pushed. abox then **trusts it on your say-so and will not pull it** —
+  the image must already be on the daemon before `abox up`, or the gateway fails
+  with a clear "build it first". `doctor` flags it as an unpinned local image
+  (no digest, no signature — the supply-chain trust is yours). This exists so you
+  can run a self-built image **completely locally, with no registry**.
+
+#### Volumes and the gateway bind-mount allowlist
+
+The Docker MCP gateway refuses a **host** bind-mount whose path is outside its
+default roots (`/tmp`, `/private/tmp`, `/var/tmp`) unless it is explicitly
+trusted. abox handles that for you: it derives the trust list from your declared
+volumes and passes it to the gateway container —
+
+- a plain `host:container` volume → `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`
+  (writable, exact path),
+- a `host:container:ro` volume → `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS`
+  (read-only),
+
+and folds those paths into the gateway fingerprint so `abox up` recreates the
+gateway when they change. The gateway *always* blocks credential and system
+paths (`.ssh`, `.aws`, `.docker`, `/etc`, `/root`, …) regardless. A bare-name
+source (`cache:/data`) is a named Docker volume and needs no allow-listing.
+
+**Read-only vs writable is your choice, via `:ro`.** Add `:ro` for a
+navigation-only server; omit it when the server must write (an editing server
+needs writable, and may also need to write its own metadata dir).
+
+#### Worked example — Serena, fully local
+
+Serena provides LSP-backed semantic code tools (find/rename symbol, references,
+symbolic edits). It publishes no official image, so build it and run it local:
+
+```bash
+git clone https://github.com/oraios/serena && cd serena
+docker build -t serena:local .
+```
+
+```yaml
+# ~/.config/abox/custom-servers.yaml
+serena:
+  image: serena:local
+  pin: false                 # trust the local build; abox won't pull it
+  env: { SERENA_DOCKER: "1" }
+  volumes:
+    - /Users/you/projects/myproj:/workspace/myproj    # Serena needs the code (writable to edit)
+  command:
+    - serena
+    - start-mcp-server
+    - --transport
+    - stdio                  # the gateway talks stdio to server images
+    - --context
+    - claude-code            # disables Serena's overlapping read/search/shell tools
+    - --project
+    - /workspace/myproj      # WORKDIR isn't the project, so pass it explicitly
+```
+
+```bash
+abox mcp add serena --dir /Users/you/projects/myproj
+abox up   --dir /Users/you/projects/myproj
+abox gateway status --tools --dir /Users/you/projects/myproj   # Serena's tools now appear
+```
+
+**Things to know about a custom server like Serena:**
+
+- **It is boundary-spanning.** It runs in the *gateway's* container, not the
+  agent's, so its own network egress and shell are **not** governed by the
+  agent's firewall or the SNI proxy. `doctor` names such servers explicitly.
+- **It gets writable host access to the mounted code** — the same blast radius as
+  the agent's `/workspace`, but now a second container writes your tree. Use `:ro`
+  if you only want navigation (Serena's editing tools then fail).
+- **Language servers.** Serena's stock image bakes Node and Rust but **not Go** —
+  extend the image if you need `gopls`. Use `--context claude-code` so Serena
+  drops its overlapping read/search/shell tools; it both cuts the per-turn token
+  cost and avoids the "shell runs in Serena's container" surprise.
+- **`custom-servers.yaml` is global**, but the `volumes`/`--project` above
+  hard-code one project. That is correct for one project; for a second, give it
+  its own entry (`serena-other`) with its own mount and `--project`.
+
+---
+
+## 8. Secrets
+
+There is no single required secret store. `~/.config/abox/secrets.yaml` maps a
+**source** to a **Docker secret name** — references only, never values.
+
+```yaml
+# ~/.config/abox/secrets.yaml
+mappings:
+  - secret: github.personal_access_token
+    op: "op://abox/github-mcp/token"      # 1Password (op://vault/item/field)
+  - secret: supabase.access_token
+    file: "~/.config/abox/supabase.token" # a file, refused if group/world-readable
+  - secret: brave.api_key
+    env: BRAVE_API_KEY                    # a host environment variable
+  - secret: some.token
+    source: prompt                        # typed in; abox never writes it to disk
+  - secret: legacy.key
+    source: docker                        # already in the store; abox only verifies presence
+```
+
+Exactly one source per mapping. `op` / `file` / `env` are the readable ones (abox
+can fetch them for drift detection); `prompt` and `docker` are not.
+
+**Commands:**
+
+```bash
+abox secrets sync            # push every readable source into the Docker store
+abox secrets sync --dry-run  # report what would change, write nothing
+abox secrets set some.token  # one-off; prompted, or --file / --env / --stdin
+abox secrets check           # drift report vs the sources; values never printed
+abox secrets ls              # the reverse index — who references what
+abox secrets ls --unused     # credentials nothing references
+abox secrets rm some.token   # revoke; refused while a project still references it (--force overrides)
+```
+
+`ls` is the blast-radius view you want before rotating a credential — it covers
+all three ways a secret is consumed (agent env var, declared MCP server, remote
+server headers) across every project abox has bound to a profile:
+
+```
+secret                        store  source  used by
+brave.api_key                 yes    -       alpha → server brave
+demo.shared                   yes    stdin   alpha → env DATABASE_URL
+                                             beta → env API_KEY
+github.personal_access_token  yes    -       — nothing references it
+```
+
+**How a value moves without abox holding it.** abox pushes readable sources into
+the Docker secret store over a pipe (never argv), and records a **salted** digest
+for drift detection (a bare `sha256` of a low-entropy secret is crackable
+offline). The gateway then emits `-e VAR` with *no value*, and the Docker daemon
+resolves `se://docker/mcp/<name>` from the OS keychain when it starts the server
+container. Neither the gateway process nor the agent ever holds the value.
+
+### Giving the agent a secret (`env_secrets`)
+
+Everything above routes *around* the agent. When the work itself needs a
+credential — a database URL, a registry token — the agent must hold it:
+
+```bash
+abox secrets set database.url                   # store it
+abox secrets attach DATABASE_URL=database.url   # hand it to the agent
+abox up
+abox secrets detach DATABASE_URL                # take it back
+```
+
+This writes `env_secrets: { DATABASE_URL: database.url }` in the manifest, passed
+as an `se://` reference the daemon resolves at container start — so the value
+never reaches abox's argv, `runspec.json`, or any file abox writes. **It is the
+one place abox weakens its own invariant, and it says so on every run:**
+
+```
+! the agent holds secrets in its environment: 1 secret(s): DATABASE_URL←database.url
+  ↳ the agent can read, print, and transmit these to any allowed domain — keep
+    the egress list tight, and expect them in `docker inspect` on the agent
+```
+
+Both halves are true and neither is fixable: a value the agent can read is a
+value it can exfiltrate to anywhere the firewall allows, and a value in a
+container's environment is visible to anyone with host Docker access. Here the
+egress allowlist stops being defence-in-depth and becomes the actual boundary.
+
+---
+
+## 9. Egress control
+
+### Address-level (the default)
+
+The allowlist is enforced on **IP addresses**, because that is what iptables and
+ipset match. abox resolves every allowlisted name into an ipset and permits
+traffic to those addresses on `egress_ports` (443 by default; 80 is opt-in).
+dnsmasq is the only resolver and, with `scoped_dns: true`, forwards only
+allowlisted names and returns NXDOMAIN for the rest.
+
+The allowlist is: your manifest `egress`, plus `defaults.egress_mandatory`, plus
+the gateway container. Everything else is dropped, and every lookup — allowed or
+not — is logged.
+
+**Its one limit:** domains sharing an address are not separable. `pypi.org` and
+`files.pythonhosted.org` are both Fastly on the same IPs; all four Anthropic
+domains share one. Once an address is allowed, a request carrying a different SNI
+or `Host` header reaches whatever else lives there — domain fronting. `doctor`
+reports the overlaps it sees.
+
+### Domain-level (the SNI proxy)
+
+Turn it on and the allowlist becomes domain-level:
+
+```yaml
+# ~/.config/abox/config.yaml
+egress_proxy:
+  enabled: true
+```
+
+The agent's firewall then **stops allowlisting addresses entirely.** It permits
+exactly one destination — an nginx container on `abox-net` — and DNATs every
+outbound 443 connection there. nginx reads the server name from the TLS
+ClientHello (`ssl_preread`), looks it up in a map rendered from your allowlist,
+and connects onward or closes. Verified against the attack:
+
+```
+allowed https://example.com           → 200
+allowed IP, SNI = pypi.org (fronting) → connection reset
+allowed IP, no SNI, Host: pypi.org    → connection reset
+```
+
+It does **not** terminate TLS (no CA to install, nothing inside the tunnel
+visible to abox — only the destination name); it publishes nothing; it runs
+read-only with every capability dropped. Refusals are logged by SNI, which
+`doctor` surfaces as a *stronger* signal than the DNS queue — those names were
+connected to, not merely resolved.
+
+### The review queue
+
+Every lookup is recorded, including the ones the firewall then refuses to route.
+`doctor` diffs them against the allowlist and shows what the agent wanted:
+
+```
+! egress review queue: 3 domain(s) looked up but not allowed:
+    telemetry.example.com (x14), cdn.jsdelivr.net (x2), pastebin.com (x1)
+```
+
+```bash
+abox egress list                        # allowlist + the review queue
+abox egress add api.example.com         # allow it (takes effect next run)
+abox egress ignore telemetry.vendor.io  # still blocked, no longer asked about
+abox egress rm api.example.com          # remove from the allowlist
+abox egress unignore telemetry.vendor.io
+```
+
+**MCP tools are not covered by any of this.** They run in the gateway's own
+containers, so a server like `curl`, `fetch`, or a custom one reaches past the
+agent's egress by design. `doctor` names those servers explicitly rather than
+letting the sandbox look tighter than it is.
+
+---
+
+## 10. Toolchains
+
+`toolchains:` in the manifest installs language toolchains **into the agent
+image**, from upstream tarballs — never npm on the host. Known values:
+
+```
+python  go  node  rust  java  ruby  php  dotnet
+```
+
+`go` and `node` versions come from `toolchain_versions` in the global config
+(defaults `go 1.24.5`, `node 22.14.0`). An unknown toolchain is rejected at parse
+time, not half-way through a build. `node` here installs Node *inside the
+container* because the project asked for it — it is not a host dependency.
+
+---
+
+## 11. Filtering command output (rtk)
+
+`rtk` filters verbose command output before the model sees it — a real per-turn
+token saving. It is **off by default**, because enabling it installs a
+`PreToolUse` hook: another program in the agent's command path. That is a
+reasonable thing to want for your own tool and a bad thing to do silently.
+
+```yaml
+# ~/.config/abox/config.yaml
+rtk:
+  enabled: true
+  version: "0.43.0"
+  repo: rtk-ai/rtk
+```
+
+abox then installs the checksum-verified Linux binary into the agent image — same
+discipline as the Claude Code binary — and renders a `settings.json` into the
+read-only artifacts dir, passed with `claude --settings`. The agent cannot edit
+the hooks that wrap its own commands.
+
+---
+
+## 12. Running: up, run, shell, lifecycle
+
+```bash
+abox init          # interactive picker → agentbox.yaml + rendered artifacts (re-runs merge)
+abox up            # network + gateway + artifacts + cached image build
+abox shell         # once, to complete the Claude login (persists in the auth volume)
+abox run "…"       # headless claude -p, transcript captured, container destroyed
+```
+
+**`abox init`** flags: `--yes`/`-y` (accept detected defaults, ask nothing),
+`--project`, `--profile`, `--server` (declare non-interactively, repeatable).
+
+**`abox up`** flags: `--no-build` (skip the image build), `--no-cache` (rebuild
+from scratch), `--force-gateway` (recreate the gateway container).
+
+**What `abox run` actually does:**
+
+1. **Preflight.** Gateway healthy, artifacts match the manifest, no socket, no
+   published ports, caps present. `bypassPermissions` turns every warning into a
+   refusal.
+2. **Provision.** `docker run` straight from `runspec.json` in the state dir — not
+   from any file in your repo, and not through an intermediate tool that could
+   reinterpret a capability, a mount, or a network.
+3. **Verify the firewall came up *inside* the container** (the marker check).
+4. **Execute** `claude -p … --output-format stream-json`, teed to
+   `runs/<ts>-<id>.jsonl`.
+5. **Harvest** iptables counters, the dnsmasq log, session id, tool calls.
+6. **Destroy** the container. The workspace and the auth volume persist.
+
+`abox run` flags: `--resume <session-id>`, `--continue`, `--keep` (leave the
+container for inspection), `--quiet`/`-q`. `abox shell` takes `--keep` too.
+
+**Lifecycle.** Containers are disposable — a fresh one per run, removed on exit.
+Only named volumes (`abox-claude-<hash>`), the workspace, and telemetry persist.
+First-ever session per project: run `abox shell` once to complete the login, or a
+headless run exits 1 at authentication against an empty auth volume.
+
+**Tear down:**
+
+```bash
+abox nuke                # remove containers and generated artifacts
+abox nuke --keep-auth    # never touch the Claude auth volume
+abox nuke -y             # don't prompt
+```
+
+---
+
+## 13. `abox doctor` — every check
+
+`abox doctor` is the full audit. `--verbose`/`-v` shows passing checks too,
+`--json` is machine-readable, `--quick` skips secret source re-reads, `--accept-git`
+re-baselines the git tamper snapshot.
+
+| Check | What it verifies |
+|---|---|
+| host tools | Docker present; `op` present *iff* a mapping needs it |
+| manifest | valid against the schema |
+| declared servers resolve | every `servers:` name is in the catalog or `custom-servers.yaml` |
+| server images digest-pinned | catalog/custom images are pinned; `pin: false` locals are excluded (reported separately) |
+| operator-supplied images | custom images — the digest is their only integrity anchor (gateway signs only `docker.io/mcp/*`) |
+| unpinned local images | `pin: false` servers — no digest, no signature, must be built locally |
+| boundary-spanning servers | names servers (`curl`, `filesystem`, custom, …) whose tools reach past the agent's firewall/masks |
+| remote servers | third-party trust story; `https`; no digest to pin |
+| secrets | every mapped name is in the Docker store; salted digests match the source |
+| agent env-secrets | the deliberate weakening — which secrets the agent holds, and the egress consequence |
+| gateway | container running; `/mcp` responds on `abox-net` |
+| gateway image / verify-signatures | gateway image pinned; the running container carries `--verify-signatures` |
+| artifacts | rendered artifacts hash-match the manifest (drift ⇒ re-render) |
+| boundary gate | `bypassPermissions` ⇒ firewall script + `NET_ADMIN`/`NET_RAW` present |
+| egress proxy | if configured, the proxy is up; surfaces SNI refusals |
+| shared addresses | allowlisted domains that share an IP (domain-fronting exposure; moot when the proxy is on) |
+| git tamper | workspace `.git/config` checked for `core.hooksPath` / `alias.*` changes since the baseline |
+| egress review queue | looked-up-but-not-allowed domains, with counts |
+| agent hygiene | no `docker.sock` mount, no published ports in the runspec |
+| single MCP endpoint | one endpoint unless `run.connectors` deliberately turns on the claude.ai path |
+
+---
+
+## 14. State on disk
+
+```
+~/.config/abox/
+  config.yaml            network, gateway image, profiles, defaults, proxy, rtk, agent_env
+  secrets.yaml           source → docker secret name (references, never values)
+  custom-servers.yaml    servers outside the Docker catalog (§7.3)
+
+~/.local/state/abox/
+  gateways/<profile>.{token,json,fingerprint}
+  proxies/<project>.fingerprint
+  secrets.json           salted digests for drift detection
+  <project-hash>/
+    artifacts/           runspec.json (the literal docker argv), Dockerfile,
+                         init-firewall.sh, mcp.json, proxy.conf (mounted read-only)
+    current-run/         where per-run logs are harvested to (not mounted in)
+    runs/                one JSONL transcript per run
+    runs.jsonl           run index
+    dns-queries.jsonl    every name the agent looked up
+    fw-counters.json     what the firewall dropped
+    git-snapshot.json    baseline for the git tamper check
+```
+
+Paths honor `ABOX_CONFIG_HOME` / `ABOX_STATE_HOME` overrides. The project hash is
+derived from the resolved absolute workspace path, so moving a project is a
+deliberate re-auth, not a silent credential share.
+
+**`/workspace` is a read-write bind of your real project directory.** Anything
+the agent writes there lands on the host — that is the point of a coding sandbox,
+but it is not a copy. Masks shadow specific paths; they do not make the workspace
+immutable. If you want the agent unable to touch your files at all, that is a
+different tool.
+
+---
+
+## 15. Command reference
+
+| Command | Key flags | What it does |
+|---|---|---|
+| `abox init` | `-y`, `--project`, `--profile`, `--server` | interactive picker → `agentbox.yaml` + artifacts; re-runs merge |
+| `abox up` | `--no-build`, `--no-cache`, `--force-gateway` | network, gateway, artifacts, cached image build |
+| `abox render` | `-C/--dir` | re-render artifacts from the manifest, without building or running |
+| `abox run "<prompt>"` | `--resume`, `--continue`, `--keep`, `-q` | fresh container, headless `claude -p`, transcript captured, destroyed |
+| `abox shell` | `--keep` | same sandbox, interactive tty (use for the first login) |
+| `abox mcp list` | `--all` | declared servers, or the whole catalog |
+| `abox mcp add <server>` | `--tool` | declare a catalog/custom server (narrow with `--tool`) |
+| `abox mcp rm <server>` | | undeclare |
+| `abox mcp add-remote <name>` | `--url`, `--transport`, `--header`, `--secret` | declare an internet-hosted server, proxied by the gateway |
+| `abox mcp rm-remote <name>` | | remove a remote server |
+| `abox mcp import` | `--apply` | inventory this host's MCP servers; declare the importable ones |
+| `abox mcp oauth [provider]` | | list or authorize OAuth apps for hosted servers |
+| `abox mcp cost` | | per-turn token cost of the declared tool set |
+| `abox egress list` | | allowlist + the review queue |
+| `abox egress add <domain…>` | | allow domains |
+| `abox egress rm <domain…>` | | remove from the allowlist |
+| `abox egress ignore <domain…>` | | record a decision against a domain (leaves the queue) |
+| `abox egress unignore <domain…>` | | undo an ignore |
+| `abox secrets sync` | `--only`, `--dry-run`, `--allow-loose-perms`, `--interactive` | push readable sources into the Docker store |
+| `abox secrets check` | `-C/--dir` | drift report; values never printed |
+| `abox secrets set <name>` | `--file`, `--env`, `--stdin`, `--allow-loose-perms` | store one secret (prompted by default) |
+| `abox secrets ls` | `-v/--verbose`, `--unused` | reverse index — who references what |
+| `abox secrets attach <ENV=name…>` | | hand a stored secret to the agent as an env var (weakens an invariant) |
+| `abox secrets detach <ENV…>` | | take an agent env secret back |
+| `abox secrets rm <name…>` | `--force` | revoke; refused while referenced unless `--force` |
+| `abox gateway up [profile]` | `--force` | start/reconcile a profile's gateway |
+| `abox gateway down [profile]` | | stop a profile's gateway |
+| `abox gateway status [profile]` | `--tools` | health; `--tools` lists what it exposes live |
+| `abox doctor` | `-v`, `--json`, `--accept-git`, `--quick` | the full audit |
+| `abox logs` | `--runs`, `--dns`, `--gateway`, `--transcript`, `-n` | local telemetry |
+| `abox nuke` | `--keep-auth`, `-y` | remove containers and artifacts (prompts before the auth volume) |
+
+Every command takes `-C/--dir <path>` to target a project other than the current
+directory.
+
+---
+
+## 16. Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| First `abox run` exits 1 at auth | Empty auth volume. Run `abox shell` once to complete the Claude login. |
+| Build dies with a disk error | Docker VM disk too small. Raise it to 40–60 GB (Settings → Resources). |
+| A custom server contributes **no tools** | Usually its host volume is refused by the gateway (path outside `/tmp`). abox authorizes declared volumes automatically — re-run `abox up` so the gateway recreates with the allow-list env. Check `docker logs abox-gw-<profile>` for `Can't start <server>: unsafe docker volume …`. |
+| `pin: false` server won't start: "not present" | The local image isn't on the daemon. `docker build`/`docker tag` it first — abox won't pull a `pin: false` image. |
+| A catalog server's tools appear but calls fail | It needs a secret. `abox secrets set <name>` (e.g. `brave.api_key`, `github.personal_access_token`), then `abox up`. |
+| `doctor`: server images digest-pinned ✖ | A `pin: true` custom image has a tag, not a digest. Pin the digest, or set `pin: false` to trust a local build. |
+| Session works today, fails later at auth | `platform.claude.com` missing from egress — OAuth refresh goes there. It's in `egress_mandatory` by default; don't remove it. |
+| Review queue full of abox's own defaults | You re-enabled a blocked host in `agent_env` without allowing its domain, so the agent keeps retrying. Add the domain to `egress_mandatory`, or leave the switch off. |
+| Changed a config/volume, gateway didn't update | `abox up` recreates on fingerprint change; if in doubt, `abox gateway up --force` or `abox up --force-gateway`. |
+| Domain fronting on a shared CDN IP | Turn on the SNI proxy (`egress_proxy.enabled: true`) for a domain-level allowlist. |
+
+---
+
+*This guide tracks the code. When a field, flag, or check here disagrees with
+`abox --help` or the pydantic schema in `src/abox/manifest.py`, the code wins —
+please open an issue so this can be corrected.*

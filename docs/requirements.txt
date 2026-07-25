@@ -1,0 +1,5 @@
+# Docs site toolchain, pinned for the Pages workflow (CI installs this file).
+# For a quick local preview without a venv:  uvx --with mkdocs-material mkdocs serve
+#
+# mkdocs-material pulls in mkdocs, pymdown-extensions, and pygments.
+mkdocs-material>=9.5,<10
