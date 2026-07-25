@@ -8,6 +8,8 @@ path an agent container will take — container DNS name, port, bearer token.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from abox import catalog as catalog_mod
@@ -352,6 +354,25 @@ def test_allowed_domain_passes_the_proxy(sni_agent) -> None:
     assert r.stdout.strip() == "200"
 
 
+def _await_denied_sni(project: str, name: str, timeout: float = 20.0) -> bool:
+    """Poll for a refused SNI rather than assuming it is logged by the time the
+    client exits.
+
+    nginx writes the stream access_log on connection *close*, so the entry can
+    trail curl returning. macOS never lost that race because the exec round-trip
+    through Docker Desktop is slow enough to hide it; on Linux it is not. The
+    ordering was always unguaranteed — asserting it once was the bug.
+    """
+    from abox import proxy
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(d["sni"] == name for d in proxy.denied_names(project)):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def test_domain_fronting_is_refused(sni_agent) -> None:
     """The finding this whole component exists for: an allowed *address* with a
     forged server name must not get through. An ipset cannot tell these apart."""
@@ -364,12 +385,19 @@ def test_domain_fronting_is_refused(sni_agent) -> None:
     )
     assert not forged.ok
     # And the attempt is recorded with the name that was attempted.
-    from abox import proxy
-
-    assert any(d["sni"] == "pypi.org" for d in proxy.denied_names("snitest"))
+    assert _await_denied_sni("snitest", "pypi.org"), "refused, but never logged"
 
 
 def test_no_sni_connection_is_refused(sni_agent) -> None:
+    """A negative test cannot tell "the proxy refused it" from "the proxy was
+    never running", so establish the proxy is alive before believing the refusal.
+    On Linux it genuinely was not running until the artifact modes were fixed,
+    and this test passed throughout.
+    """
+    from abox import proxy
+
+    assert dockerx.container_state(proxy.proxy_container("snitest")).running
+
     _m, _ws, provisioned, _s = sni_agent
     r = _exec(
         provisioned.container_name, "bash", "-lc",
