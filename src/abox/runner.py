@@ -105,7 +105,10 @@ def boundary_checks(
 
     sock = [a for a in (rendered.get("run_args") or []) if "docker.sock" in str(a)]
     checks.append(
-        BoundaryCheck("no-docker-sock", not sock, "agent must not reach the Docker daemon")
+        # Precisely: the agent's own argv carries no socket bind. That is not the
+        # same as "the agent cannot reach the daemon" — it holds a token for the
+        # gateway, which does mount the socket. See the trust-assumptions table.
+        BoundaryCheck("no-docker-sock", not sock, "agent runspec must mount no docker socket")
     )
 
     published = [

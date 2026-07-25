@@ -158,22 +158,36 @@ that dies mid-way with a disk error is almost always this.
 
 ## 4. The security model — invariants & hardenings
 
-These are enforced against the machine, not documented aspirations. `abox
-doctor` checks each, and `abox run` refuses `bypassPermissions` if any boundary
-check fails.
+The table is split deliberately. **Enforced invariants** are the ones something
+mechanically verifies, and the last column names what. **Trust assumptions** are
+the ones nothing verifies — they are load-bearing all the same, and burying them
+in prose would be the dishonest way to present this. `abox run` refuses
+`bypassPermissions` if any boundary check fails.
 
-| Invariant | How it is enforced |
+### Enforced invariants
+
+| Invariant | How it is enforced | Verified by |
+|---|---|---|
+| The agent's runspec mounts no Docker socket | no `docker.sock` bind in the rendered argv | `agent.no-docker-sock`, `boundary.no-docker-sock` |
+| The agent publishes nothing | no `-p`/`--publish` in the runspec; the gateway publishes nothing either | `agent.no-published-ports`, `gateway.no-published-ports` |
+| The agent is not privileged | no `--privileged` in the runspec | `agent.not-privileged` |
+| Default-deny egress | in-container iptables + ipset; only addresses resolved from the allowlist, on port 443 by default. The script asserts its own rules and leaves a marker `abox run` reads back — no marker, no agent | `boundary.capabilities`, `boundary.firewall-script` |
+| Domain-level egress (optional) | the SNI proxy decides by TLS server name, so a shared CDN address grants nothing (§9) | `egress.proxy` |
+| Exactly one MCP endpoint | `claude --mcp-config /opt/abox/mcp.json --strict-mcp-config`, bearer-authenticated | `agent.single-mcp-endpoint` |
+| The agent cannot rewrite its own sandbox | the firewall script and `mcp.json` are mounted read-only from outside the workspace, and hash-match the manifest | `boundary.artifacts-private`, `artifacts.integrity` |
+| The agent cannot escalate | `sudo` is **purged** from the image; abox applies the firewall as root itself, through the socket it already holds | the image build fails if `sudo` is present |
+| The agent holds no secret values unless you attach one | secrets go to MCP server containers, not the agent; `secrets attach` is reported on every run | `agent.env-secrets` |
+| Every image is digest-pinned | catalog, custom, **and the gateway** | `servers.pinned`, `gateway.image-pinned`, `gateway.image-digest` |
+| The audit trail is not agent-writable | `/var/log/abox` is root-owned inside the container and *not* bind-mounted; logs are harvested through the socket at teardown | the runspec carries no bind for it |
+
+### Trust assumptions
+
+| Assumption | What is and is not guaranteed |
 |---|---|
-| The agent cannot reach the Docker daemon | no `docker.sock` mount in the rendered runspec; checked at every run and by doctor |
-| The agent publishes nothing | no `-p`, no `appPort`, no `forwardPorts` in the runspec |
-| Default-deny egress | in-container iptables + ipset; only addresses resolved from the allowlist, on port 443 by default |
-| Domain-level egress (optional) | the SNI proxy decides by TLS server name, so a shared CDN address grants nothing (§9) |
-| Exactly one MCP endpoint | `claude --mcp-config /opt/abox/mcp.json --strict-mcp-config`, bearer-authenticated |
-| The agent cannot rewrite its own sandbox | the firewall script and `mcp.json` are mounted read-only from outside the workspace |
-| The agent cannot escalate | `sudo` is **purged** from the image (the build fails if it is present); abox applies the firewall as root itself, through the socket it already holds |
-| Secrets never reach the agent | the Docker daemon injects them into MCP server containers; neither gateway process nor agent ever holds a value |
-| Hosted MCPs don't widen the sandbox | the gateway dials them; the agent gets a tool, not a network path |
-| The audit trail is not agent-writable | `/var/log/abox` is root-owned inside the container and *not* bind-mounted; logs are harvested through the socket at teardown |
+| **The gateway is trusted code.** | The agent's own container cannot reach the Docker daemon; that much is enforced above and checked at every run. It is not the whole claim. The agent holds a bearer token for a network-reachable container that *does* mount `/var/run/docker.sock`, so the boundary that actually matters is that no crafted MCP request traverses third-party gateway code to that socket. One parsing bug there is root-equivalent on the host. abox pins the gateway by digest and verifies the running container against that pin (§4 hardenings, `abox gateway update`); it does not audit the gateway's code, and cannot. |
+| **The Docker daemon keeps secret values out of the gateway process.** | abox never writes a secret value into the gateway's environment — it emits `se://docker/mcp/<name>` references that the daemon resolves from the OS keychain when it starts a server container. That the daemon then hands the value only to the intended container is the daemon's guarantee. abox can check that no value passes through its own hands; it cannot check the daemon's. |
+| **Hosted MCP servers are dialled by the gateway, not the agent.** | This is why a remote server adds no endpoint and no egress to the agent — and it holds only because the gateway makes the call. The single-endpoint half is enforced; the "the gateway holds the credential" half is a property of the gateway. |
+| **MCP server containers are unconstrained on the network.** | They run on `abox-net` with normal egress and Docker's default resolver, outside the agent's firewall, the SNI proxy, and the scoped DNS simultaneously. A tool call carrying a URL reaches that URL. Measured rather than assumed — see [the egress investigation](notes/mcp-egress-investigation.md). |
 
 ### Hardenings in depth
 
