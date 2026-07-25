@@ -8,6 +8,6 @@ abox drives the Docker CLI directly and installs Claude Code from its
 checksum-verified native binary, so nothing it needs touches npm on the host.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = ["__version__"]
