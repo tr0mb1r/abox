@@ -120,9 +120,15 @@ def ensure_project_state(workspace: Path) -> Path:
     root = project_state_dir(workspace)
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    for sub in (runs_dir(workspace), empty_mask_dir(workspace)):
-        sub.mkdir(parents=True, exist_ok=True)
-        sub.chmod(0o700)
+    runs = runs_dir(workspace)
+    runs.mkdir(parents=True, exist_ok=True)
+    runs.chmod(0o700)
+    # Bind-mounted over a masked directory, so the agent lists it as its own uid
+    # — 0555 for the same reason empty_mask_file is 0444. It is empty by
+    # definition; there is nothing to keep private, only something to shadow.
+    empty_dir = empty_mask_dir(workspace)
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    empty_dir.chmod(0o555)
     # Destination for logs harvested out of the container at teardown. It is not
     # mounted into the container: Docker Desktop does not enforce uid or mode on
     # a bind, so a shared log dir would let the agent edit its own audit trail.
@@ -132,5 +138,8 @@ def ensure_project_state(workspace: Path) -> Path:
     empty = empty_mask_file(workspace)
     if not empty.exists():
         empty.touch()
-    empty.chmod(0o400)
+    # Bind-mounted over a masked path and read by the agent as its own uid, so
+    # it has to be world-readable on Linux. Zero bytes: there is nothing here to
+    # keep private, only something to shadow.
+    empty.chmod(0o444)
     return root

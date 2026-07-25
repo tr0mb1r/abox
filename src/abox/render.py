@@ -70,10 +70,28 @@ def _env() -> Environment:
     )
 
 
+def artifacts_path(workspace: Path) -> Path:
+    """The artifacts directory as a plain path — no mkdir, no chmod.
+
+    `artifacts_dir` enforces the mode as a side effect of returning the path,
+    which is fine for callers about to write there and useless for a caller
+    about to *inspect* it: the enforcement lands before the stat, so a tampered
+    mode is corrected and then reported as fine. Anything auditing the mode has
+    to read it without touching it first.
+    """
+    return paths.project_state_dir(workspace) / "artifacts"
+
+
 def artifacts_dir(workspace: Path) -> Path:
     d = paths.project_state_dir(workspace) / "artifacts"
     d.mkdir(parents=True, exist_ok=True)
-    d.chmod(0o700)
+    # 0755, not 0700: this directory is bind-mounted into containers that run as
+    # their own uid — the agent as `vscode`, nginx as 101 — and Linux enforces
+    # uid/mode on a bind where Docker Desktop does not. At 0700 owned by the host
+    # user, every one of them gets EACCES on Linux while working on macOS. Write
+    # stays owner-only, which is the property `artifacts_dir_is_private` exists
+    # to defend; readability by others is not a tampering risk.
+    d.chmod(0o755)
     return d
 
 
@@ -484,13 +502,14 @@ def write(result: RenderResult, *, workspace_copy: bool = True) -> dict[str, Pat
 
     for name, body in result.artifacts.items():
         path = target_dir / name
-        # The final mode is read-only so nothing on the host casually edits what
-        # the container mounts; re-opening it for a re-render therefore needs the
-        # write bit back first.
+        # Read-only so nothing on the host casually edits what the container
+        # mounts; re-opening it for a re-render therefore needs the write bit
+        # back first. World-*readable* because the container reads these as a
+        # different uid and Linux, unlike Docker Desktop, enforces that.
         if path.exists():
             path.chmod(0o600)
         path.write_text(body, encoding="utf-8")
-        path.chmod(0o500 if name.endswith(".sh") else 0o400)
+        path.chmod(0o555 if name.endswith(".sh") else 0o444)
         written[name] = path
 
     state = {
@@ -637,7 +656,18 @@ def runspec_path(workspace: Path) -> Path:
 
 
 def artifacts_dir_is_private(workspace: Path) -> bool:
-    """The artifacts dir is mounted read-only, but a group/world-writable source
-    would let anything else on the host swap the script abox is about to trust."""
-    mode = artifacts_dir(workspace).stat().st_mode
-    return not (mode & 0o077)
+    """Nothing but the owner may *modify* what the container is about to mount.
+
+    The check is on the write bits alone. It used to reject group/world read and
+    execute too, which is stricter than the sentence above and is what broke
+    Linux: the container reads these files as its own uid, and Linux enforces
+    that where Docker Desktop silently remaps it. Being readable by another
+    account on the host is not how an artifact gets swapped; being writable is.
+    """
+    # artifacts_path, not artifacts_dir: the latter re-applies the mode before
+    # returning, so this check could never fail — it corrected the very thing it
+    # was asked to detect and then reported success.
+    path = artifacts_path(workspace)
+    if not path.is_dir():
+        return False
+    return not (path.stat().st_mode & 0o022)

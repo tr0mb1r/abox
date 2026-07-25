@@ -161,6 +161,46 @@ def test_artifacts_dir_is_private(manifest, config, workspace, spec) -> None:
     assert render.artifacts_dir_is_private(workspace)
 
 
+def test_artifacts_dir_rejects_a_group_writable_source(
+    manifest, config, workspace, spec
+) -> None:
+    """The property the check actually defends: nobody else can swap the file.
+
+    Narrowing it to the write bits must not narrow it out of existence.
+    """
+    render.write(_render(manifest, config, workspace, spec))
+    d = render.artifacts_dir(workspace)
+    d.chmod(d.stat().st_mode | 0o020)
+    assert not render.artifacts_dir_is_private(workspace)
+
+
+def test_artifacts_are_readable_by_a_different_uid(
+    manifest, config, workspace, spec
+) -> None:
+    """The containers read these as their own uid — the agent as `vscode`,
+    nginx as 101 — and Linux enforces uid/mode on a bind where Docker Desktop
+    silently remaps it. At 0400 owned by the host user every one of them got
+    EACCES on Linux while working on macOS, which is how three integration
+    tests passed for months on one platform and failed on the other.
+    """
+    written = render.write(_render(manifest, config, workspace, spec))
+    assert render.artifacts_dir(workspace).stat().st_mode & 0o005 == 0o005, "dir needs o+rx"
+    for name, path in written.items():
+        mode = path.stat().st_mode
+        assert mode & 0o004, f"{name} is not readable by another uid"
+        if name.endswith(".sh"):
+            assert mode & 0o001, f"{name} is not executable by another uid"
+
+
+def test_mask_sources_are_readable_by_a_different_uid(workspace) -> None:
+    """A mask the agent cannot read is a permission error, not an empty file."""
+    from abox import paths
+
+    paths.ensure_project_state(workspace)
+    assert paths.empty_mask_file(workspace).stat().st_mode & 0o004, "empty file needs o+r"
+    assert paths.empty_mask_dir(workspace).stat().st_mode & 0o005 == 0o005, "empty dir needs o+rx"
+
+
 def test_context_dir_that_does_not_exist_warns(manifest, config, workspace, spec, tmp_path) -> None:
     manifest.mounts.context = [str(tmp_path / "nope")]
     result = render.render(manifest, config, workspace, spec)
