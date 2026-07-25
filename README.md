@@ -147,6 +147,74 @@ Agents reach `http://abox-gw-<profile>:8811/mcp` by container DNS. One gateway
 serves every project on the same profile; abox tracks which projects need which
 servers and reconciles the union.
 
+## Why not just use X
+
+abox is not the only way to put an agent behind a boundary, and for a lot of
+people it is not the best one. What it adds over each neighbour is narrow:
+**MCP mediated through one authenticated endpoint**, **the egress review queue
+as a produced artifact**, and **per-turn tool cost measurement**. If you do not
+want those three things, one of the following is probably a better fit.
+
+### Claude Code's own sandbox
+
+Claude Code sandboxes Bash commands and their children natively — Seatbelt on
+macOS, bubblewrap plus a socat network relay on Linux and WSL2 — with allowed
+read/write paths and allowed domains configured through `/sandbox` or
+`settings.json`. Filesystem and network isolation are independent layers.
+
+**It is better than abox for the common case.** Zero setup, no Docker, works on
+any project immediately, and it constrains commands *inside* an ordinary session
+— which abox does not do at all. abox's container is the boundary; inside it the
+agent runs unconstrained by design.
+
+Reach for abox instead when you want the agent's whole environment disposable
+rather than its Bash calls contained, and when you want MCP servers behind a
+gateway rather than dialled directly. Claude Code has no proxy or unified auth
+layer for MCP: servers are called directly, and credentials go in headers or the
+environment. Nothing stops you running both — they constrain different things.
+
+### Anthropic's reference dev container
+
+The `init-firewall.sh` here descends from
+[anthropics/claude-code/.devcontainer](https://github.com/anthropics/claude-code/tree/main/.devcontainer),
+which is the official, simpler, editor-native answer: one container for one
+repo, a Dockerfile, a devcontainer.json, and a domain allowlist script.
+
+**It is better than abox if one repo is all you have.** It has no extra CLI to
+install, opens straight from VS Code, and you can read the whole thing in an
+afternoon.
+
+abox is that plus a lifecycle: per-project manifests, a shared gateway that
+reconciles the union of what every project on a profile declares, secrets that
+never reach the agent, artifacts that live outside the workspace so the agent
+cannot rewrite them, and an audit that runs against the machine rather than the
+config. Whether that is worth a second tool depends entirely on how many
+projects you have.
+
+### bubblewrap, gVisor, Firecracker
+
+These are stronger isolation primitives than a Docker container, and abox does
+not compete with them. gVisor in particular gives you a real syscall boundary,
+which Docker does not.
+
+**If container escape is in your threat model, abox does not help** — it is a
+CLI that drives Docker Desktop, and it inherits whatever Docker Desktop's
+isolation is worth. Non-goals says this too. Use gVisor or a VM.
+
+What those tools do not give you is any opinion about agents: no MCP mediation,
+no egress allowlist reconciled from a manifest, no review queue of the names
+your agent tried to resolve, no per-turn tool cost. abox is a policy layer, not
+an isolation primitive, and it would happily sit on top of a stronger one.
+
+### The honest summary
+
+| You want | Use |
+|---|---|
+| guardrails on Bash in a normal session, nothing to install | Claude Code's sandbox |
+| one repo, one container, editor-native | Anthropic's reference dev container |
+| a real syscall boundary | gVisor / a VM — not abox |
+| many projects, MCP behind one authenticated endpoint, an audit trail you can read | abox |
+
 ## Install
 
 Not on PyPI yet, so install from the checkout:

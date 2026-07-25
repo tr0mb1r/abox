@@ -101,6 +101,26 @@ states each on every run.
 Everything below is in service of the four axes. When a feature weakens one of
 them, abox says so on every run rather than hiding it.
 
+### Where abox sits among the alternatives
+
+abox adds exactly three things over its nearest neighbours: **MCP mediated
+through one authenticated endpoint**, **the egress review queue as a produced
+artifact**, and **per-turn tool cost measurement**. Everything else it does,
+something simpler already does.
+
+| You want | Use | Why not abox |
+|---|---|---|
+| guardrails on Bash inside a normal session | **Claude Code's own sandbox** — Seatbelt on macOS, bubblewrap + socat on Linux/WSL2, configured via `/sandbox` or `settings.json` | abox does not constrain commands *inside* the container at all. Its container is the boundary; within it the agent runs freely by design. The two compose — run both |
+| one repo, one container, editor-native | **[Anthropic's reference dev container](https://github.com/anthropics/claude-code/tree/main/.devcontainer)**, which this project's `init-firewall.sh` descends from | it is simpler, official, and has no CLI to install. abox is that plus a lifecycle across many projects |
+| a real syscall boundary | **gVisor, Firecracker, a VM** | abox drives Docker Desktop and inherits whatever its isolation is worth. Container escape is a stated non-goal. abox is a policy layer and would sit happily on top of a stronger primitive |
+| many projects, MCP behind one authenticated endpoint, an audit you can read | **abox** | — |
+
+Two specifics worth stating rather than implying: Claude Code has no built-in
+proxy or unified auth layer for MCP — servers are dialled directly and
+credentials travel in headers or the environment — and it does not document a
+per-tool token breakdown or a log of blocked egress for review. Those absences
+are the gap abox fills, and they are a narrower gap than "sandboxing".
+
 ---
 
 ## 2. Architecture
