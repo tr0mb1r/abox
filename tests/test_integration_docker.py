@@ -347,6 +347,57 @@ def sni_agent(live_config: GlobalConfig, tmp_path):
         dockerx.docker("network", "rm", TEST_NETWORK)
 
 
+def test_the_sni_agent_firewall_is_actually_live(sni_agent) -> None:
+    """Establish the proxy is in the path before trusting anything below it.
+
+    The three tests that follow assert the proxy's behaviour, and every one of
+    them would pass just as well if the firewall never applied: example.com
+    would answer directly, and a forged SNI would be refused by example.com
+    rather than by us. The fixture never checked, so on Linux — where sni.log
+    came back empty while all three "passed" — there was no way to tell a
+    working control from an absent one.
+    """
+    from abox import runner
+
+    _m, _ws, provisioned, _s = sni_agent
+    assert runner.verify_firewall_live(provisioned.container_name, required=True).ok
+
+    nat = _exec(
+        provisioned.container_name, "iptables", "-t", "nat", "-S", "OUTPUT", user="root"
+    )
+    assert nat.ok, nat.stderr
+    assert "--dport 443" in nat.stdout, f"no 443 redirect installed:\n{nat.stdout}"
+
+
+def test_the_allowed_connection_goes_through_the_proxy(sni_agent) -> None:
+    """A 200 proves reachability, not that the proxy was involved.
+
+    Only the proxy's own log proves the traffic took the intended path, which is
+    the difference between "egress works" and "egress is being filtered".
+    """
+    from abox import proxy
+
+    _m, _ws, provisioned, _s = sni_agent
+    r = _exec(provisioned.container_name, "curl", "-sS", "-o", "/dev/null",
+              "-w", "%{http_code}", "-m", "25", "https://example.com")
+    assert r.stdout.strip() == "200", r.stderr
+
+    deadline = time.monotonic() + 20
+    seen = ""
+    while time.monotonic() < deadline:
+        got = dockerx.docker(
+            "exec", proxy.proxy_container("snitest"), "cat", "/var/log/nginx/sni.log",
+            timeout=30,
+        )
+        seen = got.stdout or ""
+        if "example.com" in seen:
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        f"the proxy never logged the allowed connection — sni.log:\n{seen or '(empty)'}"
+    )
+
+
 def test_allowed_domain_passes_the_proxy(sni_agent) -> None:
     _m, _ws, provisioned, _s = sni_agent
     r = _exec(provisioned.container_name, "curl", "-sS", "-o", "/dev/null",
