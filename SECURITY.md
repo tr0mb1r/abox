@@ -9,7 +9,7 @@ For the adversary model, the non-goals and the residual-risk list, see
 
 ## Maturity
 
-**abox has not had third-party security review.** Version 0.1.0. One author. The
+**abox has not had third-party security review.** Version 0.1.1. One author. The
 tests below were written by the same person who wrote the code they test, which
 is worth exactly as much as that usually is. Adopt accordingly: it is a
 defence-in-depth layer over Docker, not a security boundary anyone else has
