@@ -1,0 +1,121 @@
+# The `-m docker` suite on a real Linux host.
+#
+# Everything abox claims about itself was measured on macOS with Docker Desktop.
+# Two of those measurements are known to differ on Linux, and both are
+# load-bearing:
+#
+#   * Docker Desktop does NOT enforce uid/mode on a bind mount; Linux does.
+#     abox relies on the macOS behaviour without saying so — the artifacts dir
+#     is chmod 0700 owned by the *host* user, while the agent runs as uid 1000
+#     inside the image. On a runner the host user is uid 1001, so the agent
+#     should be unable to read /opt/abox at all. That is a prediction, and this
+#     workflow exists to find out.
+#   * The image installs iptables from apt with no nft/legacy selection, so the
+#     firewall could apply rules that match nothing against a distro kernel.
+#
+# This job is therefore a MEASUREMENT, not a gate. It is dispatch-only and its
+# whole point is to learn what breaks; a red run here is a finding, not a
+# regression. The environment is written to the job summary either way, so the
+# result is interpretable without re-reading the logs.
+name: linux-docker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The agent image is ~1.3 GB on top of a ~1 GB base. Runners ship with a
+      # lot of preinstalled SDKs; reclaim the space before building.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tail -1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync
+        run: uv sync --all-extras --dev
+
+      # Captured before the suite runs, so a failure is still interpretable:
+      # these are the facts that differ from the macOS baseline.
+      - name: Record the platform
+        id: platform
+        run: |
+          {
+            echo "## Platform"
+            echo '```'
+            echo "kernel        : $(uname -srm)"
+            echo "distro        : $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "host user     : $(id)"
+            echo "docker        : $(docker version --format '{{.Server.Version}}')"
+            echo "storage driver: $(docker info --format '{{.Driver}}')"
+            echo "iptables      : $(iptables -V 2>/dev/null || echo 'not on PATH')"
+            echo "apparmor      : $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo n/a)"
+            echo "resolv.conf   : $(grep -m1 nameserver /etc/resolv.conf)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The macOS-vs-Linux difference abox depends on, stated as a measurement
+      # rather than an assumption, in the same job that then exercises it.
+      - name: Measure bind-mount uid/mode enforcement
+        run: |
+          mkdir -p /tmp/probe && sudo chown 0:0 /tmp/probe && sudo chmod 0755 /tmp/probe
+          {
+            echo "## Bind-mount uid/mode"
+            echo '```'
+            if docker run --rm -u 1000:1000 -v /tmp/probe:/probe alpine:3 \
+                 sh -c 'touch /probe/x 2>/dev/null'; then
+              echo "uid/mode NOT enforced (behaves like Docker Desktop)"
+            else
+              echo "uid/mode IS enforced (differs from the macOS baseline)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the docker suite
+        id: suite
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          uv run pytest -m docker -v --tb=short 2>&1 | tee /tmp/suite.log
+
+      - name: Summarise the result
+        if: always()
+        run: |
+          {
+            echo "## \`pytest -m docker\` on Linux"
+            echo ""
+            echo "outcome: **${{ steps.suite.outcome }}**"
+            echo ""
+            echo '```'
+            tail -40 /tmp/suite.log 2>/dev/null || echo "(no output captured)"
+            echo '```'
+            echo ""
+            echo "_A red result here is a finding about Linux, not a regression._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-docker-log
+          path: /tmp/suite.log
+          if-no-files-found: warn
+
+      # Surface the real outcome as the job's, now that the summary is written.
+      - name: Reflect the suite outcome
+        if: steps.suite.outcome == 'failure'
+        run: |
+          echo "::warning::the docker suite failed on Linux — see the job summary"
+          exit 1
