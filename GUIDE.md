@@ -194,8 +194,17 @@ matters for "boundary-spanning" servers (§7.3, §13).
 
 **Host prerequisites — the whole list:**
 
-- **Docker Desktop ≥ 4.48** with the MCP Toolkit enabled.
+- **macOS with Docker Desktop ≥ 4.48**, MCP Toolkit enabled.
 - **`op`** (1Password CLI) — *optional*, only if a secret points at `op://…`.
+
+**Linux and colima are not supported yet.** What abox actually needs is the
+`docker mcp` CLI plugin, which is buildable anywhere — Docker Desktop is just
+the easy way to get it on macOS. But at least one security claim changes off
+Desktop: secrets fall back from the OS keychain to a `.env` file on disk. The
+full scoping, including the `iptables` backend risk and why colima behaves more
+like Docker Desktop than like Linux, is in
+[the Linux support note](https://github.com/tr0mb1r/abox/blob/main/docs/notes/linux-support.md).
+It is a plan, not a measurement: nothing in it has been run on Linux.
 
 There is **no npm, no Node, no `@devcontainers/cli`** on the host. abox drives
 the Docker CLI directly and bakes Claude Code into the agent image from its

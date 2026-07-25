@@ -239,8 +239,16 @@ MCP server (catalog, hosted, and self-hosted custom images) — see
 
 Host prerequisites:
 
-- **Docker Desktop ≥ 4.48** with the MCP Toolkit enabled — that is the whole list
+- **macOS with Docker Desktop ≥ 4.48**, MCP Toolkit enabled — that is the whole list
 - **`op`** (1Password CLI) — optional, only if you point a secret at `op://…`
+
+**Linux and colima are not supported yet**, and the reason is not portability
+alone: off Docker Desktop, secrets fall back from the OS keychain to a `.env`
+file on disk, which changes a security claim rather than an install step. The
+scoping — including the `iptables` backend risk and why colima behaves more like
+Docker Desktop than like Linux — is in
+[the Linux support note](https://github.com/tr0mb1r/abox/blob/main/docs/notes/linux-support.md).
+Nothing in it has been run on Linux; it is a plan, not a result.
 
 **No npm, no Node, no `@devcontainers/cli` on the host.** abox drives the Docker
 CLI itself and bakes Claude Code into the image from its checksum-verified
