@@ -60,3 +60,53 @@ def test_maturity_and_reporting_are_stated() -> None:
     text = SECURITY.read_text(encoding="utf-8")
     assert "has not had third-party security review" in text
     assert "security/advisories" in text
+
+
+#: Files that get published — to GitHub, to the docs site, or both.
+_PUBLISHED = ("README.md", "GUIDE.md", "QUICKSTART.md", "SECURITY.md")
+
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+#: An absolute macOS/Linux home path names the account it belongs to.
+_HOME_PATH = re.compile(r"/(?:Users|home)/([\w.-]+)/")
+#: Accounts that are not anybody's: the container's own user, and the
+#: placeholders the docs use when a host path has to be shown in full.
+_IMPERSONAL_ACCOUNTS = {"vscode", "root", "you", "user", "me", "youruser"}
+
+
+def _published_files() -> list[Path]:
+    return [REPO / name for name in _PUBLISHED] + sorted((REPO / "docs" / "notes").glob("*.md"))
+
+
+def test_no_contact_email_is_published() -> None:
+    """Reporting goes through GitHub advisories only; no address is exposed."""
+    offenders = []
+    for path in _published_files():
+        if not path.is_file():
+            continue
+        for match in _EMAIL.findall(path.read_text(encoding="utf-8")):
+            # Example env values and non-address strings are not contact details.
+            if match.endswith("@users.noreply.github.com"):
+                continue
+            offenders.append(f"{path.name}: {match}")
+    assert not offenders, (
+        "published docs must not carry an email address — reporting is GitHub "
+        f"advisories only: {', '.join(offenders)}"
+    )
+
+
+def test_no_home_directory_path_is_published() -> None:
+    """An absolute home path names the account that ran the command.
+
+    `/home/vscode` is the container's own user and `/Users/you` is a
+    placeholder; a real account name is the leak.
+    """
+    offenders = [
+        f"{path.name}: {account}"
+        for path in _published_files()
+        if path.is_file()
+        for account in _HOME_PATH.findall(path.read_text(encoding="utf-8"))
+        if account not in _IMPERSONAL_ACCOUNTS
+    ]
+    assert not offenders, (
+        f"use ~/ rather than an absolute home path in published docs: {', '.join(offenders)}"
+    )

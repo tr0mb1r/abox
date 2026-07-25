@@ -21,10 +21,10 @@ review produced it.
 
 ## Reporting a vulnerability
 
-Use **GitHub private security advisories** on
-[tr0mb1r/abox](https://github.com/tr0mb1r/abox/security/advisories/new). That
-keeps the report private until there is a fix. If that is unavailable to you,
-email **val.serkin@gmail.com** — the same address on every commit in this repo.
+Report through **GitHub private security advisories**:
+[open an advisory on tr0mb1r/abox](https://github.com/tr0mb1r/abox/security/advisories/new).
+That is the only channel — it keeps the report private until there is a fix, and
+it is the one place a report will be seen.
 
 Please include what you were able to reach, from which position (agent
 container, MCP server container, host), and the `abox doctor` output if it is
