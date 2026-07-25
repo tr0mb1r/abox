@@ -173,6 +173,28 @@ RUN (SUDO_FORCE_REMOVE=yes DEBIAN_FRONTEND=noninteractive apt-get purge -y sudo 
  && ! command -v sudo \
  && ! dpkg -l sudo 2>/dev/null | grep -q "^ii"
 
+# `abox run` builds the claude argv itself; an interactive shell does not, so a
+# bare `claude` here would start with no MCP config and report "No MCP servers
+# configured" — a working agent with none of its tools, and nothing saying why.
+# The config is mounted at a path Claude Code does not search, precisely so that
+# passing it explicitly is what makes "exactly one endpoint" true. This wrapper
+# passes it, and says so, rather than leaving the flags to be guessed.
+RUN printf '%s\n' \
+  '# Installed by abox. `claude` needs the gateway config passed explicitly.' \
+  'claude() {' \
+  '  case " $* " in' \
+  '    *" --mcp-config "*) command claude "$@" ;;' \
+  '    *) command claude --mcp-config {{ mcp_config }}{% if single_mcp_endpoint %} --strict-mcp-config{% endif %} "$@" ;;' \
+  '  esac' \
+  '}' \
+  'if [ -n "${PS1-}" ] && [ -z "${ABOX_SHELL_BANNER-}" ]; then' \
+  '  export ABOX_SHELL_BANNER=1' \
+  '  printf "abox: \\`claude\\` runs with --mcp-config {{ mcp_config }}{% if single_mcp_endpoint %} --strict-mcp-config{% endif %} (gateway: ${ABOX_GATEWAY_URL:-unset}).\\n"' \
+  '  printf "      \\`command claude\\` bypasses that and sees no MCP servers.\\n"' \
+  'fi' \
+  > /etc/profile.d/abox-claude.sh \
+ && chmod 0644 /etc/profile.d/abox-claude.sh
+
 USER {{ remote_user }}
 WORKDIR /workspace
 ENV CLAUDE_CONFIG_DIR="/home/{{ remote_user }}/.claude" \

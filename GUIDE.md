@@ -1033,6 +1033,17 @@ Only named volumes (`abox-claude-<hash>`), the workspace, and telemetry persist.
 First-ever session per project: run `abox shell` once to complete the login, or a
 headless run exits 1 at authentication against an empty auth volume.
 
+**Running Claude interactively.** `abox run` builds the claude argv —
+`--mcp-config /opt/abox/mcp.json --strict-mcp-config` — and takes a required
+prompt, so it is headless only. `abox shell` hands over a bash prompt and builds
+no argv, so a bare `claude` there would start with no MCP config and report *"No
+MCP servers configured"*: a working agent with none of its tools, and nothing
+saying why. The agent image therefore ships a `claude` shell function that
+passes those flags, and the shell prints one line on entry stating it. Use
+`command claude` to bypass the wrapper — you will get no MCP servers, which is
+occasionally what you want. `abox doctor` verifies the wrapper is in the image
+(`agent.interactive-mcp`).
+
 **Tear down:**
 
 ```bash

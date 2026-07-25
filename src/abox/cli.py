@@ -496,6 +496,15 @@ def shell(
     """Open an interactive session in a fresh sandbox (also used for first login)."""
     try:
         workspace, manifest, config = _load(directory)
+        # `abox run` builds the claude argv; an interactive shell does not. Say
+        # so before handing over the tty, because the failure is silent: a bare
+        # `claude` starts fine and reports no MCP servers.
+        strict = " --strict-mcp-config" if manifest.run.single_mcp_endpoint else ""
+        console.print(
+            f"[dim]inside: `claude` is wrapped to pass --mcp-config "
+            f"{render_mod.MCP_CONFIG_PATH}{strict}; `command claude` bypasses it "
+            f"and sees no MCP servers.[/]"
+        )
         outcome = runner.shell_session(manifest, config, workspace, keep=keep)
         console.print(
             f"[dim]session {outcome.run_id} ended (exit {outcome.exit_code}, "

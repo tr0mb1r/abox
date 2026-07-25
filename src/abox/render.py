@@ -48,6 +48,11 @@ ARTIFACT_DEVCONTAINER = "devcontainer.json"
 ARTIFACT_DOCKERFILE = "Dockerfile"
 ARTIFACT_FIREWALL = "init-firewall.sh"
 ARTIFACT_MCP = "mcp.json"
+
+#: Where the MCP config is mounted inside the container. Deliberately not a
+#: path Claude Code searches: passing it explicitly is what makes "exactly one
+#: endpoint" true rather than hopeful.
+MCP_CONFIG_PATH = "/opt/abox/mcp.json"
 ARTIFACT_SETTINGS = "settings.json"
 ARTIFACT_PROXY = "proxy.conf"
 MANIFEST_OF_ARTIFACTS = "artifacts.json"
@@ -327,7 +332,7 @@ def build_runspec(
         "run_args": run_args,
         "logs": "/var/log/abox",
         "firewall": "/opt/abox/init-firewall.sh",
-        "mcp_config": "/opt/abox/mcp.json",
+        "mcp_config": MCP_CONFIG_PATH,
         "settings": "/opt/abox/settings.json" if agent_settings(config) else "",
         "toolchains": list(manifest.toolchains),
     }
@@ -404,6 +409,10 @@ def render(
         claude_version=config.claude_version,
         versions=config.toolchain_versions,
         rtk=config.rtk,
+        mcp_config=MCP_CONFIG_PATH,
+        # Mirrors runner.claude_argv: --strict is dropped exactly when the
+        # manifest opts into connectors, which is a request for a second source.
+        single_mcp_endpoint=manifest.run.single_mcp_endpoint,
     )
 
     settings = json.dumps(agent_settings(config), indent=2) + "\n"

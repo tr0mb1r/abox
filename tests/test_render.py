@@ -277,6 +277,36 @@ def test_mandatory_egress_covers_claude_auth(manifest, config, workspace, spec) 
         assert f'"{host}"' in result.artifacts[render.ARTIFACT_FIREWALL]
 
 
+def test_image_wraps_claude_so_an_interactive_shell_gets_the_gateway(
+    manifest, config, workspace, spec
+) -> None:
+    """`abox run` builds the claude argv; `abox shell` builds none.
+
+    Without the wrapper a bare `claude` in the shell starts with no MCP config
+    and reports "No MCP servers configured" — a working agent with none of its
+    tools, and nothing saying why.
+    """
+    result = _render(manifest, config, workspace, spec)
+    dockerfile = result.artifacts[render.ARTIFACT_DOCKERFILE]
+    assert "/etc/profile.d/abox-claude.sh" in dockerfile
+    assert f"--mcp-config {render.MCP_CONFIG_PATH}" in dockerfile
+    assert "--strict-mcp-config" in dockerfile
+    # It must not swallow an explicit --mcp-config the caller passed.
+    assert '*" --mcp-config "*)' in dockerfile
+
+
+def test_wrapper_drops_strict_when_connectors_are_on(
+    manifest, config, workspace, spec
+) -> None:
+    """Mirrors runner.claude_argv: connectors are a request for a second source."""
+    manifest.run.connectors = True
+    dockerfile = _render(manifest, config, workspace, spec).artifacts[
+        render.ARTIFACT_DOCKERFILE
+    ]
+    assert f"--mcp-config {render.MCP_CONFIG_PATH}" in dockerfile
+    assert "--strict-mcp-config" not in dockerfile
+
+
 def test_mandatory_egress_survives_an_operator_supplied_list(
     manifest, config, workspace, spec
 ) -> None:

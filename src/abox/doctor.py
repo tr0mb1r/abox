@@ -1275,6 +1275,7 @@ def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> li
             detail=", ".join(privileged) if privileged else "no privileged flag",
         ),
         _mcp_endpoint_check(manifest),
+        check_interactive_claude(workspace),
     ]
 
 
@@ -1364,6 +1365,40 @@ def check_agent_secrets(manifest: Manifest, config: GlobalConfig) -> list[Check]
         )
     )
     return checks
+
+
+def check_interactive_claude(workspace: Path) -> Check:
+    """Does an interactive shell get the gateway, or a Claude with no tools?
+
+    `agent.single-mcp-endpoint` verifies the argv `abox run` builds. It says
+    nothing about `abox shell`, which hands over a bash prompt and builds no
+    argv at all — so a bare `claude` there started with no MCP config and
+    reported "No MCP servers configured", a working agent with none of its
+    tools and nothing explaining why. The image now ships a wrapper; this
+    checks the rendered Dockerfile actually carries it, because an invariant
+    that holds on one path and not the other is the kind of gap that only
+    shows up when somebody types the obvious command.
+    """
+    dockerfile = render.artifacts_dir(workspace) / render.ARTIFACT_DOCKERFILE
+    if not dockerfile.is_file():
+        return Check(
+            id="agent.interactive-mcp",
+            title="an interactive `claude` gets the gateway",
+            status=Status.skip,
+            detail="nothing rendered yet",
+        )
+    body = dockerfile.read_text(encoding="utf-8", errors="replace")
+    ok = "/etc/profile.d/abox-claude.sh" in body and render.MCP_CONFIG_PATH in body
+    return Check(
+        id="agent.interactive-mcp",
+        title="an interactive `claude` gets the gateway",
+        status=Status.ok if ok else Status.fail,
+        detail=f"wrapper passes --mcp-config {render.MCP_CONFIG_PATH}"
+        if ok
+        else "the image ships no claude wrapper — a bare `claude` in `abox shell` "
+        "will report no MCP servers",
+        hint="" if ok else "`abox up` re-renders and rebuilds the image",
+    )
 
 
 def _mcp_endpoint_check(manifest: Manifest | None) -> Check:
