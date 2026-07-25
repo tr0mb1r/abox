@@ -33,7 +33,11 @@ stream {
     # The allowlist. Exact names only — abox rejects wildcards in egress
     # because a wildcard cannot be checked against what it actually matches.
     map $ssl_preread_server_name $abox_upstream {
-        default "";
+        # Not "" — an empty upstream is a config error to nginx, and whether the
+        # access log runs on that error path varies by build. This address
+        # refuses instantly and does so through the normal proxy path, so the
+        # attempt is always logged with the name that was attempted.
+        default "{{ deny_sentinel }}";
 {%- for domain in egress %}
         "{{ domain }}" "{{ domain }}:443";
 {%- endfor %}
@@ -43,9 +47,9 @@ stream {
         listen {{ port }};
         ssl_preread on;
 
-        # An empty upstream is a configuration error to nginx, which closes the
-        # connection. Failing closed is the point: a name that is not in the map
-        # above has no route, and the attempt is logged with its SNI.
+        # A name absent from the map above goes to the deny sentinel, which
+        # nothing is listening on: the connection fails closed, and unlike an
+        # empty upstream it fails somewhere nginx still logs.
         proxy_pass $abox_upstream;
 
         proxy_connect_timeout 10s;

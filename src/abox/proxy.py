@@ -38,6 +38,19 @@ from .manifest import GlobalConfig, Manifest, merged_egress
 
 CONTAINER_CONF = "/etc/nginx/nginx.conf"
 LOG_DIR = "/var/log/nginx"
+#: Where an unmatched server name is sent. Nothing listens on port 1 of the
+#: proxy's own loopback, so the connection is refused immediately — but it is
+#: refused *through the normal proxy path*, which means nginx runs its log phase
+#: and the attempt reaches the review queue.
+#:
+#: The map used to default to an empty upstream, which nginx treats as a config
+#: error. That also refused the connection, but whether the access log runs on
+#: that error path is not guaranteed — it does on nginx 1.31.3 via Docker
+#: Desktop and does not on the nginx:alpine a Linux runner pulls, so denials
+#: vanished from the queue on Linux while the refusal itself still worked.
+#: Failing closed was never in doubt; being *able to see it* was.
+DENY_SENTINEL = "127.0.0.1:1"
+
 #: The unprivileged user nginx:alpine ships.
 NGINX_UID = 101
 NGINX_GID = 101
@@ -225,10 +238,13 @@ def down(project: str) -> bool:
 
 
 def denied_names(project: str, *, tail: int = 500) -> list[dict[str, Any]]:
-    """SNI values the proxy refused — connections it logged with no upstream.
+    """SNI values the proxy refused.
 
     This is the domain-level counterpart to the DNS review queue: a name here
     was not merely looked up, it was connected to.
+
+    A refusal is recognised by the sentinel upstream, and still by the older
+    empty/"-" form so a log written before this change keeps parsing.
     """
     result = dockerx.docker(
         "exec", proxy_container(project), "cat", f"{LOG_DIR}/sni.log", timeout=30
@@ -245,6 +261,6 @@ def denied_names(project: str, *, tail: int = 500) -> list[dict[str, Any]]:
                 key, _, value = token.partition("=")
                 fields[key] = value.strip('"')
         sni = fields.get("sni", "")
-        if sni and sni != "-" and fields.get("upstream", "-") in ("-", ""):
+        if sni and sni != "-" and fields.get("upstream", "-") in ("-", "", DENY_SENTINEL):
             out.append({"sni": sni, "client": fields.get("client", ""), "raw": line})
     return out

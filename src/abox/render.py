@@ -27,6 +27,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from . import __version__, dockerx, paths
+from . import proxy as proxy_mod
 from .errors import RenderError
 from .gateway import GatewaySpec, mcp_config
 from .manifest import (
@@ -442,6 +443,7 @@ def render(
         port=config.egress_proxy.port,
         timeout=config.egress_proxy.timeout,
         resolver=DOCKER_EMBEDDED_DNS,
+        deny_sentinel=proxy_mod.DENY_SENTINEL,
     )
 
     firewall = env.get_template("init-firewall.sh.j2").render(

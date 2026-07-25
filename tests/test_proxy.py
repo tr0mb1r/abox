@@ -34,8 +34,12 @@ def test_allowlist_becomes_an_sni_map(manifest, proxied, workspace, spec) -> Non
     assert "ssl_preread on;" in conf
     assert '"github.com" "github.com:443";' in conf
     assert '"api.anthropic.com" "api.anthropic.com:443";' in conf
-    # An unlisted name has no upstream, and nginx closes the connection.
-    assert 'default "";' in conf
+    # An unlisted name goes to the deny sentinel: refused, and — unlike an
+    # empty upstream — refused somewhere nginx still runs its log phase.
+    from abox import proxy as proxy_mod
+
+    assert f'default "{proxy_mod.DENY_SENTINEL}";' in conf
+    assert 'default "";' not in conf
 
 
 def test_the_proxy_does_not_terminate_tls(manifest, proxied, workspace, spec) -> None:
@@ -49,6 +53,27 @@ def test_the_proxy_does_not_terminate_tls(manifest, proxied, workspace, spec) ->
 def test_denied_attempts_are_logged_with_their_sni(manifest, proxied, workspace, spec) -> None:
     conf = render.render(manifest, proxied, workspace, spec).artifacts[render.ARTIFACT_PROXY]
     assert "$ssl_preread_server_name" in conf.split("log_format")[1][:200]
+
+
+def test_denied_names_recognises_the_sentinel(manifest, runner) -> None:
+    """The parser has to match what the template now writes.
+
+    Both forms are accepted: a log written before the sentinel landed still
+    parses, so upgrading does not blank the queue.
+    """
+    from abox import proxy as proxy_mod
+
+    runner.expect(
+        r"docker exec .* cat .*sni\.log",
+        f'2026-07-25T10:00:00+00:00 client=172.18.0.9 sni="pypi.org" '
+        f'upstream="{proxy_mod.DENY_SENTINEL}" status=502 bytes=0\n'
+        '2026-07-25T10:00:01+00:00 client=172.18.0.9 sni="old.example" '
+        'upstream="-" status=502 bytes=0\n'
+        '2026-07-25T10:00:02+00:00 client=172.18.0.9 sni="example.com" '
+        'upstream="93.184.216.34:443" status=200 bytes=5120\n',
+    )
+    names = {d["sni"] for d in proxy_mod.denied_names("demo")}
+    assert names == {"pypi.org", "old.example"}, names
 
 
 # -- the firewall changes shape --------------------------------------------
