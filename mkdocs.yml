@@ -54,6 +54,7 @@ nav:
   - Home: README.md
   - Quickstart: QUICKSTART.md
   - Complete Guide: GUIDE.md
+  - Security: SECURITY.md
   # Investigation notes: measurements, including the ones whose result is
   # "not defended". Published on purpose — see SECURITY.md.
   - Notes:
