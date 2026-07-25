@@ -65,6 +65,11 @@ setup_dns() {
     echo "log-queries"
     echo "log-facility=${DNS_LOG}"
     echo "cache-size=0"
+    # Nothing routes over IPv6 (see the ip6tables block below), so an AAAA
+    # answer is an address the agent will try first and never reach. Suppress
+    # it: the failure mode otherwise is a confusing timeout rather than a clean
+    # refusal, and it hid an IPv6 bypass behind what looked like a logging bug.
+    echo "filter-AAAA"
 {%- if scoped_dns %}
     # Forward ONLY names the allowlist covers; everything else gets NXDOMAIN.
     # Without this, dnsmasq resolves arbitrary names, which is a low-bandwidth
@@ -144,6 +149,29 @@ iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
 iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# ------------------------------------------------------------------ IPv6 ----
+# Every rule above is IPv4. An unconfigured ip6tables defaults to policy ACCEPT,
+# so on any network with IPv6 the whole of default-deny egress, the address
+# allowlist and the SNI redirect are bypassed by a client that simply prefers
+# AAAA — which clients do, per RFC 6724. abox's own bridge is created without
+# --ipv6 so the usual deployment has no v6 address at all, but "usually absent"
+# is not a control, and this went unnoticed because Docker Desktop has no IPv6
+# while a Linux host may.
+#
+# There is no v6 allowlist: the ipset is `family inet` and the proxy is reached
+# over v4. So v6 is denied outright rather than filtered — loopback only.
+if have ip6tables; then
+  ip6tables -P INPUT DROP  2>/dev/null || true
+  ip6tables -P FORWARD DROP 2>/dev/null || true
+  ip6tables -P OUTPUT DROP 2>/dev/null || true
+  ip6tables -F 2>/dev/null || true
+  ip6tables -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
+  ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+  echo "ipv6: denied (no v6 allowlist exists; v4 is the only routed family)"
+else
+  echo "WARN: ip6tables missing — IPv6 egress is NOT restricted" >&2
+fi
 
 setup_dns || true
 
@@ -268,6 +296,11 @@ assert() {
   fi
 }
 
+ipv6_is_denied() {
+  # No ip6tables at all is a fail, not a pass: it means nothing refused v6.
+  have ip6tables || return 1
+  ip6tables -S OUTPUT 2>/dev/null | head -1 | grep -qx -- '-P OUTPUT DROP'
+}
 policy_is_drop() {
   iptables -S OUTPUT | head -1 | grep -qx -- '-P OUTPUT DROP'
 }
@@ -284,6 +317,7 @@ proxy_redirect_present() {
 {%- endif %}
 
 assert "OUTPUT policy is DROP" policy_is_drop
+assert "IPv6 OUTPUT policy is DROP" ipv6_is_denied
 assert "terminal DROP rule installed" final_drop_present
 assert "gateway reachable on tcp/${GATEWAY_PORT}" gateway_rule_present
 {%- if proxy_enabled %}

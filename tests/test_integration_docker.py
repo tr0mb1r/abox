@@ -455,7 +455,11 @@ def test_domain_fronting_is_refused(sni_agent) -> None:
     c = provisioned.container_name
     forged = _exec(
         c, "bash", "-lc",
-        'IP=$(getent hosts example.com | head -1 | cut -d" " -f1); '
+        # -4: the point of this test is the forged *name*, not the address
+        # family. Before AAAA was filtered, getent handed back an IPv6 literal
+        # and curl never reached the proxy at all — the refusal came from having
+        # no v6 route, which looked exactly like the proxy refusing it.
+        'IP=$(getent ahostsv4 example.com | head -1 | cut -d" " -f1); '
         'echo "resolved=[$IP]" >&2; '
         'curl -sS -v -o /dev/null -m 15 --resolve pypi.org:443:$IP https://pypi.org',
     )

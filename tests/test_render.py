@@ -479,6 +479,32 @@ def test_port_80_is_opt_in(manifest, config, workspace, spec) -> None:
     assert 'EGRESS_PORTS="80,443"' in wider
 
 
+def test_ipv6_egress_is_denied_not_merely_unmentioned(
+    manifest, config, workspace, spec
+) -> None:
+    """Every other rule in the script is IPv4.
+
+    An unconfigured ip6tables defaults to policy ACCEPT, so on a network with
+    IPv6 the whole allowlist is bypassed by a client that prefers AAAA — which
+    clients do. abox's bridge has no v6 today, but "usually absent" is not a
+    control, and Docker Desktop having no IPv6 is why this was invisible.
+    """
+    fw = _render(manifest, config, workspace, spec).artifacts[render.ARTIFACT_FIREWALL]
+    assert "ip6tables -P OUTPUT DROP" in fw
+    assert "ip6tables -P INPUT DROP" in fw
+    # And the script must refuse to certify itself if v6 was left open.
+    assert "ipv6_is_denied" in fw
+
+
+def test_the_resolver_does_not_hand_out_unroutable_aaaa(
+    manifest, config, workspace, spec
+) -> None:
+    """Nothing routes over v6, so an AAAA answer is an address the agent tries
+    first and never reaches — a timeout where a refusal belongs."""
+    fw = _render(manifest, config, workspace, spec).artifacts[render.ARTIFACT_FIREWALL]
+    assert "filter-AAAA" in fw
+
+
 def test_dns_is_scoped_to_the_allowlist(manifest, config, workspace, spec) -> None:
     """Arbitrary name resolution is a covert channel that survives default-deny
     egress: the query name itself carries the data."""
