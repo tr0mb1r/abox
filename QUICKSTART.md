@@ -56,7 +56,7 @@ the repo instead of the last release, use
 abox --version
 ```
 
-You should get `abox 0.1.2`, from `~/.local/bin/abox`. If the shell can't find
+You should get `abox 0.1.3`, from `~/.local/bin/abox`. If the shell can't find
 it, add `~/.local/bin` to your `PATH` (or run `uv tool update-shell`).
 
 To upgrade later, re-run the install with `--reinstall`. To remove it:
