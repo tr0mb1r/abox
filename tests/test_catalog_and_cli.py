@@ -332,7 +332,7 @@ def test_host_inventory_classifies_each_source(
 
 
 def test_mcp_import_lists_and_applies(
-    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
 ) -> None:
     (tmp_path / "docker-mcp" / "registry.yaml").write_text(
         "registry:\n  duckduckgo:\n    ref: ''\n"
@@ -350,6 +350,32 @@ def test_mcp_import_lists_and_applies(
     applied = cli.invoke(app, ["mcp", "import", "--dir", str(project), "--apply"])
     assert applied.exit_code == 0
     assert Manifest.load(project).servers == ["duckduckgo"]
+
+
+def test_mcp_import_survives_an_unreachable_secret_store(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """The secrets line is advisory and comes after the work is already done.
+
+    `--apply` writes the manifest and the artifacts first. Failing the command
+    afterwards because the store could not be *listed* would report a failure
+    for an operation that succeeded, leaving the manifest already mutated —
+    which is what happened on a host without the MCP CLI plugin.
+    """
+    (tmp_path / "docker-mcp" / "registry.yaml").write_text(
+        "registry:\n  github-official:\n    ref: ''\n"
+    )
+    monkeypatch.setenv("ABOX_CLAUDE_CONFIG", str(tmp_path / "absent.json"))
+    runner.expect(r"docker mcp secret ls", "", returncode=1, stderr="no such command")
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+
+    applied = cli.invoke(app, ["mcp", "import", "--dir", str(project), "--apply"])
+    assert applied.exit_code == 0
+    assert Manifest.load(project).servers == ["github-official"]
+    assert "github.personal_access_token" in applied.stdout
+    assert "secret store unreachable" in applied.stdout
 
 
 def test_secrets_rm_refuses_while_referenced(tmp_path: Path, catalog_file: Path, runner) -> None:

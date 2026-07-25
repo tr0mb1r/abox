@@ -682,15 +682,27 @@ def mcp_import(
             _bind(workspace, manifest)
             console.print(f"\n[green]✔[/] declared {', '.join(importable)}")
             needed = secrets_mod.required_secrets(cat, importable)
-            present = secrets_mod.docker_secret_names()
-            missing = [s for s in needed if s not in present]
             if needed:
-                state = (
-                    "[green](all present)[/]"
-                    if not missing
-                    else f"[yellow](missing: {', '.join(missing)})[/]"
-                )
-                console.print(f"  secrets: {', '.join(needed)} {state}")
+                # Advisory only, and it comes *after* the manifest and the
+                # artifacts are already written. An unreachable secret store is
+                # a reason to say less, not a reason to fail a command that has
+                # already done its work — `abox doctor` reports the store
+                # properly, and this line would only ever have hinted at it.
+                try:
+                    present = secrets_mod.docker_secret_names()
+                except AboxError:
+                    console.print(
+                        f"  secrets: {', '.join(needed)} "
+                        "[dim](secret store unreachable — `abox doctor` to check)[/]"
+                    )
+                else:
+                    missing = [s for s in needed if s not in present]
+                    state = (
+                        "[green](all present)[/]"
+                        if not missing
+                        else f"[yellow](missing: {', '.join(missing)})[/]"
+                    )
+                    console.print(f"  secrets: {', '.join(needed)} {state}")
             console.print("  [dim]`abox up` to apply to the gateway[/]")
 
         if not manifest.run.connectors:
