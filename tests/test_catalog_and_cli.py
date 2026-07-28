@@ -165,6 +165,19 @@ def test_version_flag() -> None:
     assert "abox" in result.stdout
 
 
+def test_the_two_copies_of_the_version_agree() -> None:
+    """The version is written twice — pyproject.toml for the distribution and
+    __init__ for `abox --version` — so a release chore that bumps one and not
+    the other ships a binary that misreports itself."""
+    import tomllib
+
+    from abox import __version__
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+    assert declared == __version__
+
+
 def test_init_writes_a_valid_manifest(tmp_path: Path, catalog_file: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
