@@ -1165,6 +1165,12 @@ execution-adjacent file snapshot after you have read the diff.
     dns-queries.jsonl    every name the agent looked up
     fw-counters.json     what the firewall dropped
     git-snapshot.json    baseline for the git tamper check
+
+Docker holds the rest, and it is the part that grows: one
+`abox-agent-<project>:<manifest-digest>` image per distinct manifest, at well
+over a gigabyte apiece. `abox up` prunes the superseded ones after a successful
+build, `abox doctor` reports what is left, and `abox nuke` removes this
+project's outright.
 ```
 
 Paths honor `ABOX_CONFIG_HOME` / `ABOX_STATE_HOME` overrides. The project hash is

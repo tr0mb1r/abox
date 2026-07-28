@@ -1504,6 +1504,52 @@ def preflight(
     return report
 
 
+def check_agent_images(manifest: Manifest, workspace: Path) -> Check:
+    """How much disk this project's agent images occupy, and how much is stale.
+
+    The tag is content-addressed, so every manifest change builds a new image and
+    the previous one stays until something removes it. `abox up` prunes after a
+    successful build, but a project that has not been brought up since — or whose
+    old images were pinned by a container at the time — can still be sitting on
+    several gigabytes with nothing saying so.
+    """
+    images = dockerx.agent_images(manifest.project)
+    if not images:
+        return Check(
+            id="agent.images",
+            title="agent images on disk",
+            status=Status.skip,
+            detail="none built yet",
+        )
+    total = sum(img.size for img in images)
+    current = str(render.inspect_rendered(workspace).get("image") or "")
+    stale = [img for img in images if img.tag != current]
+    stale_bytes = sum(img.size for img in stale)
+    return Check(
+        id="agent.images",
+        title="agent images on disk",
+        status=Status.warn if stale else Status.ok,
+        detail=(
+            f"{len(images)} image(s), {_gb(total)}"
+            + (f" — {len(stale)} superseded, {_gb(stale_bytes)} reclaimable" if stale else "")
+        ),
+        hint="`abox up` prunes superseded images after a successful build; "
+        "`abox nuke` removes all of this project's"
+        if stale
+        else "",
+        data={"total_bytes": total, "stale_bytes": stale_bytes, "count": len(images)},
+    )
+
+
+def _gb(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB"):
+        if value < 1000:
+            return f"{value:.0f} {unit}"
+        value /= 1000
+    return f"{value:.1f} GB"
+
+
 def full(
     manifest: Manifest,
     config: GlobalConfig,
@@ -1544,6 +1590,7 @@ def full(
     report.denied = denied
     for check in check_agent_hygiene(workspace, manifest):
         report.add(check)
+    report.add(check_agent_images(manifest, workspace))
     return report
 
 

@@ -773,3 +773,66 @@ def test_logs_are_harvested_as_root(manifest, rendered, runner_fake) -> None:
     call = runner_fake.find("dns.log")[0]
     assert call.argv[:4] == ("docker", "exec", "-u", "root")
     assert (paths.current_run_dir(rendered) / "dns.log").is_file()
+
+
+# -- agent images accumulate -----------------------------------------------
+
+
+IMAGE_LS = (
+    "abox-agent-demo:aaaaaaaaaaaa\tsha256:aaa\t1.4GB\n"
+    "abox-agent-demo:bbbbbbbbbbbb\tsha256:bbb\t1.35GB\n"
+    "abox-agent-demo:<none>\tsha256:ccc\t1.3GB\n"
+)
+
+
+def test_agent_images_are_parsed_with_their_sizes(runner_fake) -> None:
+    runner_fake.expect(r"image ls abox-agent-demo", IMAGE_LS)
+    images = dockerx.agent_images("demo")
+    assert [i.tag for i in images] == [
+        "abox-agent-demo:aaaaaaaaaaaa",
+        "abox-agent-demo:bbbbbbbbbbbb",
+    ]
+    assert images[0].size == 1_400_000_000
+
+
+def test_a_dangling_tag_is_not_reported_as_an_image(runner_fake) -> None:
+    """`<none>` is what an image looks like once a newer build stole its tag;
+    naming it would promise a removal that does nothing for the operator."""
+    runner_fake.expect(r"image ls abox-agent-demo", IMAGE_LS)
+    assert all("<none>" not in i.tag for i in dockerx.agent_images("demo"))
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("1.4GB", 1_400_000_000), ("523MB", 523_000_000), ("12KB", 12_000), ("0B", 0), ("?", 0)],
+)
+def test_docker_sizes_are_parsed(text: str, expected: int) -> None:
+    """`docker image ls` has no numeric size verb, so the human string is it."""
+    assert dockerx._parse_size(text) == expected
+
+
+def test_doctor_warns_about_superseded_images(
+    manifest: Manifest, rendered: Path, runner_fake
+) -> None:
+    runner_fake.expect(r"image ls abox-agent-demo", IMAGE_LS)
+    check = doctor.check_agent_images(manifest, rendered)
+    assert check.status is doctor.Status.warn
+    assert "reclaimable" in check.detail
+    assert check.data["count"] == 2
+
+
+def test_doctor_is_quiet_when_only_the_current_image_exists(
+    manifest: Manifest, rendered: Path, runner_fake
+) -> None:
+    current = render.inspect_rendered(rendered)["image"]
+    runner_fake.expect(r"image ls abox-agent-demo", f"{current}\tsha256:aaa\t1.4GB\n")
+    check = doctor.check_agent_images(manifest, rendered)
+    assert check.status is doctor.Status.ok
+    assert "superseded" not in check.detail
+
+
+def test_doctor_skips_when_nothing_has_been_built(
+    manifest: Manifest, rendered: Path, runner_fake
+) -> None:
+    runner_fake.expect(r"image ls abox-agent-demo", "")
+    assert doctor.check_agent_images(manifest, rendered).status is doctor.Status.skip

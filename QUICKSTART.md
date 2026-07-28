@@ -88,15 +88,19 @@ Then you get the review screen, which is where the actual configuring happens:
 
 ```
 ? Review — pick a line to change it:
-    gateway profile      default  (port 8811)
-    MCP servers          duckduckgo, github-official
-    server credentials   1 needed, 0 set here — github.personal_access_token
-    tool narrowing       (all tools from every server)
-    toolchains           python
-    allowed domains      5 + 4 always-on — pypi.org, files.pythonhosted.org  +…
-    masked paths         (2 from global defaults)
-    context dirs         (none)
-    permission mode      default
+    gateway profile        default  (port 8811)
+    MCP servers            duckduckgo, github-official
+    server credentials     1 needed, 0 set here — github.personal_access_token
+    tool narrowing         (all tools from every server)
+    toolchains             python
+    allowed domains        5 + 4 always-on — pypi.org, files.pythonhosted.org…
+    masked paths           (2 from global defaults)
+    context dirs           (none)
+    server network         all 2 on the gateway network (outside the firewall)
+    permission mode        default
+    claude.ai connectors   off
+    transcript format      stream-json
+    run timeout            3600s
   ❯ ✔ Save — write agentbox.yaml and render the container
     ✖ Cancel — write nothing
 ```
@@ -115,6 +119,12 @@ Two lines worth knowing about the first time:
 - **allowed domains** — pre-filled from your toolchains and your git remote.
   Everything not on this list is dropped. The handful Claude Code cannot
   authenticate without are always on and are not offered as a choice.
+- **server network** — MCP servers run on the gateway's network, which is
+  *outside* the agent's firewall. Cutting one off (`none`) is the only per-server
+  network limit Docker actually enforces; use it for servers that touch the
+  filesystem or the repo, never one that needs the internet.
+- **claude.ai connectors** — off, and worth leaving off: on means a second MCP
+  path abox does not mediate, whose tool calls never reach the gateway log.
 
 Non-interactive equivalent, useful for scripting:
 
@@ -353,11 +363,27 @@ abox doctor
 ## Tearing down
 
 ```bash
-abox nuke              # containers + generated artifacts; prompts before the auth volume
+abox nuke              # containers, images + generated artifacts; prompts before the auth volume
 abox nuke --keep-auth  # keep the Claude login
 ```
 
 The gateway survives if another project still uses its profile.
+
+### Disk
+
+The agent image tag is content-addressed — `abox-agent-<project>:<manifest-digest>`
+— so every change to `agentbox.yaml` builds a *new* image. `abox up` removes the
+ones it supersedes once the replacement has built, and says what it reclaimed:
+
+```
+✔ agent image built: abox-agent-demo-app:3db0abeb6291
+✔ reclaimed 1.4 GB (1 superseded image)
+```
+
+`abox doctor` reports what this project's images occupy, and flags anything
+still reclaimable — an image pinned by a running container at prune time, or a
+project not brought up since it was last edited. `abox nuke` removes all of
+them.
 
 ---
 
@@ -365,7 +391,7 @@ The gateway survives if another project still uses its profile.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `no space left on device` mid-build | Docker disk image full | raise it in Settings → Resources, or `docker image prune` |
+| `no space left on device` mid-build | Docker disk image full | `abox doctor` reports this project's images; raise the disk in Settings → Resources, `abox nuke` a project you are done with, or `docker image prune` |
 | `abox run` exits 1 immediately | no Claude login in the volume | `abox shell`, run `claude`, log in |
 | `gateway abox-gw-<p> is running: not created` | gateway never started | `abox up` (or `abox gateway up`) |
 | `could not pull MCP server image` | the gateway starts servers with `--pull never` | abox pre-pulls; a failure here is a real registry/disk problem |

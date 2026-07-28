@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from abox import catalog as catalog_mod
-from abox import paths, picker
+from abox import paths, picker, render
 from abox.cli import app
 from abox.manifest import CustomServer, CustomServers, GlobalConfig, Manifest, ProfileConfig
 
@@ -565,3 +565,110 @@ def test_rerunning_init_keeps_fields_the_picker_never_asks_about(
     assert again.egress_ignored == ["telemetry.vendor.io"]
     assert again.mounts.watch == ["Makefile"]
     assert again.run.timeout == 120
+
+
+# -- superseded agent images ----------------------------------------------
+
+
+#: What a healthy gateway says back, as `tests/test_gateway.py` scripts it.
+_INIT_SSE = (
+    'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"serverInfo":'
+    '{"name":"Docker AI MCP Gateway","version":"2.0.1"}}}\n'
+)
+
+
+def _ready(runner, images: str) -> None:
+    """Get `abox up` as far as the build: healthy gateway, scripted image list."""
+    runner.expect(r"docker run --rm --network", _INIT_SSE)
+    runner.expect(r"image ls abox-agent-", images)
+
+
+def test_up_removes_this_projects_superseded_images(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """The tag is content-addressed, so every settings change built a new
+    ~1.4GB image and left the last one behind forever."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    current = render.inspect_rendered(project)["image"]
+    _ready(
+        runner,
+        f"{current}\tsha256:new\t1.4GB\nabox-agent-proj:oldoldoldold\tsha256:old\t1.35GB\n",
+    )
+    result = cli.invoke(app, ["up", "--dir", str(project)])
+    removed = runner.find("image rm")
+    assert [c.argv[-1] for c in removed] == ["abox-agent-proj:oldoldoldold"]
+    assert "reclaimed 1.4 GB" in result.output or "reclaimed 1.3 GB" in result.output
+
+
+def test_up_never_removes_the_image_it_just_built(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    current = render.inspect_rendered(project)["image"]
+    _ready(runner, f"{current}\tsha256:new\t1.4GB\n")
+    cli.invoke(app, ["up", "--dir", str(project)])
+    assert runner.find("image rm") == []
+
+
+def test_a_failed_build_prunes_nothing(tmp_path: Path, catalog_file: Path, runner) -> None:
+    """A failed build leaves you with the image you had."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    runner.expect(r"^docker build", "boom", returncode=1)
+    _ready(runner, "abox-agent-proj:old\tsha256:old\t1.35GB\n")
+    cli.invoke(app, ["up", "--dir", str(project)])
+    assert runner.find("image rm") == []
+
+
+def test_the_new_settings_reach_the_manifest(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """connectors, timeout, output and server_network had no interface at all;
+    a row that cannot be written is decoration."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def configure(draft, ctx):
+        draft.servers = ["duckduckgo"]
+        draft.server_network = {"duckduckgo": "none"}
+        draft.connectors = True
+        draft.output = "text"
+        draft.timeout = 900
+        return True
+
+    monkeypatch.setattr(picker, "review_and_edit", configure)
+    assert cli.invoke(app, ["init", "--dir", str(project)]).exit_code == 0
+
+    written = Manifest.load(project)
+    assert written.run.connectors is True
+    assert written.run.timeout == 900
+    assert written.run.output.value == "text"
+    assert written.server_network["duckduckgo"].value == "none"
+
+
+def test_server_network_is_dropped_for_a_server_you_removed(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """A `server_network` key naming an undeclared server fails validation, so
+    unticking the server has to take its network setting with it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def configure(draft, ctx):
+        draft.servers = []
+        draft.server_network = {"duckduckgo": "none"}
+        return True
+
+    monkeypatch.setattr(picker, "review_and_edit", configure)
+    result = cli.invoke(app, ["init", "--dir", str(project)])
+    assert result.exit_code == 0
+    assert Manifest.load(project).server_network == {}

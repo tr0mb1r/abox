@@ -226,6 +226,13 @@ class InitDraft:
     mask: list[str] = field(default_factory=list)
     context: list[str] = field(default_factory=list)
     permission_mode: str = "default"
+    #: Servers pinned to `network: none`. The only per-server network control
+    #: Docker actually enforces, and it had no interface at all.
+    server_network: dict[str, str] = field(default_factory=dict)
+    #: claude.ai MCP connectors — a second MCP path abox does not mediate.
+    connectors: bool = False
+    output: str = "stream-json"
+    timeout: int = 3600
     #: Profiles invented during this run. The caller persists them only once the
     #: manifest is written: saving them here, as the picker used to, left an
     #: orphan profile holding a port behind every cancelled init.
@@ -284,6 +291,14 @@ def seed_draft(
         mask=list(existing.mounts.mask) if existing else [],
         context=list(existing.mounts.context) if existing else [],
         permission_mode=existing.run.permission_mode.value if existing else "default",
+        server_network=(
+            {name: mode.value for name, mode in existing.server_network.items()}
+            if existing
+            else {}
+        ),
+        connectors=existing.run.connectors if existing else False,
+        output=existing.run.output.value if existing else "stream-json",
+        timeout=existing.run.timeout if existing else 3600,
     )
 
 
@@ -297,6 +312,11 @@ SERVER_GROUPS: tuple[tuple[str, Callable[[CatalogServer], bool]], ...] = (
     ("ready to use", lambda s: not s.secrets),
     ("needs a secret — abox can set it for you next", lambda s: bool(s.secrets)),
 )
+
+
+#: Stand-in for a declared server the catalog has since stopped carrying, so a
+#: manifest that outlived its catalog still renders rather than raising.
+_NO_SERVER = CatalogServer(name="")
 
 
 def _server_marks(server: CatalogServer) -> str:
@@ -722,6 +742,15 @@ def _egress_value(draft: InitDraft, ctx: InitContext) -> str:
     return f"{len(listed)} + {len(always)} always-on — {_summarise(listed, empty='', limit=2)}"
 
 
+def _server_network_value(draft: InitDraft, ctx: InitContext) -> str:
+    cut = sorted(name for name, mode in draft.server_network.items() if mode == "none")
+    if not draft.servers:
+        return "(no servers declared)"
+    if not cut:
+        return f"all {len(draft.servers)} on the gateway network (outside the firewall)"
+    return f"{_summarise(cut, empty='', limit=2)} cut off"
+
+
 def _profile_value(draft: InitDraft, ctx: InitContext) -> str:
     profile = ctx.config.profiles.get(draft.profile)
     return f"{draft.profile}" + (f"  (port {profile.port})" if profile else "")
@@ -789,6 +818,106 @@ def _edit_permission(draft: InitDraft, ctx: InitContext) -> None:
     draft.permission_mode = pick_permission_mode(draft.permission_mode)
 
 
+def pick_server_network(
+    catalog: Catalog, servers: Sequence[str], existing: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Which MCP servers run with no network at all.
+
+    The gateway applies its own networks to every server it spawns, so `shared`
+    cannot be narrowed — a server there sits outside the agent's firewall, the
+    SNI proxy and the scoped resolver, all three. ``none`` is the one setting
+    Docker enforces, and it had no interface before this.
+    """
+    require_interactive("choosing server networks")
+    existing = existing or {}
+    offered = [name for name in servers if not (catalog.get(name) or _NO_SERVER).is_remote]
+    if not offered:
+        questionary.print(
+            "  no container-based servers declared — a hosted server has no "
+            "container to cut off",
+            style="fg:ansibrightblack",
+        )
+        return {k: v for k, v in existing.items() if k in servers}
+    picked = checkbox(
+        "Cut these servers off the network entirely:",
+        [
+            questionary.Choice(
+                title=f"{name:<28} {(catalog.get(name) or _NO_SERVER).summary(44)}",
+                value=name,
+                checked=existing.get(name) == "none",
+            )
+            for name in offered
+        ],
+        instruction="only for servers that touch the filesystem or the repo, "
+        "never one that needs the internet",
+    )
+    return dict.fromkeys(picked, "none")
+
+
+def _edit_server_network(draft: InitDraft, ctx: InitContext) -> None:
+    draft.server_network = pick_server_network(ctx.catalog, draft.servers, draft.server_network)
+
+
+def _edit_connectors(draft: InitDraft, ctx: InitContext) -> None:
+    draft.connectors = (
+        select_one(
+            "claude.ai MCP connectors:",
+            [
+                questionary.Choice(
+                    title="off — the gateway is the agent's only MCP endpoint", value="off"
+                ),
+                questionary.Choice(
+                    title="on  — also load the connectors on your claude.ai account",
+                    value="on",
+                ),
+            ],
+            default="on" if draft.connectors else "off",
+            instruction="on is a second MCP path abox does not mediate: those tool "
+            "calls never reach the gateway log",
+        )
+        == "on"
+    )
+
+
+def _edit_output(draft: InitDraft, ctx: InitContext) -> None:
+    draft.output = select_one(
+        "Transcript format for headless runs:",
+        [
+            questionary.Choice(title="stream-json — full transcript, one JSON object per event",
+                               value="stream-json"),
+            questionary.Choice(title="json        — one JSON result at the end", value="json"),
+            questionary.Choice(title="text        — plain text", value="text"),
+        ],
+        default=draft.output,
+        instruction="what `abox logs --runs` will have to work with",
+    )
+
+
+def _validate_timeout(text: str) -> bool | str:
+    """The model's own bounds, at the prompt rather than after the whole flow."""
+    value = text.strip()
+    if not value:
+        return True  # blank leaves it alone
+    if not value.isdigit():
+        return f"{value!r} is not a whole number of seconds"
+    if not 30 <= int(value) <= 86_400:
+        return "must be between 30 and 86400 seconds"
+    return True
+
+
+def _edit_timeout(draft: InitDraft, ctx: InitContext) -> None:
+    answer = ask_text(
+        "Wall-clock ceiling for one headless run, in seconds:",
+        default=str(draft.timeout),
+        validate=_validate_timeout,
+        instruction="the run is killed at this point; blank keeps the current value",
+    ).strip()
+    # Blank rather than a number is "leave it": a validated prompt still has to
+    # survive an empty answer, and re-raising here would drop the whole walk.
+    if answer:
+        draft.timeout = int(answer)
+
+
 ROWS: tuple[Row, ...] = (
     Row(
         "profile",
@@ -847,11 +976,39 @@ ROWS: tuple[Row, ...] = (
         _edit_context,
     ),
     Row(
+        "server_network",
+        "server network",
+        "cut a server off the network — the one thing Docker enforces per server",
+        _server_network_value,
+        _edit_server_network,
+    ),
+    Row(
         "permission",
         "permission mode",
         "how much the agent may do unattended",
         lambda d, c: d.permission_mode,
         _edit_permission,
+    ),
+    Row(
+        "connectors",
+        "claude.ai connectors",
+        "a second MCP path abox does not mediate; off keeps one endpoint",
+        lambda d, c: "on — a second, unmediated MCP path" if d.connectors else "off",
+        _edit_connectors,
+    ),
+    Row(
+        "output",
+        "transcript format",
+        "what a headless run writes to runs/<ts>.jsonl",
+        lambda d, c: d.output,
+        _edit_output,
+    ),
+    Row(
+        "timeout",
+        "run timeout",
+        "wall-clock ceiling for one headless run",
+        lambda d, c: f"{d.timeout}s",
+        _edit_timeout,
     ),
 )
 

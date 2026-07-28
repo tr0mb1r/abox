@@ -196,6 +196,60 @@ def image_digest(image: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class ImageRef:
+    """One local image tag, with the disk it occupies."""
+
+    tag: str
+    image_id: str
+    size: int
+
+
+def agent_images(project: str) -> list[ImageRef]:
+    """Every agent image built for one project, newest first.
+
+    The tag is content-addressed (``abox-agent-<project>:<manifest-digest>``), so
+    each change to the manifest builds a *new* tag and leaves the previous one
+    behind. Nothing used to remove them, and at well over a gigabyte apiece an
+    operator who edits their sandbox a few times pays for every edit.
+    """
+    result = docker(
+        "image",
+        "ls",
+        f"abox-agent-{project}",
+        "--format",
+        "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}",
+        timeout=60,
+    )
+    if not result.ok:
+        return []
+    out: list[ImageRef] = []
+    for line in result.lines:
+        parts = line.split("\t")
+        if len(parts) != 3 or parts[0].endswith(":<none>"):
+            continue
+        out.append(ImageRef(tag=parts[0], image_id=parts[1], size=_parse_size(parts[2])))
+    return out
+
+
+def _parse_size(text: str) -> int:
+    """``docker image ls`` prints human sizes; there is no numeric format verb."""
+    units = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}
+    value = text.strip().upper()
+    for suffix, scale in sorted(units.items(), key=lambda kv: -len(kv[0])):
+        if value.endswith(suffix):
+            try:
+                return int(float(value[: -len(suffix)].strip()) * scale)
+            except ValueError:
+                return 0
+    return 0
+
+
+def remove_image(tag: str) -> bool:
+    """Remove one image tag. A tag still in use by a container simply stays."""
+    return docker("image", "rm", tag, timeout=120).ok
+
+
 def container_image_digest(name: str) -> str | None:
     """Return the ``repo@sha256:…`` a running container was actually started from.
 

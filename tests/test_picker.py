@@ -321,7 +321,8 @@ def test_every_row_renders_prose_rather_than_a_blank_when_unset(q, config, tmp_p
 def test_every_editable_field_has_a_row() -> None:
     assert {row.key for row in picker.ROWS} == {
         "profile", "servers", "secrets", "tools", "toolchains",
-        "egress", "mask", "context", "permission",
+        "egress", "mask", "context", "server_network", "permission",
+        "connectors", "output", "timeout",
     }
 
 
@@ -687,3 +688,101 @@ def test_no_review_row_overflows_an_eighty_column_terminal(q, config, tmp_path) 
     )
     for choice in picker._hub_choices(draft, _ctx(tmp_path, config)):
         assert len(str(choice.title)) <= picker.HUB_WIDTH, choice.title
+
+
+# -- the settings that had no interface ------------------------------------
+
+
+def test_connectors_reads_as_a_second_mcp_path(q, config, tmp_path) -> None:
+    """Off by default, and the row has to say why that matters — those tool
+    calls never reach the gateway log."""
+    ctx = _ctx(tmp_path, config)
+    row = next(r for r in picker.ROWS if r.key == "connectors")
+    assert row.value(_draft(), ctx) == "off"
+    assert "unmediated" in row.value(_draft(connectors=True), ctx)
+
+
+def test_connectors_round_trips(q, config, tmp_path) -> None:
+    q.answers["select"] = "on"
+    draft = _draft()
+    picker._edit_connectors(draft, _ctx(tmp_path, config))
+    assert draft.connectors is True
+    q.answers["select"] = "off"
+    picker._edit_connectors(draft, _ctx(tmp_path, config))
+    assert draft.connectors is False
+
+
+def test_server_network_offers_only_declared_container_servers(q, config, tmp_path) -> None:
+    q.answers["checkbox"] = ["duckduckgo"]
+    out = picker.pick_server_network(_catalog(), ["duckduckgo", "github-official"])
+    offered = [c.value for c in q.calls["checkbox"][0]["choices"]]
+    assert offered == ["duckduckgo", "github-official"]
+    assert out == {"duckduckgo": "none"}
+
+
+def test_a_hosted_server_has_no_container_to_cut_off(q) -> None:
+    catalog = Catalog(
+        servers={
+            "context7": CatalogServer(
+                name="context7", remote_url="https://mcp.context7.com/mcp", kind="remote"
+            )
+        }
+    )
+    assert picker.pick_server_network(catalog, ["context7"]) == {}
+    assert q.calls["checkbox"] == []
+
+
+def test_the_server_network_row_names_the_default_honestly(q, config, tmp_path) -> None:
+    """`shared` puts a server outside the agent's firewall, the SNI proxy and
+    the scoped resolver — the row should not read as though it were contained."""
+    ctx = _ctx(tmp_path, config)
+    row = next(r for r in picker.ROWS if r.key == "server_network")
+    assert "outside the firewall" in row.value(_draft(servers=["duckduckgo"]), ctx)
+    assert "cut off" in row.value(
+        _draft(servers=["duckduckgo"], server_network={"duckduckgo": "none"}), ctx
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [("3600", True), ("29", False), ("86401", False), ("30", True), ("abc", False), ("", True)],
+)
+def test_timeout_validation_follows_the_model_bounds(value: str, ok: bool) -> None:
+    assert (picker._validate_timeout(value) is True) is ok
+
+
+def test_a_blank_timeout_keeps_the_current_value(q, config, tmp_path) -> None:
+    """A validated prompt still has to survive an empty answer; raising here
+    would drop the whole walk."""
+    q.answers["text"] = ""
+    draft = _draft(timeout=120)
+    picker._edit_timeout(draft, _ctx(tmp_path, config))
+    assert draft.timeout == 120
+
+
+def test_timeout_round_trips(q, config, tmp_path) -> None:
+    q.answers["text"] = "900"
+    draft = _draft()
+    picker._edit_timeout(draft, _ctx(tmp_path, config))
+    assert draft.timeout == 900
+
+
+def test_output_round_trips(q, config, tmp_path) -> None:
+    q.answers["select"] = "text"
+    draft = _draft()
+    picker._edit_output(draft, _ctx(tmp_path, config))
+    assert draft.output == "text"
+
+
+def test_seed_draft_carries_the_new_settings_from_an_existing_manifest(
+    workspace, config, manifest
+) -> None:
+    manifest.run.connectors = True
+    manifest.run.timeout = 120
+    manifest.server_network = {"duckduckgo": "none"}
+    draft = picker.seed_draft(
+        project="demo", workspace=workspace, config=config, existing=manifest
+    )
+    assert draft.connectors is True
+    assert draft.timeout == 120
+    assert draft.server_network == {"duckduckgo": "none"}

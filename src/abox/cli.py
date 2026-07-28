@@ -268,7 +268,13 @@ def _manifest_from(
     """
     base = existing.model_dump(mode="json") if existing else {}
     mounts = {**base.get("mounts", {}), "mask": draft.mask, "context": draft.context}
-    run = {**base.get("run", {}), "permission_mode": draft.permission_mode}
+    run = {
+        **base.get("run", {}),
+        "permission_mode": draft.permission_mode,
+        "connectors": draft.connectors,
+        "output": draft.output,
+        "timeout": draft.timeout,
+    }
     data = {
         **base,
         "project": draft.project,
@@ -276,6 +282,9 @@ def _manifest_from(
         "servers": draft.servers,
         "tools": draft.tools,
         "toolchains": draft.toolchains,
+        # Only for servers still declared: a `server_network` key naming a server
+        # that is no longer in `servers` fails validation.
+        "server_network": {k: v for k, v in draft.server_network.items() if k in draft.servers},
         "mounts": mounts,
         "egress": [e for e in draft.egress if e not in config.defaults.egress_mandatory],
         "run": run,
@@ -417,8 +426,46 @@ def up(
             )
         runspec = runner.load_runspec(workspace)
         console.print(f"[green]✔[/] agent image built: {runspec['image']}")
+        _prune_superseded_images(manifest.project, keep=str(runspec["image"]))
     except AboxError as exc:
         _fail(exc)
+
+
+def _prune_superseded_images(project: str, *, keep: str) -> None:
+    """Drop this project's older agent images once the new one exists.
+
+    The tag is content-addressed, so every edit to the manifest builds a new one
+    and used to leave the last behind forever — well over a gigabyte a time, and
+    the review screen makes editing the normal thing to do. Only this project's
+    ``abox-agent-*`` tags are ever considered, and only after the replacement has
+    built: a failed build leaves you with the image you had.
+    """
+    superseded = [img for img in dockerx.agent_images(project) if img.tag != keep]
+    if not superseded:
+        return
+    removed, reclaimed = [], 0
+    for image in superseded:
+        # A tag still referenced by a container is refused by Docker; that is the
+        # right answer, so a refusal is skipped rather than forced.
+        if dockerx.remove_image(image.tag):
+            removed.append(image.tag)
+            reclaimed += image.size
+    if not removed:
+        return
+    console.print(
+        f"[green]✔[/] reclaimed {_human_bytes(reclaimed)} "
+        f"({len(removed)} superseded image{'s' if len(removed) > 1 else ''})"
+    )
+
+
+def _human_bytes(size: int) -> str:
+    """Decimal units, to match what `docker image ls` prints."""
+    value = float(size)
+    for unit in ("B", "KB", "MB"):
+        if value < 1000:
+            return f"{value:.0f} {unit}"
+        value /= 1000
+    return f"{value:.1f} GB"
 
 
 # -- run / shell ----------------------------------------------------------
@@ -1629,6 +1676,16 @@ def nuke(
 
         removed = render_mod.clean(workspace)
         console.print(f"[green]✔[/] removed {len(removed)} generated artifact(s)")
+
+        # After the containers, so nothing still references them. A teardown that
+        # leaves gigabytes of this project's images behind is not a teardown.
+        images = dockerx.agent_images(manifest.project)
+        reclaimed = sum(img.size for img in images if dockerx.remove_image(img.tag))
+        if reclaimed:
+            console.print(
+                f"[green]✔[/] removed {len(images)} agent image(s), "
+                f"{_human_bytes(reclaimed)} reclaimed"
+            )
 
         # Dropped unconditionally, unlike the auth volume: `abox up` rebuilds it
         # in a second, and leaving a bearer token behind on a teardown that the
