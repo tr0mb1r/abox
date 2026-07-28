@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 from abox import catalog as catalog_mod
 from abox import paths, picker
 from abox.cli import app
-from abox.manifest import CustomServer, CustomServers, Manifest
+from abox.manifest import CustomServer, CustomServers, GlobalConfig, Manifest, ProfileConfig
 
 cli = CliRunner()
 
@@ -414,3 +414,154 @@ def test_secrets_rm_drops_the_stale_digest(tmp_path: Path, catalog_file: Path, r
     assert secrets_mod.SyncState.load().digest_of("gone.key")
     assert cli.invoke(app, ["secrets", "rm", "gone.key"]).exit_code == 0
     assert secrets_mod.SyncState.load().digest_of("gone.key") is None
+
+
+# -- init: the review screen ----------------------------------------------
+
+
+def _interactive(monkeypatch: pytest.MonkeyPatch, *, mode: str = "quick", save: bool = True):
+    """Drive `abox init` down the interactive path without a terminal."""
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: mode)
+    monkeypatch.setattr(picker, "review_and_edit", lambda *a, **k: save)
+
+
+def test_quick_setup_and_save_matches_the_yes_path(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """The keystone. Quick pre-fill and `--yes` are the same seeder, so the two
+    must land on identical manifests — they used to be separate branches of one
+    `if`, which is how they drifted."""
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "pyproject.toml").write_text("[project]\nname='a'\n")
+    assert cli.invoke(app, ["init", "--dir", str(a), "--yes"]).exit_code == 0
+
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / "pyproject.toml").write_text("[project]\nname='a'\n")
+    _interactive(monkeypatch)
+    assert cli.invoke(app, ["init", "--dir", str(b), "--project", "a"]).exit_code == 0
+
+    left, right = Manifest.load(a), Manifest.load(b)
+    assert left == right
+
+
+def test_init_yes_never_reaches_the_review_screen(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    def explode(*a, **k):
+        raise AssertionError("--yes must ask nothing")
+
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", explode)
+    monkeypatch.setattr(picker, "review_and_edit", explode)
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert cli.invoke(app, ["init", "--dir", str(project), "--yes"]).exit_code == 0
+
+
+def test_cancelling_the_review_screen_writes_nothing(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    _interactive(monkeypatch, save=False)
+    result = cli.invoke(app, ["init", "--dir", str(project)])
+    assert result.exit_code == 0
+    assert "nothing written" in result.output
+    assert not paths.manifest_path(project).is_file()
+
+
+def test_cancelling_after_creating_a_profile_leaves_no_orphan(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """The picker used to save a new profile the moment it was named."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def invent(draft, ctx):
+        draft.created_profiles["research"] = ProfileConfig(port=9999)
+        return False
+
+    monkeypatch.setattr(picker, "review_and_edit", invent)
+    assert cli.invoke(app, ["init", "--dir", str(project)]).exit_code == 0
+    assert "research" not in GlobalConfig.load().profiles
+
+
+def test_a_created_profile_is_saved_once_the_manifest_is(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def invent(draft, ctx):
+        draft.profile = "research"
+        draft.created_profiles["research"] = ProfileConfig(port=9999)
+        return True
+
+    monkeypatch.setattr(picker, "review_and_edit", invent)
+    assert cli.invoke(app, ["init", "--dir", str(project)]).exit_code == 0
+    assert GlobalConfig.load().profiles["research"].port == 9999
+
+
+def test_a_credential_stored_before_cancelling_is_named(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """It cannot be rolled back by abandoning the init, so it must not be silent."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def stored(draft, ctx):
+        draft.stored_secrets.append("github.personal_access_token")
+        return False
+
+    monkeypatch.setattr(picker, "review_and_edit", stored)
+    result = cli.invoke(app, ["init", "--dir", str(project)])
+    assert "github.personal_access_token" in result.output
+    assert "abox secrets rm" in result.output
+
+
+def test_next_steps_names_the_login_step(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """A missing Claude login is the most common cause of a run exiting 1, and
+    nothing in init used to mention it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    _interactive(monkeypatch)
+    result = cli.invoke(app, ["init", "--dir", str(project)])
+    assert "abox up" in result.output
+    assert "abox shell" in result.output
+    assert "log in" in result.output
+
+
+def test_rerunning_init_keeps_fields_the_picker_never_asks_about(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """init rebuilt the manifest from scratch, so a second run silently dropped
+    everything set by `abox secrets attach`, `abox egress ignore` and friends —
+    and re-running init is now the documented way to re-edit a project."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert cli.invoke(app, ["init", "--dir", str(project), "--yes"]).exit_code == 0
+
+    manifest = Manifest.load(project)
+    manifest.env_secrets = {"DATABASE_URL": "database.url"}
+    manifest.egress_ignored = ["telemetry.vendor.io"]
+    manifest.mounts.watch = ["Makefile"]
+    manifest.run.timeout = 120
+    manifest.write(project)
+
+    assert cli.invoke(app, ["init", "--dir", str(project), "--yes"]).exit_code == 0
+    again = Manifest.load(project)
+    assert again.env_secrets == {"DATABASE_URL": "database.url"}
+    assert again.egress_ignored == ["telemetry.vendor.io"]
+    assert again.mounts.watch == ["Makefile"]
+    assert again.run.timeout == 120

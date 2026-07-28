@@ -78,17 +78,43 @@ cd ~/projects/demo-app
 abox init
 ```
 
-The interactive picker walks you through:
+First it asks how you want to start:
 
-- **Profile** — projects sharing a profile share one gateway. Start with `default`.
-- **MCP servers** — multi-select over the Docker catalog; each entry shows
-  whether it needs a secret and whether its image is digest-pinned.
-- **Tool narrowing** — optional, per server.
-- **Toolchains** — pre-ticked from what it detected in your repo
-  (`pyproject.toml` → python, `go.mod` → go, and so on).
-- **Egress** — pre-filled from those toolchains and your git remote. Everything
-  not on this list is dropped.
-- **Permission mode** — start with `default`.
+- **Quick** — take what abox detected from your repo and go straight to the
+  review screen. This is the one to pick.
+- **Custom** — answer every question first, then land on the same review screen.
+
+Then you get the review screen, which is where the actual configuring happens:
+
+```
+? Review — pick a line to change it:
+    gateway profile      default  (port 8811)
+    MCP servers          duckduckgo, github-official
+    server credentials   1 needed, 0 set here — github.personal_access_token
+    tool narrowing       (all tools from every server)
+    toolchains           python
+    allowed domains      5 + 4 always-on — pypi.org, files.pythonhosted.org  +…
+    masked paths         (2 from global defaults)
+    context dirs         (none)
+    permission mode      default
+  ❯ ✔ Save — write agentbox.yaml and render the container
+    ✖ Cancel — write nothing
+```
+
+Every line is already filled in, and every line is editable: press enter on one,
+change it, and you come straight back here. Nothing touches disk until you pick
+**Save**, so Cancel really does write nothing — and Ctrl-C inside one question
+costs you that answer, not all of them.
+
+Two lines worth knowing about the first time:
+
+- **MCP servers** — type to filter the Docker catalog; entries are grouped by
+  whether they need a credential, and each shows whether its image is
+  digest-pinned. Pick one that needs a secret and abox offers to store it right
+  there, rather than letting `abox up` fail later.
+- **allowed domains** — pre-filled from your toolchains and your git remote.
+  Everything not on this list is dropped. The handful Claude Code cannot
+  authenticate without are always on and are not offered as a choice.
 
 Non-interactive equivalent, useful for scripting:
 
@@ -137,7 +163,8 @@ per-project volume `abox-claude-<hash>`, so every later headless run reuses it.
 Exit the shell and the container is destroyed; the volume stays.
 
 > Skipping this step is the single most common "why did my run exit 1?" — a
-> headless run with no login fails at authentication.
+> headless run with no login fails at authentication. `abox init` now ends by
+> naming this step for exactly that reason.
 
 ---
 

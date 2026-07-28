@@ -384,6 +384,9 @@ defaults:
   session that works today fails when the token rolls over without it.
 - **`profiles`** — a profile is a named gateway on a fixed port. Two profiles may
   not share a port. Projects on the same profile share one gateway container.
+  Inventing one from `abox init` (`+ new profile…`) allocates the first free port
+  from 8811 up, but writes it here only once the manifest is written — an
+  abandoned `init` consumes no port and leaves nothing behind.
 
 Also in `~/.config/abox/`: **`secrets.yaml`** (§8) and **`custom-servers.yaml`**
 (§7.3).
@@ -458,7 +461,10 @@ run:
 
 You rarely edit this by hand — `abox mcp add`, `abox egress add`, `abox secrets
 attach`, etc. all edit it and re-render — but every one of those is just a typed
-mutation of this file.
+mutation of this file. Re-running `abox init` is the interactive equivalent: it
+opens the review screen on what is already here, and merges rather than replaces,
+so fields the picker never asks about (`env_secrets`, `egress_ignored`,
+`mounts.watch`, everything in `run` bar the permission mode) survive untouched.
 
 ### `mounts.mask` vs `mounts.watch`
 
@@ -789,6 +795,13 @@ mappings:
 Exactly one source per mapping. `op` / `file` / `env` are the readable ones (abox
 can fetch them for drift detection); `prompt` and `docker` are not.
 
+`abox init` offers to collect these inline: pick a server the catalog says needs
+a credential and the review screen's **server credentials** line says so, and can
+prompt for it there (hidden, straight into the Docker secret store, never through
+argv). A credential stored that way is real immediately — cancelling the rest of
+the init does not remove it, so `init` names what it stored and points at
+`abox secrets rm <name>`. `abox secrets set <name>` does the same job later.
+
 **Commands:**
 
 ```bash
@@ -999,14 +1012,22 @@ the hooks that wrap its own commands.
 ## 12. Running: up, run, shell, lifecycle
 
 ```bash
-abox init          # interactive picker → agentbox.yaml + rendered artifacts (re-runs merge)
+abox init          # interactive review screen → agentbox.yaml + rendered artifacts (re-runs merge)
 abox up            # network + gateway + artifacts + cached image build
 abox shell         # once, to complete the Claude login (persists in the auth volume)
 abox run "…"       # headless claude -p, transcript captured, container destroyed
 ```
 
-**`abox init`** flags: `--yes`/`-y` (accept detected defaults, ask nothing),
-`--project`, `--profile`, `--server` (declare non-interactively, repeatable).
+**`abox init`** opens with **Quick** (take what was detected from the repo) or
+**Custom** (answer every question first). Both land on the same review screen,
+where every setting shows its current value and every line is editable; nothing
+is written until you pick Save. Ctrl-C inside one question returns you to the
+review screen with that line unchanged — Ctrl-C *at* the review screen cancels
+the whole thing and writes nothing.
+
+Flags: `--yes`/`-y` (accept detected defaults, ask nothing), `--project`,
+`--profile`, `--server` (repeatable). `--profile` and `--server` seed the
+review screen and their lines stay editable; with `--yes` they are final.
 
 **`abox up`** flags: `--no-build` (skip the image build), `--no-cache` (rebuild
 from scratch), `--force-gateway` (recreate the gateway container).
@@ -1162,7 +1183,7 @@ different tool.
 
 | Command | Key flags | What it does |
 |---|---|---|
-| `abox init` | `-y`, `--project`, `--profile`, `--server` | interactive picker → `agentbox.yaml` + artifacts; re-runs merge |
+| `abox init` | `-y`, `--project`, `--profile`, `--server` | interactive review-and-edit screen → `agentbox.yaml` + artifacts; re-runs merge and reopen the editor |
 | `abox up` | `--no-build`, `--no-cache`, `--force-gateway` | network, gateway, artifacts, cached image build |
 | `abox render` | `-C/--dir` | re-render artifacts from the manifest, without building or running |
 | `abox run "<prompt>"` | `--resume`, `--continue`, `--keep`, `-q` | fresh container, headless `claude -p`, transcript captured, destroyed |

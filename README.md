@@ -263,7 +263,7 @@ and that lands *inside the container* because your project asked for it.
 
 ```bash
 cd ~/projects/demo-app
-abox init          # pick MCP servers, toolchains, egress; writes agentbox.yaml
+abox init          # review screen: servers, toolchains, egress; writes agentbox.yaml
 abox up            # network + gateway + image build (first build takes a few minutes)
 abox shell         # once, to complete the Claude login (it persists in a volume)
 abox run "summarise the open PRs in this repo"
@@ -662,7 +662,7 @@ every sandbox on the host.
 
 | Command | What it does |
 |---|---|
-| `abox init` | interactive picker → `agentbox.yaml` + rendered artifacts; re-runs merge |
+| `abox init` | interactive review-and-edit screen → `agentbox.yaml` + rendered artifacts; re-runs merge and reopen the editor |
 | `abox up` | network, gateway, artifacts, cached image build |
 | `abox render` | re-render the generated artifacts from the manifest, without building or running |
 | `abox run "<prompt>"` | fresh container, headless `claude -p`, transcript captured, container destroyed |

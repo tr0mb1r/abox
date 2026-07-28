@@ -20,23 +20,18 @@ from . import secrets as secrets_mod
 from . import shell as shell_mod
 from .errors import AboxError
 from .manifest import (
-    BASE_MANDATORY_EGRESS,
     GATEWAY_IMAGE_TAG,
     CustomServers,
     GlobalConfig,
     Manifest,
-    MountsConfig,
-    PermissionMode,
     RemoteSecret,
     RemoteServer,
     RemoteTransport,
-    RunConfig,
     SecretsConfig,
     ServerNetwork,
     effective_allowlist,
     format_errors,
     merged_egress,
-    merged_masks,
 )
 
 console = Console()
@@ -169,15 +164,22 @@ def init(
         Path | None, typer.Option("--dir", "-C", help="Project directory.")
     ] = None,
     project: Annotated[str | None, typer.Option(help="Project name (default: dir name).")] = None,
-    profile: Annotated[str | None, typer.Option(help="Gateway profile.")] = None,
+    profile: Annotated[
+        str | None, typer.Option(help="Gateway profile. Seeds the review screen; still editable.")
+    ] = None,
     servers: Annotated[
-        list[str] | None, typer.Option("--server", help="Declare a server non-interactively.")
+        list[str] | None,
+        typer.Option("--server", help="Declare a server. Seeds the review screen; still editable."),
     ] = None,
     yes: Annotated[
         bool, typer.Option("--yes", "-y", help="Accept detected defaults, ask nothing.")
     ] = False,
 ) -> None:
-    """Create (or update) agentbox.yaml and render the container artifacts."""
+    """Create (or update) agentbox.yaml and render the container artifacts.
+
+    Opens a review screen with every setting already filled in from what abox
+    detected; pick a line to change it, and nothing is written until you save.
+    """
     try:
         workspace = (directory or Path.cwd()).expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
@@ -195,96 +197,43 @@ def init(
         name = name.replace(" ", "-").lower()
 
         detected = picker.detect_toolchains(workspace)
-        suggested_egress = picker.suggest_egress(
-            existing.toolchains if existing else detected, workspace
+        draft = picker.seed_draft(
+            project=name,
+            workspace=workspace,
+            config=config,
+            existing=existing,
+            profile=profile,
+            servers=servers,
+            detected=detected,
         )
 
-        if yes or not picker.interactive():
-            chosen_profile = profile or (
-                existing.profile if existing else next(iter(config.profiles))
+        if not yes and picker.interactive():
+            ctx = picker.InitContext(
+                workspace=workspace,
+                catalog=cat,
+                config=config,
+                manifest_path=paths.manifest_path(workspace),
+                detected=detected,
             )
-            chosen_servers = list(servers or (existing.servers if existing else []))
-            chosen_tools = existing.tools if existing else {}
-            chosen_toolchains = existing.toolchains if existing else detected
-            chosen_egress = list(
-                dict.fromkeys(
-                    [
-                        *(existing.egress if existing else []),
-                        *suggested_egress,
-                        *BASE_MANDATORY_EGRESS,
-                    ]
-                )
-            )
-            mask = existing.mounts.mask if existing else []
-            context = existing.mounts.context if existing else []
-            mode = existing.run.permission_mode.value if existing else "default"
-        else:
-            chosen_profile = profile or picker.pick_profile(
-                config, default=existing.profile if existing else None
-            )
-            chosen_servers = list(servers) if servers else picker.pick_servers(
-                cat, preselected=existing.servers if existing else []
-            )
-            chosen_tools = picker.pick_tools(
-                cat, chosen_servers, existing.tools if existing else {}
-            )
-            chosen_toolchains = picker.pick_toolchains(
-                existing.toolchains if existing else detected
-            )
-            # Suggest egress from the toolchains just chosen, not the ones that
-            # happened to be auto-detected: picking `python` by hand in a repo
-            # with no pyproject.toml should still offer pypi.org.
-            chosen_egress = picker.pick_egress(
-                picker.suggest_egress(chosen_toolchains, workspace),
-                existing.egress if existing else [],
-            )
-            context = picker.pick_context_dirs(existing.mounts.context if existing else [])
-            mode = picker.pick_permission_mode(
-                existing.run.permission_mode.value if existing else "default"
-            )
-            mask = existing.mounts.mask if existing else []
+            if picker.choose_setup_mode(name, existing=existing is not None) == "custom":
+                picker.walk_all(draft, ctx)
+            if not picker.review_and_edit(draft, ctx):
+                console.print("[dim]nothing written[/]")
+                _warn_orphan_secrets(draft)
+                raise typer.Exit(0)
 
-        try:
-            manifest = Manifest(
-                project=name,
-                profile=chosen_profile,
-                servers=chosen_servers,
-                remote_servers=existing.remote_servers if existing else {},
-                tools=chosen_tools,
-                toolchains=chosen_toolchains,
-                mounts=MountsConfig(mask=mask, context=context),
-                egress=[e for e in chosen_egress if e not in config.defaults.egress_mandatory],
-                run=RunConfig(permission_mode=PermissionMode(mode)),
-            )
-        except ValidationError as exc:
-            # A typo in an answer is an ordinary mistake, not a crash. Report it
-            # the way every other abox failure is reported.
-            raise AboxError(
-                "the answers do not make a valid manifest:\n" + format_errors(exc),
-                hint="re-run `abox init` and correct the flagged answer",
-            ) from exc
-
-        answers = picker.InitAnswers(
-            project=manifest.project,
-            profile=manifest.profile,
-            servers=manifest.servers,
-            tools=manifest.tools,
-            toolchains=manifest.toolchains,
-            egress=merged_egress(manifest, config),
-            mask=merged_masks(manifest, config),
-            context=manifest.mounts.context,
-            permission_mode=manifest.run.permission_mode.value,
-        )
-        if (
-            not yes
-            and picker.interactive()
-            and not picker.confirm_summary(answers, paths.manifest_path(workspace))
-        ):
-            console.print("[dim]nothing written[/]")
-            raise typer.Exit(0)
+        manifest = _manifest_from(draft, config, existing)
 
         target = manifest.write(workspace)
         console.print(f"[green]✔[/] wrote {target}")
+        if draft.created_profiles:
+            # Deferred until the manifest exists: the picker used to save a new
+            # profile the moment it was named, so cancelling left an orphan
+            # profile holding a port in the global config.
+            config.profiles.update(draft.created_profiles)
+            config.save()
+            for profile_name in draft.created_profiles:
+                console.print(f"[green]✔[/] added profile {profile_name} to the global config")
 
         result = render_mod.render(manifest, config, workspace, _spec(manifest, config))
         written = render_mod.write(result)
@@ -294,12 +243,82 @@ def init(
             console.print(f"[yellow]![/] {warning}")
 
         _bind(workspace, manifest)
-        console.print(
-            f"\nnext: [bold]abox up[/] to build the image and start the "
-            f"{manifest.profile} gateway"
-        )
+        if yes or not picker.interactive():
+            console.print(
+                f"\nnext: [bold]abox up[/] to build the image and start the "
+                f"{manifest.profile} gateway"
+            )
+        else:
+            _print_next_steps(manifest)
     except AboxError as exc:
         _fail(exc)
+
+
+def _manifest_from(
+    draft: picker.InitDraft, config: GlobalConfig, existing: Manifest | None
+) -> Manifest:
+    """Fold the answers over the existing manifest, rather than replacing it.
+
+    ``init`` used to rebuild the model from scratch, which silently dropped every
+    field the picker never asks about — ``env_secrets``, ``egress_ignored``,
+    ``server_network``, ``mounts.watch``, and everything in ``run`` bar the
+    permission mode. Both README and GUIDE promise "re-runs merge", and
+    re-running ``init`` is now the documented way to re-edit a project, so this
+    is load-bearing rather than tidy.
+    """
+    base = existing.model_dump(mode="json") if existing else {}
+    mounts = {**base.get("mounts", {}), "mask": draft.mask, "context": draft.context}
+    run = {**base.get("run", {}), "permission_mode": draft.permission_mode}
+    data = {
+        **base,
+        "project": draft.project,
+        "profile": draft.profile,
+        "servers": draft.servers,
+        "tools": draft.tools,
+        "toolchains": draft.toolchains,
+        "mounts": mounts,
+        "egress": [e for e in draft.egress if e not in config.defaults.egress_mandatory],
+        "run": run,
+    }
+    try:
+        return Manifest.model_validate(data)
+    except ValidationError as exc:
+        # A typo in an answer is an ordinary mistake, not a crash. Report it
+        # the way every other abox failure is reported.
+        raise AboxError(
+            "the answers do not make a valid manifest:\n" + format_errors(exc),
+            hint="re-run `abox init` and correct the flagged answer",
+        ) from exc
+
+
+def _warn_orphan_secrets(draft: picker.InitDraft) -> None:
+    """A secret typed during setup is already in Docker's store; say so.
+
+    It cannot be rolled back by abandoning the init — ``docker mcp secret set``
+    writes to the OS keychain, not to a file abox owns — so the honest move is
+    to name what was stored rather than let it sit there unmentioned.
+    """
+    if not draft.stored_secrets:
+        return
+    console.print(
+        f"[yellow]![/] {len(draft.stored_secrets)} credential(s) were stored during "
+        f"setup and are still there: {', '.join(draft.stored_secrets)}"
+    )
+    console.print("   [dim]↳ `abox secrets rm <name>` if you did not mean to[/]")
+
+
+def _print_next_steps(manifest: Manifest) -> None:
+    console.print(
+        f"\n[bold]Next:[/]\n"
+        f"  [bold]1[/]  abox up            [dim]build the image, start the "
+        f"{manifest.profile} gateway[/]\n"
+        f"  [bold]2[/]  abox shell         [dim]then run `claude` inside and log in — "
+        f"once per project[/]\n"
+        f'  [bold]3[/]  abox run "…"       [dim]headless run; transcript captured[/]\n'
+        f"\n[dim]Step 2 is not optional the first time: a fresh project has an empty "
+        f"auth\nvolume, so `abox run` exits 1 at login. `abox doctor` audits the "
+        f"sandbox\nat any point.[/]"
+    )
 
 
 # -- up / render ----------------------------------------------------------

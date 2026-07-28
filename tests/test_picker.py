@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from abox import picker
+from abox import paths, picker
 from abox.catalog import Catalog, CatalogServer
 from abox.errors import AboxError
 
@@ -148,7 +148,7 @@ def test_server_choices_flag_secrets_and_unpinned(q) -> None:
     q.answers["checkbox"] = []
     picker.pick_servers(_catalog())
     titles = [c.title for c in q.calls["checkbox"][0]["choices"]]
-    assert any("needs 1 secret(s)" in t for t in titles)
+    assert any("needs 1 secret" in t for t in titles)
 
 
 def test_empty_catalog_explains_itself(q) -> None:
@@ -272,3 +272,418 @@ def test_context_dir_validation_accepts_a_real_dir(tmp_path: Path) -> None:
 
 def test_context_dir_validation_accepts_blank() -> None:
     assert picker._validate_context_input("") is True
+
+
+# -- the review screen -----------------------------------------------------
+
+
+def scripted(*values: Any):
+    """The ``q`` fixture calls a callable answer once per prompt; this scripts a run."""
+    it = iter(values)
+    return lambda: next(it)
+
+
+def _ctx(tmp_path: Path, config, catalog: Catalog | None = None) -> picker.InitContext:
+    return picker.InitContext(
+        workspace=tmp_path,
+        catalog=catalog if catalog is not None else _catalog(),
+        config=config,
+        manifest_path=tmp_path / "agentbox.yaml",
+        detected=[],
+    )
+
+
+def _draft(**kw: Any) -> picker.InitDraft:
+    base: dict[str, Any] = {"project": "demo", "profile": "dev"}
+    return picker.InitDraft(**{**base, **kw})
+
+
+def test_the_review_screen_shows_tools_and_context_the_old_summary_dropped(q, config, tmp_path):
+    """InitAnswers carried both and confirm_summary rendered neither, so the one
+    screen meant to show what you built showed less than you had answered."""
+    draft = _draft(
+        servers=["duckduckgo"], tools={"duckduckgo": ["search"]}, context=["/srv/data"]
+    )
+    titles = [c.title for c in picker._hub_choices(draft, _ctx(tmp_path, config))]
+    assert any("duckduckgo: 1 of 2" in t for t in titles)
+    assert any("/srv/data" in t for t in titles)
+
+
+def test_every_row_renders_prose_rather_than_a_blank_when_unset(q, config, tmp_path):
+    ctx = _ctx(tmp_path, config)
+    draft = _draft()
+    for row in picker.ROWS:
+        value = row.value(draft, ctx)
+        assert value, f"{row.key} rendered empty"
+        assert value.strip() != "", f"{row.key} rendered whitespace"
+
+
+def test_every_editable_field_has_a_row() -> None:
+    assert {row.key for row in picker.ROWS} == {
+        "profile", "servers", "secrets", "tools", "toolchains",
+        "egress", "mask", "context", "permission",
+    }
+
+
+def test_saving_returns_true_and_edits_nothing(q, config, tmp_path) -> None:
+    q.answers["select"] = picker.SAVE
+    draft = _draft()
+    assert picker.review_and_edit(draft, _ctx(tmp_path, config)) is True
+    assert q.calls["checkbox"] == []
+
+
+def test_cancelling_returns_false(q, config, tmp_path) -> None:
+    q.answers["select"] = picker.CANCEL
+    assert picker.review_and_edit(_draft(), _ctx(tmp_path, config)) is False
+
+
+def test_the_screen_loops_until_save(q, config, tmp_path) -> None:
+    q.answers["select"] = scripted("toolchains", picker.SAVE)
+    q.answers["checkbox"] = ["python"]
+    draft = _draft()
+    assert picker.review_and_edit(draft, _ctx(tmp_path, config)) is True
+    assert draft.toolchains == ["python"]
+    assert len(q.calls["select"]) == 2
+
+
+def test_a_cancelled_sub_prompt_returns_to_the_screen_with_the_row_unchanged(q, config, tmp_path):
+    """The whole point: Ctrl-C inside one answer costs that answer, not all of them."""
+    q.answers["select"] = scripted("toolchains", picker.SAVE)
+    q.answers["checkbox"] = None  # Ctrl-C
+    draft = _draft(toolchains=["go"])
+    assert picker.review_and_edit(draft, _ctx(tmp_path, config)) is True
+    assert draft.toolchains == ["go"]
+
+
+def test_ctrl_c_at_the_review_screen_cancels_the_whole_init(q, config, tmp_path) -> None:
+    q.answers["select"] = None
+    with pytest.raises(AboxError, match="cancelled"):
+        picker.review_and_edit(_draft(), _ctx(tmp_path, config))
+
+
+def test_a_failing_sub_prompt_does_not_kill_the_screen(q, config, tmp_path) -> None:
+    """An empty catalog is a real AboxError, not a cancel — it still must not
+    destroy the eight answers already given."""
+    q.answers["select"] = scripted("servers", picker.CANCEL)
+    ctx = _ctx(tmp_path, config, catalog=Catalog())
+    assert picker.review_and_edit(_draft(), ctx) is False
+
+
+def test_the_screen_never_shells_out_to_docker_while_drawing(q, config, tmp_path, monkeypatch):
+    """`docker mcp secret ls` has a 60s timeout; calling it to render a row
+    would hang `abox init` for a minute on a stopped daemon."""
+    def explode() -> set[str]:
+        raise AssertionError("the review screen must not touch Docker")
+
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", explode)
+    draft = _draft(servers=["github-official"])
+    assert picker._hub_choices(draft, _ctx(tmp_path, config))
+
+
+# -- quick vs custom -------------------------------------------------------
+
+
+def test_quick_is_the_default_for_a_fresh_project(q) -> None:
+    q.answers["select"] = "quick"
+    assert picker.choose_setup_mode("demo") == "quick"
+    call = q.calls["select"][0]
+    assert call["default"] == "quick"
+    assert "New sandbox for demo" in call["message"]
+
+
+def test_an_existing_manifest_offers_review_rather_than_quick(q) -> None:
+    q.answers["select"] = "quick"
+    picker.choose_setup_mode("demo", existing=True)
+    call = q.calls["select"][0]
+    assert "Editing demo" in call["message"]
+    assert any("Review" in c.title for c in call["choices"])
+
+
+def test_the_custom_walk_visits_every_row(q, config, tmp_path) -> None:
+    q.answers["select"] = "dev"
+    q.answers["checkbox"] = []
+    q.answers["text"] = ""
+    q.answers["confirm"] = False
+    picker.walk_all(_draft(egress=["pypi.org"]), _ctx(tmp_path, config))
+    asked = [c["message"] for kind in q.calls for c in q.calls[kind]]
+    assert any("Gateway profile" in m for m in asked)
+    assert any("MCP servers" in m for m in asked)
+    assert any("Toolchains" in m for m in asked)
+    assert any("Allowed outbound domains" in m for m in asked)
+    assert any("Extra paths to hide" in m for m in asked)
+    assert any("context dirs" in m for m in asked)
+    assert any("Permission mode" in m for m in asked)
+
+
+def test_a_cancelled_walk_keeps_what_was_already_answered(q, config, tmp_path) -> None:
+    q.answers["select"] = "dev"
+    q.answers["checkbox"] = None  # cancels at the servers question
+    draft = _draft()
+    picker.walk_all(draft, _ctx(tmp_path, config))
+    assert draft.profile == "dev"  # the answer before the cancel survived
+
+
+# -- seeding ---------------------------------------------------------------
+
+
+def test_seed_draft_matches_what_the_non_interactive_path_writes(workspace, config) -> None:
+    """Quick setup and `--yes` must start from the same place; they used to be
+    two branches of one `if`, and only one remembered the mandatory hosts."""
+    draft = picker.seed_draft(
+        project="demo", workspace=workspace, config=config, existing=None
+    )
+    assert draft.toolchains == ["python"]
+    assert "pypi.org" in draft.egress
+    for host in picker.BASE_MANDATORY_EGRESS:
+        assert host in draft.egress
+    assert draft.profile == next(iter(config.profiles))
+
+
+def test_seed_draft_prefers_the_existing_manifest_over_detection(workspace, config, manifest):
+    draft = picker.seed_draft(
+        project="demo", workspace=workspace, config=config, existing=manifest
+    )
+    assert draft.profile == "dev"
+    assert draft.servers == ["github-official", "duckduckgo"]
+    assert draft.mask == [".env*", "secrets/"]
+
+
+def test_flags_seed_the_draft_but_leave_the_row_editable(workspace, config) -> None:
+    draft = picker.seed_draft(
+        project="demo", workspace=workspace, config=config, existing=None,
+        profile="secops", servers=["duckduckgo"],
+    )
+    assert draft.profile == "secops"
+    assert draft.servers == ["duckduckgo"]
+
+
+# -- the orphan profile ----------------------------------------------------
+
+
+def test_a_new_profile_is_not_saved_until_the_manifest_is(q, config) -> None:
+    """Saving it here left an orphan profile, holding a port, behind every
+    cancelled init."""
+    q.answers["select"] = "__new__"
+    q.answers["text"] = "research"
+    sink: dict[str, Any] = {}
+    assert picker.pick_profile(config, created=sink) == "research"
+    assert set(sink) == {"research"}
+    assert not paths.global_config_path().exists()
+
+
+# -- grouping and search ---------------------------------------------------
+
+
+def test_server_choices_are_grouped_with_separators(q) -> None:
+    q.answers["checkbox"] = []
+    picker.pick_servers(_catalog())
+    choices = q.calls["checkbox"][0]["choices"]
+    assert any(isinstance(c, picker.questionary.Separator) for c in choices)
+    headings = [c.title for c in choices if isinstance(c, picker.questionary.Separator)]
+    assert any("ready to use" in h for h in headings)
+    assert any("needs a secret" in h for h in headings)
+
+
+def test_already_chosen_servers_come_first(q) -> None:
+    q.answers["checkbox"] = []
+    picker.pick_servers(_catalog(), preselected=["github-official"])
+    titles = [c.title for c in q.calls["checkbox"][0]["choices"]]
+    assert "already in this project" in titles[0]
+    assert "github-official" in titles[1]
+
+
+def test_the_server_list_enables_search_and_disables_jk(q) -> None:
+    """questionary refuses both — j/k become filter input once search is on —
+    so passing search without turning j/k off raises at prompt construction."""
+    q.answers["checkbox"] = []
+    picker.pick_servers(_catalog())
+    call = q.calls["checkbox"][0]
+    assert call["use_search_filter"] is True
+    assert call["use_jk_keys"] is False
+
+
+def test_a_list_of_only_separators_counts_as_empty(q) -> None:
+    """Separator is a Choice with disabled='-', so a heading-only list walks
+    into the same crash the zero-choice guard exists for."""
+    assert picker.checkbox("nothing", [picker.questionary.Separator("── none ──")]) == []
+    assert q.calls["checkbox"] == []
+
+
+# -- inline credentials ----------------------------------------------------
+
+
+def _secret_ctx(tmp_path, config) -> picker.InitContext:
+    return _ctx(tmp_path, config)
+
+
+def test_no_secrets_needed_asks_nothing(q, config, tmp_path) -> None:
+    picker.offer_secrets(_draft(servers=["duckduckgo"]), _secret_ctx(tmp_path, config))
+    assert q.calls["confirm"] == []
+
+
+def test_declining_stores_nothing(q, config, tmp_path, monkeypatch) -> None:
+    q.answers["confirm"] = False
+    monkeypatch.setattr(
+        picker.secrets_mod, "set_secret", lambda *a, **k: pytest.fail("stored anyway")
+    )
+    draft = _draft(servers=["github-official"])
+    picker.offer_secrets(draft, _secret_ctx(tmp_path, config))
+    assert draft.stored_secrets == []
+
+
+def test_only_the_missing_secrets_are_asked_for(q, config, tmp_path, monkeypatch) -> None:
+    q.answers["confirm"] = True
+    q.answers["select"] = "type"
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", lambda: set())
+    asked: list[str] = []
+    monkeypatch.setattr(
+        picker.secrets_mod, "read_from_prompt", lambda name, **k: asked.append(name) or "v"
+    )
+    monkeypatch.setattr(picker.secrets_mod, "set_secret", lambda *a, **k: None)
+    draft = _draft(servers=["github-official"])
+    picker.offer_secrets(draft, _secret_ctx(tmp_path, config))
+    assert asked == ["github.personal_access_token"]
+    assert draft.stored_secrets == ["github.personal_access_token"]
+
+
+def test_an_already_stored_secret_is_not_asked_for_again(q, config, tmp_path, monkeypatch):
+    q.answers["confirm"] = True
+    monkeypatch.setattr(
+        picker.secrets_mod, "docker_secret_names", lambda: {"github.personal_access_token"}
+    )
+    monkeypatch.setattr(
+        picker.secrets_mod, "read_from_prompt", lambda *a, **k: pytest.fail("asked anyway")
+    )
+    picker.offer_secrets(_draft(servers=["github-official"]), _secret_ctx(tmp_path, config))
+
+
+def test_an_unreachable_secret_store_does_not_fail_the_picker(q, config, tmp_path, monkeypatch):
+    """Docker not running is an ordinary state during `abox init`."""
+    q.answers["confirm"] = True
+
+    def unreachable() -> set[str]:
+        raise AboxError("could not list docker secrets: daemon not running")
+
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", unreachable)
+    monkeypatch.setattr(
+        picker.secrets_mod, "set_secret", lambda *a, **k: pytest.fail("stored anyway")
+    )
+    draft = _draft(servers=["github-official"])
+    picker.offer_secrets(draft, _secret_ctx(tmp_path, config))
+    assert draft.stored_secrets == []
+
+
+def test_a_secret_value_never_reaches_a_prompt_or_the_draft(q, config, tmp_path, monkeypatch):
+    q.answers["confirm"] = True
+    q.answers["select"] = "type"
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", lambda: set())
+    monkeypatch.setattr(picker.secrets_mod, "read_from_prompt", lambda *a, **k: "hunter2")
+    monkeypatch.setattr(picker.secrets_mod, "set_secret", lambda *a, **k: None)
+    draft = _draft(servers=["github-official"])
+    picker.offer_secrets(draft, _secret_ctx(tmp_path, config))
+    blob = repr(q.calls) + repr(draft)
+    assert "hunter2" not in blob
+
+
+def test_skipping_the_rest_stops_asking(q, config, tmp_path, monkeypatch) -> None:
+    q.answers["confirm"] = True
+    q.answers["select"] = "stop"
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", lambda: set())
+    monkeypatch.setattr(
+        picker.secrets_mod, "read_from_prompt", lambda *a, **k: pytest.fail("asked anyway")
+    )
+    picker.offer_secrets(_draft(servers=["github-official"]), _secret_ctx(tmp_path, config))
+
+
+# -- validation ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [
+        ("https://example.com", "not URLs"),
+        ("example.com/path", "must not contain a path"),
+        ("example.com:443", "must not contain a port"),
+        ("*.example.com", "wildcard egress is not supported"),
+    ],
+)
+def test_egress_validation_rejects_what_the_manifest_would(value: str, needle: str) -> None:
+    assert needle in str(picker._validate_egress_input(value))
+
+
+def test_egress_validation_accepts_a_comma_separated_list() -> None:
+    assert picker._validate_egress_input("a.com, b.co.uk example.org") is True
+
+
+def test_egress_validation_accepts_blank() -> None:
+    assert picker._validate_egress_input("") is True
+
+
+def test_the_egress_prompt_validates_what_you_type(q) -> None:
+    q.answers["checkbox"] = []
+    q.answers["text"] = ""
+    picker.pick_egress([], [])
+    assert q.calls["text"][0]["validate"] is picker._validate_egress_input
+
+
+def test_mandatory_hosts_are_shown_but_not_untickable(q) -> None:
+    """Offering a tickbox for something that cannot be turned off is a lie."""
+    q.answers["checkbox"] = ["pypi.org"]
+    q.answers["text"] = ""
+    out = picker.pick_egress(["pypi.org"], [], always_on=["api.anthropic.com"])
+    offered = [c.value for c in q.calls["checkbox"][0]["choices"]]
+    assert "api.anthropic.com" not in offered
+    assert "api.anthropic.com" in out
+
+
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [("/etc/passwd", "workspace-relative"), ("../outside", "escape the workspace")],
+)
+def test_mask_validation_rejects_paths_the_model_would(value: str, needle: str) -> None:
+    assert needle in str(picker._validate_mask_input(value))
+
+
+def test_mask_validation_accepts_a_relative_glob() -> None:
+    assert picker._validate_mask_input("secrets/ *.pem") is True
+
+
+def test_the_mask_row_can_actually_be_set(q) -> None:
+    """The old summary printed a `masked` line fed from global defaults while
+    the picker never asked for a project mask."""
+    q.answers["text"] = "secrets/ *.pem"
+    assert picker.pick_masks([".env*"], []) == ["secrets/", "*.pem"]
+
+
+# -- plain-language help ---------------------------------------------------
+
+
+def test_every_prompt_explains_itself(q, config, tmp_path) -> None:
+    q.answers["select"] = "dev"
+    q.answers["checkbox"] = []
+    q.answers["text"] = ""
+    q.answers["confirm"] = False
+    picker.walk_all(_draft(), _ctx(tmp_path, config))
+    for kind in ("select", "checkbox", "confirm"):
+        for call in q.calls[kind]:
+            assert call.get("instruction"), f"{kind}: {call['message']!r} has no instruction"
+
+
+def test_permission_mode_labels_line_up(q) -> None:
+    q.answers["select"] = "default"
+    picker.pick_permission_mode()
+    titles = [c.title for c in q.calls["select"][0]["choices"]]
+    dashes = {t.index("—") for t in titles}
+    assert len(dashes) == 1, f"labels are ragged: {titles}"
+
+
+def test_no_review_row_overflows_an_eighty_column_terminal(q, config, tmp_path) -> None:
+    """A row that wraps makes prompt_toolkit's cursor jump on every keystroke."""
+    draft = _draft(
+        servers=["duckduckgo", "github-official"],
+        egress=["a-very-long-registry-hostname.example.com"] * 12,
+        context=["/some/deeply/nested/host/path/for/context"] * 4,
+        mask=["a/very/long/glob/pattern/**/*.pem"] * 6,
+    )
+    for choice in picker._hub_choices(draft, _ctx(tmp_path, config)):
+        assert len(str(choice.title)) <= picker.HUB_WIDTH, choice.title
