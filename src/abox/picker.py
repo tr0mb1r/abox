@@ -648,8 +648,13 @@ def offer_secrets(draft: InitDraft, ctx: InitContext) -> None:
     needed = ctx.catalog.secrets_for(draft.servers)
     if not needed:
         return
+    # `needed` counts credentials, not servers — one server can declare several,
+    # so phrasing the count as "N of the servers" both miscounts and disagrees
+    # with its own verb at N=1.
+    plural = "s" if len(needed) > 1 else ""
     if not ask_confirm(
-        f"{len(needed)} of the servers you picked need a credential — set them now?",
+        f"the servers you picked need {len(needed)} credential{plural} — "
+        f"set {'them' if plural else 'it'} now?",
         default=True,
         instruction="stored in Docker's secret store immediately, and kept even if "
         "you cancel this setup",

@@ -522,6 +522,37 @@ def test_no_secrets_needed_asks_nothing(q, config, tmp_path) -> None:
     assert q.calls["confirm"] == []
 
 
+def test_one_credential_reads_as_singular(q, config, tmp_path) -> None:
+    """`secrets_for` counts credentials, not servers, so the old wording
+    ("N of the servers you picked need a credential") both disagreed with its
+    own verb at N=1 and named the wrong noun."""
+    q.answers["confirm"] = False
+    picker.offer_secrets(_draft(servers=["github-official"]), _secret_ctx(tmp_path, config))
+    assert q.calls["confirm"][0]["message"] == (
+        "the servers you picked need 1 credential — set it now?"
+    )
+
+
+def test_two_credentials_on_one_server_do_not_claim_two_servers(q, config, tmp_path) -> None:
+    """One server declaring two secrets used to report "2 of the servers"."""
+    q.answers["confirm"] = False
+    catalog = Catalog(
+        servers={
+            "greedy": CatalogServer(
+                name="greedy",
+                description="Wants both.",
+                image="mcp/greedy@sha256:" + "e" * 64,
+                secrets=("greedy.token", "greedy.webhook"),
+                tools=("go",),
+            )
+        }
+    )
+    picker.offer_secrets(_draft(servers=["greedy"]), _ctx(tmp_path, config, catalog))
+    assert q.calls["confirm"][0]["message"] == (
+        "the servers you picked need 2 credentials — set them now?"
+    )
+
+
 def test_declining_stores_nothing(q, config, tmp_path, monkeypatch) -> None:
     q.answers["confirm"] = False
     monkeypatch.setattr(
