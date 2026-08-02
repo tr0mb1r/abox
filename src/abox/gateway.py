@@ -20,6 +20,7 @@ and ``docker mcp`` CLI v0.43.1 rather than assumed:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets as pysecrets
@@ -343,6 +344,22 @@ remote_catalog_name = abox_catalog_name
 remote_catalog_path = abox_catalog_path
 
 
+def rendered_catalog_sha(profile: str) -> str:
+    """sha256 of the catalog file the gateway mounts, or "" when there is none.
+
+    Hashed into the gateway fingerprint. The *rendered file* is the thing the
+    container loads, and it carries content the spec does not model: a
+    ``network: none`` shadow is a verbatim copy of the upstream catalog entry,
+    image and all, so an upstream refresh (a CVE fix, say) changes what the
+    gateway would spawn while the modelled ``network_none`` name list stays
+    identical.
+    """
+    path = abox_catalog_path(profile)
+    if not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _network_none_shadows(
     names: Iterable[str],
     custom_servers: dict[str, Any],
@@ -393,8 +410,10 @@ def write_abox_catalog(
     under the same key with ``disableNetwork: true`` added — catalogs merge by
     key and the later one wins. The gateway logs the overwrite by name, and
     doctor reports it, so it is not a silent substitution. The copy is taken
-    from the catalog on every render, so it cannot drift further than one
-    ``abox up``.
+    from the catalog on every render, and the rendered file is hashed into the
+    gateway fingerprint (`rendered_catalog_sha`), so a changed upstream entry
+    recreates the container instead of leaving the running gateway spawning the
+    image the copy used to name.
     """
     path = abox_catalog_path(profile)
     remote_servers = remote_servers or {}
@@ -621,6 +640,10 @@ class GatewaySpec:
                 # re-read on start, so a changed network placement must recreate
                 # the container or the old catalog keeps serving.
                 "network_none": list(self.network_none),
+                # ...and the same is true of what is *in* those entries, which the
+                # name list above does not capture: a refreshed upstream image
+                # rewrites the file without changing any name here.
+                "catalog": rendered_catalog_sha(self.profile),
                 "custom": {
                     name: server.model_dump(mode="json")
                     if hasattr(server, "model_dump")
@@ -676,6 +699,43 @@ def build_spec(
         remote_servers=tuple(sorted((remote_servers or {}).items())),
         custom_servers=tuple(sorted(custom.items())),
         network_none=tuple(sorted(set(network_none) | declared_none)),
+    )
+
+
+def spec_from_registry(
+    profile: str,
+    config: GlobalConfig,
+    registry: ProfileRegistry,
+    *,
+    servers: list[str] | None = None,
+    tools: list[str] | None = None,
+    remote_servers: dict[str, Any] | None = None,
+    custom_servers: dict[str, Any] | None = None,
+    network_none: Iterable[str] | None = None,
+) -> GatewaySpec:
+    """What the profile's registry asks for, with optional caller overrides.
+
+    `up` and `status` must build this the same way: they compare fingerprints
+    with each other, so a field one of them forgets is permanent drift. That is
+    what happened to ``network_none`` — `status` omitted it, `doctor` turned
+    every run into a `gateway.drift` warning, and `abox gateway up --force`
+    re-stored the same mismatching value without clearing it. A warning that
+    fires unconditionally hides the stale gateway it exists to catch.
+    """
+    return build_spec(
+        profile,
+        config,
+        servers=servers if servers is not None else registry.servers,
+        tools=tools if tools is not None else registry.tools,
+        remote_servers=(
+            remote_servers if remote_servers is not None else registry.remote_servers()
+        ),
+        custom_servers=(
+            custom_servers if custom_servers is not None else registry.custom_servers()
+        ),
+        network_none=(
+            network_none if network_none is not None else registry.network_none()
+        ),
     )
 
 
@@ -879,14 +939,7 @@ def status(profile: str, config: GlobalConfig, *, deep: bool = True) -> GatewayS
             healthy=False,
             detail="not created",
         )
-    spec = build_spec(
-        profile,
-        config,
-        servers=registry.servers,
-        tools=registry.tools,
-        remote_servers=registry.remote_servers(),
-        custom_servers=registry.custom_servers(),
-    )
+    spec = spec_from_registry(profile, config, registry)
     if not state.running:
         return GatewayStatus(
             profile=profile,
@@ -937,27 +990,25 @@ def up(
 ) -> GatewayStatus:
     """Bring the profile's gateway to the desired state, recreating on drift."""
     registry = ProfileRegistry.load(profile)
-    wanted_servers = servers if servers is not None else registry.servers
-    wanted_tools = tools if tools is not None else registry.tools
-    wanted_remotes = (
-        remote_servers if remote_servers is not None else registry.remote_servers()
-    )
-    wanted_custom = (
-        custom_servers if custom_servers is not None else registry.custom_servers()
-    )
-    wanted_none = network_none if network_none is not None else registry.network_none()
-    spec = build_spec(
+    spec = spec_from_registry(
         profile,
         config,
-        servers=wanted_servers,
-        tools=wanted_tools,
-        remote_servers=wanted_remotes,
-        custom_servers=wanted_custom,
-        network_none=wanted_none,
+        registry,
+        servers=servers,
+        tools=tools,
+        remote_servers=remote_servers,
+        custom_servers=custom_servers,
+        network_none=network_none,
     )
 
+    # Rendered before the fingerprint is taken, because the fingerprint hashes
+    # the rendered file.
     write_abox_catalog(
-        profile, wanted_remotes, wanted_custom, spec.network_none, catalog
+        profile,
+        dict(spec.remote_servers),
+        dict(spec.custom_servers),
+        spec.network_none,
+        catalog,
     )
     dockerx.ensure_network(spec.network)
     if pull_images:
@@ -1132,7 +1183,9 @@ __all__ = [
     "mcp_config",
     "probe",
     "remote_catalog_path",
+    "rendered_catalog_sha",
     "sanitize_for_log",
+    "spec_from_registry",
     "status",
     "unbind_project",
     "up",

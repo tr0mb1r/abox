@@ -464,6 +464,26 @@ class Manifest(StrictModel):
                 out.append(normalized)
         return out
 
+    @field_validator("tools")
+    @classmethod
+    def _tool_filters_are_not_empty(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        """``tools: {github: []}`` is rejected, for the reason it is not honest.
+
+        It is the natural way to write "expose no tools from this server" and it
+        did the opposite: `runner` flattens the filters to one set, an empty one
+        is falsy, `GatewaySpec.gateway_args` emits no ``--tools=`` at all, and
+        the gateway hands the agent every tool the server has — while `doctor`
+        goes on advising "narrow with `tools:`", which the operator just did.
+        """
+        empty = sorted(name for name, tools in value.items() if not tools)
+        if empty:
+            raise ValueError(
+                f"empty tools filter for {', '.join(empty)} — an empty list means the "
+                "server is not narrowed at all, so name the tools to expose or drop "
+                "the server from `servers`"
+            )
+        return value
+
     @model_validator(mode="after")
     def _tools_reference_declared_servers(self) -> Self:
         stray = sorted(set(self.tools) - set(self.all_servers))
@@ -515,6 +535,28 @@ class Manifest(StrictModel):
                 f"{', '.join(both)} appear(s) in both egress and egress_ignored — "
                 "allow it or ignore it, not both"
             )
+        # The same contradiction, one level up and easier to miss: `merged_egress`
+        # unions the mandatory hosts in whatever this file says, so ignoring one
+        # recorded a denial the firewall goes on contradicting — and the queue,
+        # which is the only place the operator would have seen it again, stopped
+        # mentioning it. `defaults.egress_mandatory` can do this too and is not
+        # visible from here; that half needs a doctor check against the
+        # effective allowlist.
+        #
+        # Dropped rather than rejected, deliberately. Refusing to *load* the file
+        # bricks a manifest an older abox wrote — every command fails, including
+        # `abox egress unignore`, which is the documented repair. The entry is a
+        # no-op either way (the host stays allowed), so removing it preserves the
+        # invariant this validator exists for without stranding anyone. The place
+        # to refuse is where the operator makes the decision: `abox egress
+        # ignore` says no, with the reason, before writing anything.
+        unconditional = set(BASE_MANDATORY_EGRESS)
+        if self.run.connectors:
+            unconditional |= set(CONNECTOR_EGRESS)
+        if set(self.egress_ignored) & unconditional:
+            self.__dict__["egress_ignored"] = [
+                host for host in self.egress_ignored if host not in unconditional
+            ]
         return self
 
     @model_validator(mode="after")
@@ -593,10 +635,20 @@ class EgressProxyConfig(StrictModel):
     """
 
     enabled: bool = False
+    #: A mutable tag by default, which is a weaker anchor than everything else
+    #: abox runs: MCP server images and the gateway are digest-pinned, and this
+    #: container is on the egress path of *all* traffic. Pinning it by digest is
+    #: the safe choice — `pinned` below is what tells the difference, and `proxy`
+    #: refuses to adopt a local image for an unpinned reference because of it.
     image: str = "nginx:alpine"
     port: int = Field(default=8443, ge=1024, le=65535)
     #: Idle timeout for a proxied connection.
     timeout: int = Field(default=300, ge=10, le=86_400)
+
+    @property
+    def pinned(self) -> bool:
+        """Is the image a digest reference — a name that means its own content?"""
+        return bool(_DIGEST_RE.match(self.image))
 
 
 class ProfileConfig(StrictModel):
@@ -991,15 +1043,40 @@ class CustomServer(StrictModel):
             )
         return self
 
+    @field_validator("tools")
+    @classmethod
+    def _tools_is_not_empty(cls, value: list[str]) -> list[str]:
+        """``tools: []`` is rejected rather than silently meaning "everything".
+
+        It reads as "expose nothing" and did the opposite: `all_tools` treated
+        it as ``["*"]``, `catalog_entry` dropped the key, and the gateway
+        published the server's whole tool surface. Nothing downstream could tell
+        "all" from "none", so there is no spelling of "expose nothing" to route
+        it to — the honest answer is to refuse the ambiguous one at the door.
+        """
+        if not value:
+            raise ValueError(
+                "tools must not be empty — write `tools: ['*']` (or drop the key) for "
+                "every tool, or name the tools to expose. An empty list looks like "
+                "'expose nothing' and there is no such setting: to expose nothing, "
+                "remove the server"
+            )
+        return value
+
     @property
     def all_tools(self) -> bool:
-        return self.tools == ["*"] or not self.tools
+        # An empty list cannot reach here — `_tools_is_not_empty` rejects it —
+        # so this is the whole question: the wildcard, or a real narrowing.
+        return self.tools == ["*"]
 
 
 class CustomServers(StrictModel):
     """``~/.config/abox/custom-servers.yaml`` — a bare mapping of name -> server."""
 
     servers: dict[str, CustomServer] = Field(default_factory=dict)
+    #: Entries that did not validate, name -> why. Surfaced by `abox init` and
+    #: `doctor` rather than raised: see `load`.
+    rejected: dict[str, str] = Field(default_factory=dict)
 
     @classmethod
     def load(cls) -> CustomServers:
@@ -1016,8 +1093,23 @@ class CustomServers(StrictModel):
         payload = data if set(data) == {"servers"} else {"servers": data}
         try:
             return cls.model_validate(payload)
-        except ValidationError as exc:
-            raise ConfigError(f"{target} is invalid:\n{_format_errors(exc)}") from exc
+        except ValidationError:
+            pass
+
+        # One bad entry must not take the machine down. This file is global and
+        # is loaded by nearly every command, so raising here means a single
+        # server nobody is using — a stale `tools: []`, say — breaks every
+        # unrelated project on the host. Validate them one at a time instead:
+        # the invalid ones are dropped and named, which is the same treatment
+        # `load_local_catalogs` gives a catalog file it cannot parse.
+        servers: dict[str, CustomServer] = {}
+        rejected: dict[str, str] = {}
+        for name, entry in (payload.get("servers") or {}).items():
+            try:
+                servers[name] = CustomServer.model_validate(entry)
+            except ValidationError as exc:
+                rejected[str(name)] = _format_errors(exc).strip().replace("\n", "; ")
+        return cls(servers=servers, rejected=rejected)
 
     def __contains__(self, name: object) -> bool:
         return name in self.servers
@@ -1079,12 +1171,20 @@ def merged_egress(
     ``defaults.egress_mandatory`` remains the operator's way to add hosts to
     every project. It is not a way to drop the four Claude Code cannot run
     without; "mandatory" now means what it says.
+
+    ``CONNECTOR_EGRESS`` is folded in here rather than left to the caller for
+    the same reason: ``render`` passed it and nothing else did, so the SNI map
+    and the firewall allowed one more host than every *reporting* path knew
+    about — `abox up`'s domain count, ``ProxySpec.egress``, doctor's
+    shared-address analysis — and the review queue filed that allowed,
+    connected host as an unreviewed denial on every single run.
     """
     out: list[str] = []
     for host in (
         *manifest.egress,
         *BASE_MANDATORY_EGRESS,
         *config.defaults.egress_mandatory,
+        *(CONNECTOR_EGRESS if manifest.run.connectors else ()),
         *(extra or []),
     ):
         h = host.strip().lower()
@@ -1109,3 +1209,15 @@ def effective_allowlist(manifest: Manifest, config: GlobalConfig) -> list[str]:
 
 #: Historical name; remote and image servers share one secret shape.
 RemoteSecret = ServerSecret
+
+
+def effective_allowlist_mandatory(manifest: Manifest, config: GlobalConfig) -> list[str]:
+    """Hosts `merged_egress` unions in whatever the manifest says.
+
+    The set `abox egress ignore` must refuse, because "ignored" would be a
+    decision abox does not enforce for any of them.
+    """
+    out = set(BASE_MANDATORY_EGRESS) | set(config.defaults.egress_mandatory)
+    if manifest.run.connectors:
+        out |= set(CONNECTOR_EGRESS)
+    return sorted(out)

@@ -245,6 +245,80 @@ def test_status_reports_a_missing_container(config: GlobalConfig, runner) -> Non
     assert status.detail == "not created"
 
 
+_RUNNING = {
+    "State": {"Running": True, "Status": "running"},
+    "Config": {"Image": "docker/mcp-gateway:v2", "Labels": {}},
+    "NetworkSettings": {"Ports": {}},
+}
+
+
+def test_status_agrees_with_up_about_a_network_pin(
+    config: GlobalConfig, runner, workspace: Path
+) -> None:
+    """doctor turns a fingerprint mismatch into `gateway.drift` — "started with
+    a different server set". `status` used to leave `network_none` out of the
+    spec it fingerprints, so a profile with any server pinned to `none` warned
+    on every run and `abox gateway up --force` could not clear it. A warning
+    that always fires cannot report the stale gateway it exists for."""
+    from abox.catalog import Catalog, CatalogServer
+    from abox.manifest import ServerNetwork
+
+    image = "mcp/git@sha256:" + "c" * 64
+    cat = Catalog(
+        servers={
+            "git": CatalogServer(
+                name="git", image=image, raw={"type": "server", "image": image}
+            )
+        }
+    )
+    gateway.bind_project(
+        "dev",
+        workspace=workspace,
+        project="demo",
+        servers=["git"],
+        tools={},
+        server_network={"git": ServerNetwork.none},
+    )
+    runner.expect(r"docker container inspect", "", returncode=1)  # not created yet
+    runner.expect(r"docker image inspect", json.dumps({"Id": "sha256:abc"}))
+    runner.expect(r"docker run --rm", _INIT_SSE)
+    gateway.up("dev", config, cat)
+
+    # The container `up` just created, as `docker inspect` would now report it.
+    runner.responses.clear()
+    runner.expect(r"docker container inspect", json.dumps(_RUNNING))
+    runner.expect(r"docker run --rm", _INIT_SSE)
+    assert gateway.status("dev", config).fingerprint_matches
+
+
+def test_a_refreshed_shadow_body_recreates_the_gateway(config: GlobalConfig) -> None:
+    """A `network: none` shadow copies the upstream catalog entry verbatim, so a
+    catalog refresh repoints the image behind an unchanged `network_none` name
+    list. The gateway reads its catalog once, at start — without this the
+    running container goes on spawning the superseded image indefinitely."""
+    from abox.catalog import Catalog, CatalogServer
+
+    def fingerprint_for(image: str) -> str:
+        cat = Catalog(
+            servers={
+                "git": CatalogServer(
+                    name="git", image=image, raw={"type": "server", "image": image}
+                )
+            }
+        )
+        gateway.write_abox_catalog("dev", {}, {}, ["git"], cat)
+        spec = gateway.build_spec(
+            "dev", config, servers=["git"], network_none=["git"]
+        )
+        return spec.fingerprint()
+
+    old = fingerprint_for("mcp/git@sha256:" + "a" * 64)
+    # Stable when nothing changed: a fingerprint that always differs would
+    # recreate the gateway on every `abox up` and report drift forever.
+    assert fingerprint_for("mcp/git@sha256:" + "a" * 64) == old
+    assert fingerprint_for("mcp/git@sha256:" + "b" * 64) != old
+
+
 def test_status_flags_published_ports(config: GlobalConfig, runner) -> None:
     inspected = {
         "State": {"Running": True, "Status": "running"},

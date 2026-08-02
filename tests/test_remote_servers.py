@@ -22,6 +22,7 @@ from abox.manifest import (
     RemoteSecret,
     RemoteServer,
     RemoteTransport,
+    SecretsConfig,
 )
 
 CONTEXT7 = RemoteServer(url="https://mcp.context7.com/mcp")
@@ -558,6 +559,37 @@ def test_registry_unions_custom_servers_across_projects() -> None:
     )
     reg.save()
     assert "m" in gateway.ProfileRegistry.load("dev").custom_servers()
+
+
+def test_custom_server_secrets_reach_the_catalog_as_names(config: GlobalConfig) -> None:
+    """`CatalogServer.secrets` is a list of secret *names*.
+
+    Handing the ServerSecret models over instead poisoned every consumer:
+    `secrets_for` compared a model against the store's strings, so the secret
+    read as missing however it was stored, and the message that said so joined
+    models into a string and raised TypeError out of `abox doctor`.
+    """
+    custom = CustomServers(servers={"serena": _custom(secrets=["serena.token"])})
+    entry = catalog_mod.custom_to_catalog(custom)["serena"]
+    assert entry.secrets == ("serena.token",)
+    cat = catalog_mod.Catalog(servers=catalog_mod.custom_to_catalog(custom))
+    assert cat.secrets_for(["serena"]) == ["serena.token"]
+
+
+def test_doctor_sees_a_stored_custom_server_secret(runner) -> None:
+    """The positive path through the same control: the secret IS in the store,
+    so the check has to go green — the crash it used to take was on the way to
+    reporting it missing."""
+    custom = CustomServers(servers={"serena": _custom(secrets=["serena.token"])})
+    cat = catalog_mod.Catalog(servers=catalog_mod.custom_to_catalog(custom))
+    manifest = Manifest(project="d", profile="dev", servers=["serena"])
+    runner.expect(r"docker mcp secret ls", "NAME\nserena.token\n")
+    checks = {
+        c.id: c
+        for c in doctor.check_secrets(manifest, cat, SecretsConfig(), deep=False)
+    }
+    assert checks["secrets.present"].status is doctor.Status.ok
+    assert checks["secrets.present"].data["required"] == ["serena.token"]
 
 
 def test_doctor_names_the_custom_image_trust_story(config: GlobalConfig) -> None:

@@ -75,6 +75,10 @@ class ProxySpec:
     network: str
     conf: Path
     egress: tuple[str, ...]
+    #: Is ``image`` a digest reference? A digest names its own content, so a
+    #: local copy of one can be adopted; a tag names whatever happens to carry
+    #: it on this daemon.
+    image_pinned: bool = False
 
     def run_options(self) -> list[str]:
         """Nothing published: the agent reaches this by container DNS only."""
@@ -137,6 +141,7 @@ def build_spec(manifest: Manifest, config: GlobalConfig, workspace: Path) -> Pro
         network=config.network,
         conf=conf_path(workspace),
         egress=tuple(merged_egress(manifest, config)),
+        image_pinned=config.egress_proxy.pinned,
     )
 
 
@@ -207,12 +212,21 @@ def up(
         state = dockerx.container_state(spec.container)
 
     if not state.exists:
-        if not dockerx.image_present(spec.image):
+        # This container decides which names leave the sandbox and sees the SNI
+        # of every connection the agent makes, so an unpinned reference must not
+        # be satisfied by whatever already carries that tag on the daemon:
+        # `image_present` is a local `docker image inspect`, so a
+        # `docker build -t nginx:alpine` — or a poisoned base on a shared CI host
+        # — was adopted as the egress filter with no pull and no digest.
+        if not spec.image_pinned or not dockerx.image_present(spec.image):
             pull = dockerx.pull(spec.image)
             if not pull.ok:
                 raise AboxError(
                     f"could not pull the egress proxy image {spec.image}: "
-                    f"{pull.stderr.strip()[:200]}"
+                    f"{pull.stderr.strip()[:200]}",
+                    hint="pin it by digest (`egress_proxy.image: nginx@sha256:…` in "
+                    "~/.config/abox/config.yaml) and abox will use a local copy "
+                    "without needing the registry",
                 )
         dockerx.run_detached(spec.container, spec.image, [], opts=spec.run_options())
         path = _fingerprint_path(spec.project)
@@ -237,8 +251,24 @@ def down(project: str) -> bool:
     return True
 
 
-def denied_names(project: str, *, tail: int = 500) -> list[dict[str, Any]]:
-    """SNI values the proxy refused.
+@dataclass(frozen=True)
+class DenialLog:
+    """The SNI log as read — including the case where it could not be read.
+
+    "nothing was denied" and "the log is unreadable" are different answers, and
+    they used to be the same empty list: a stopped, removed or exec-refused
+    proxy returned ``[]`` and the report that only speaks when the list is
+    non-empty said nothing at all. In proxy mode this is the only domain-level
+    denial evidence there is, so silence has to be distinguishable from clean.
+    """
+
+    ok: bool
+    detail: str = ""
+    entries: tuple[dict[str, Any], ...] = ()
+
+
+def read_denials(project: str, *, tail: int = 500) -> DenialLog:
+    """SNI values the proxy refused, or why they could not be read.
 
     This is the domain-level counterpart to the DNS review queue: a name here
     was not merely looked up, it was connected to.
@@ -250,7 +280,12 @@ def denied_names(project: str, *, tail: int = 500) -> list[dict[str, Any]]:
         "exec", proxy_container(project), "cat", f"{LOG_DIR}/sni.log", timeout=30
     )
     if not result.ok:
-        return []
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        return DenialLog(
+            False,
+            f"could not read {LOG_DIR}/sni.log in {proxy_container(project)}: "
+            f"{detail[-1] if detail else 'docker exec failed'}",
+        )
     out: list[dict[str, Any]] = []
     for line in result.stdout.splitlines()[-tail:]:
         if 'upstream="-"' not in line and "status=200" in line:
@@ -263,4 +298,13 @@ def denied_names(project: str, *, tail: int = 500) -> list[dict[str, Any]]:
         sni = fields.get("sni", "")
         if sni and sni != "-" and fields.get("upstream", "-") in ("-", "", DENY_SENTINEL):
             out.append({"sni": sni, "client": fields.get("client", ""), "raw": line})
-    return out
+    return DenialLog(True, "", tuple(out))
+
+
+def denied_names(project: str, *, tail: int = 500) -> list[dict[str, Any]]:
+    """Just the refusals, for callers that cannot act on a read failure.
+
+    This collapses "unreadable" back into "empty", so anything that *reports* to
+    an operator wants `read_denials` instead.
+    """
+    return list(read_denials(project, tail=tail).entries)

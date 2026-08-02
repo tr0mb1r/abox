@@ -302,7 +302,12 @@ def custom_to_catalog(custom: CustomServers) -> dict[str, CatalogServer]:
             description=server.description or "custom server",
             image=server.image,
             tools=() if server.all_tools else tuple(server.tools),
-            secrets=tuple(server.secrets),
+            # `CustomServer.secrets` holds ServerSecret models; this field holds
+            # *names*. Passing the models through meant every consumer of
+            # `secrets_for` — doctor's missing-secret list, `abox mcp ls`, the
+            # init picker's getpass prompt — compared a model against a string
+            # and then tried to join it into a message.
+            secrets=tuple(s.name for s in server.secrets),
             source="custom",
             local_image=not server.pin,
         )
@@ -320,6 +325,11 @@ def load(
         oci, oci_warnings = load_oci_catalog()
         servers, warnings, cross_file = oci, [*warnings, *oci_warnings], {}
     custom = custom if custom is not None else CustomServers.load()
+    for name, why in sorted(getattr(custom, "rejected", {}).items()):
+        # Dropped by CustomServers.load rather than raised, so one bad entry in
+        # a global file cannot break every project on the host. Naming it here
+        # is what keeps "dropped" from meaning "silently gone".
+        warnings.append(f"custom server {name!r} was skipped — {why}")
     overlay = custom_to_catalog(custom)
     shadowed = sorted(set(overlay) & set(servers))
     for name in shadowed:

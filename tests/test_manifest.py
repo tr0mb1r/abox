@@ -20,6 +20,7 @@ from abox.manifest import (
     SecretMapping,
     SecretsConfig,
     SecretSource,
+    effective_allowlist,
     merged_egress,
     merged_masks,
 )
@@ -166,7 +167,57 @@ def test_merged_egress_injects_the_mandatory_entries(
     assert "api.anthropic.com" in merged_egress(manifest, config)
 
 
+def test_connectors_widen_the_allowlist_everywhere_not_just_at_render(
+    manifest: Manifest, config: GlobalConfig
+) -> None:
+    """`run.connectors` is an egress decision. Only `render` used to add the
+    connector host, so the enforced allowlist was one domain wider than every
+    path that reports it — and the review queue flagged an allowed host on
+    every run."""
+    assert "mcp-proxy.anthropic.com" not in merged_egress(manifest, config)
+    assert "mcp-proxy.anthropic.com" not in effective_allowlist(manifest, config)
+    manifest.run.connectors = True
+    assert "mcp-proxy.anthropic.com" in merged_egress(manifest, config)
+    assert "mcp-proxy.anthropic.com" in effective_allowlist(manifest, config)
+
+
 # -- custom servers -------------------------------------------------------
+
+
+def test_an_empty_tools_filter_is_refused_not_read_as_everything() -> None:
+    """`tools: {github: []}` reads as "expose nothing" and meant "expose
+    everything": the flattened filter is empty, so no `--tools=` argument is
+    emitted and the gateway publishes the server's whole surface — while doctor
+    still advises narrowing with `tools:`."""
+    with pytest.raises(ConfigError, match="empty tools filter"):
+        Manifest.parse_yaml(
+            "project: a\nprofile: b\nservers: [github]\ntools:\n  github: []\n"
+        )
+
+
+def test_a_real_tools_filter_still_narrows() -> None:
+    """The positive path: a named filter reaches the gateway argument that
+    enforces it, so the rule above rejects the ambiguous spelling only."""
+    m = Manifest.parse_yaml(
+        "project: a\nprofile: b\nservers: [github]\ntools:\n  github: [list_issues]\n"
+    )
+    assert m.tools == {"github": ["list_issues"]}
+
+
+def test_custom_server_tools_may_not_be_empty() -> None:
+    """Same trap in custom-servers.yaml: `all_tools` treated [] as ['*'], so the
+    catalog entry carried no `tools` key and the server was not narrowed."""
+    with pytest.raises(ValueError, match="tools must not be empty"):
+        CustomServer(image="ghcr.io/me/x@sha256:" + "a" * 64, tools=[])
+
+
+def test_custom_server_tools_narrowing_reaches_the_catalog_entry() -> None:
+    server = CustomServer(image="ghcr.io/me/x@sha256:" + "a" * 64, tools=["only_this"])
+    assert not server.all_tools
+    assert server.catalog_entry("x")["tools"] == [{"name": "only_this"}]
+    wide = CustomServer(image="ghcr.io/me/x@sha256:" + "a" * 64)
+    assert wide.all_tools
+    assert "tools" not in wide.catalog_entry("x")
 
 
 def test_custom_server_requires_a_digest() -> None:
@@ -289,6 +340,68 @@ def test_a_domain_cannot_be_both_allowed_and_ignored() -> None:
         )
 
 
+def test_a_mandatory_domain_is_dropped_from_ignored_on_load() -> None:
+    """`abox egress ignore claude.ai` recorded a denial and said "still blocked"
+    for a host `merged_egress` unions in unconditionally: the firewall kept
+    routing to it and the review queue stopped mentioning it.
+
+    Dropped on load rather than rejected. Refusing the *file* bricks a manifest
+    an older abox wrote — every command fails, including `abox egress unignore`,
+    which is the documented repair. The entry is a no-op either way, so removing
+    it keeps the invariant without stranding anyone; the refusal lives in
+    `abox egress ignore`, where the decision is actually made.
+    """
+    m = Manifest.parse_yaml("project: a\nprofile: b\negress_ignored: [claude.ai, evil.example]\n")
+    assert m.egress_ignored == ["evil.example"]
+
+
+def test_a_connector_domain_is_dropped_too_when_connectors_are_on() -> None:
+    """merged_egress unions CONNECTOR_EGRESS on exactly the same unconditional
+    terms, so ignoring one was the same contradiction one line lower."""
+    on = Manifest.parse_yaml(
+        "project: a\nprofile: b\nrun:\n  connectors: true\n"
+        "egress_ignored: [mcp-proxy.anthropic.com]\n"
+    )
+    assert on.egress_ignored == []
+    # With connectors off it is genuinely not allowed, so ignoring it is a real
+    # decision and must survive.
+    off = Manifest.parse_yaml(
+        "project: a\nprofile: b\negress_ignored: [mcp-proxy.anthropic.com]\n"
+    )
+    assert off.egress_ignored == ["mcp-proxy.anthropic.com"]
+
+
+def test_ignoring_an_ordinary_domain_still_works(config: GlobalConfig) -> None:
+    """The positive path through the same rule — a check that rejected every
+    ignore would only move the lie somewhere else."""
+    m = Manifest.parse_yaml("project: a\nprofile: b\negress_ignored: [evil.example]\n")
+    assert m.egress_ignored == ["evil.example"]
+    assert "evil.example" not in merged_egress(m, config)
+
+
 def test_ignored_domains_are_validated_like_egress() -> None:
     with pytest.raises(ConfigError):
         Manifest.parse_yaml("project: a\nprofile: b\negress_ignored: ['https://x.com']\n")
+
+
+def test_one_bad_custom_server_does_not_break_every_project(tmp_path, monkeypatch) -> None:
+    """custom-servers.yaml is global and loaded by nearly every command, so
+    raising on a single invalid entry takes down projects that never mention it.
+    The entry is dropped and named instead — the same treatment a catalog file
+    that will not parse already gets."""
+    from abox import paths as paths_mod
+    from abox.manifest import CustomServers
+
+    path = paths_mod.custom_servers_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "good:\n  image: r/i@sha256:" + "a" * 64 + "\n"
+        "stale:\n  image: r/j@sha256:" + "b" * 64 + "\n  tools: []\n",
+        encoding="utf-8",
+    )
+
+    custom = CustomServers.load()  # must not raise
+    assert "good" in custom.servers
+    assert "stale" not in custom.servers
+    assert "stale" in custom.rejected
+    assert "tools" in custom.rejected["stale"]
