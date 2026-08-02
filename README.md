@@ -73,6 +73,7 @@ instead, deliberately.
 | The agent's runspec mounts no Docker socket | no `docker.sock` bind in the rendered argv | `agent.no-docker-sock`, `boundary.no-docker-sock` |
 | The agent publishes nothing | no `-p`/`--publish` in the argv; the gateway publishes nothing either | `agent.no-published-ports`, `gateway.no-published-ports` |
 | The agent is not privileged | no `--privileged` in the argv | `agent.not-privileged` |
+| The agent joins an isolated bridge | `--network` in the rendered argv names a user-defined network, never `host`/`none`/`bridge`/`container:` — abox execs the firewall as root, so a shared namespace would land those rules outside the sandbox | `agent.network-isolated`, `boundary.network` |
 | Default-deny egress | in-container iptables + ipset, applied as root by abox; the script asserts its own rules and leaves a marker `abox run` reads back — no marker, no agent | `boundary.capabilities`, `boundary.firewall-script` |
 | Domain-level egress (optional) | SNI-aware proxy decides by the TLS server name, so a shared CDN address grants nothing | `egress.proxy` |
 | Exactly one MCP endpoint | `claude --mcp-config /opt/abox/mcp.json --strict-mcp-config`, bearer-authenticated | `agent.single-mcp-endpoint` |

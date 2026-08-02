@@ -26,6 +26,7 @@ from .catalog import Catalog
 from .errors import AboxError
 from .manifest import (
     BASE_MANDATORY_EGRESS,
+    RESERVED_NETWORK_MODES,
     CustomServers,
     GlobalConfig,
     Manifest,
@@ -1322,6 +1323,38 @@ def check_egress_queue(
 # -- agent hygiene --------------------------------------------------------
 
 
+def _agent_network_check(run_args: list[str]) -> Check:
+    """The agent must join an isolated bridge, not a namespace someone else owns.
+
+    Asserted against the rendered argv. The equivalent boundary check used to
+    compare the config to a runspec rendered from that same config, which can
+    only catch a stale runspec — and passed happily for ``--network host``,
+    where the firewall abox execs as root rewrites the operator's own rules.
+    """
+    network = render.flag_value(run_args, "--network")
+    if not network:
+        return Check(
+            id="agent.network-isolated",
+            title="agent joins an isolated network",
+            status=Status.fail,
+            detail="the runspec sets no --network, so the agent joins the default bridge",
+            hint="re-run `abox up` to re-render the runspec",
+        )
+    reserved = network in RESERVED_NETWORK_MODES or network.startswith("container:")
+    return Check(
+        id="agent.network-isolated",
+        title="agent joins an isolated network",
+        status=Status.fail if reserved else Status.ok,
+        detail=f"--network {network}",
+        hint=(
+            "a shared namespace puts the firewall abox execs as root outside the "
+            "sandbox — set `network` in config.yaml to a user-defined bridge"
+            if reserved
+            else ""
+        ),
+    )
+
+
 def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> list[Check]:
     rendered = render.inspect_rendered(workspace)
     if not rendered:
@@ -1351,6 +1384,7 @@ def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> li
             status=Status.fail if privileged else Status.ok,
             detail=", ".join(privileged) if privileged else "no privileged flag",
         ),
+        _agent_network_check(run_args),
         _mcp_endpoint_check(manifest),
         check_interactive_claude(workspace),
         check_token_not_world_readable(workspace),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from abox import dockerx, doctor, gateway, paths, render, runner
@@ -125,6 +126,13 @@ def _boundary(manifest, config, workspace, name: str):
     return next(c for c in runner.boundary_checks(manifest, config, workspace) if c.name == name)
 
 
+def _retamper_runspec(workspace, mutate) -> None:
+    """Rewrite the rendered run_args — the tampering the boundary gate exists for."""
+    _mutate_runspec(
+        workspace, lambda spec: spec.update(run_args=mutate([str(a) for a in spec["run_args"]]))
+    )
+
+
 def test_artifacts_private_goes_red_through_boundary_checks(manifest, config, rendered) -> None:
     """The check must fail *through its caller*, not only when called directly.
 
@@ -139,6 +147,38 @@ def test_artifacts_private_goes_red_through_boundary_checks(manifest, config, re
 
     assert not _boundary(manifest, config, rendered, "artifacts-private").ok
     assert d.stat().st_mode & 0o022, "boundary_checks repaired the mode it was asked to detect"
+
+
+def test_network_boundary_goes_red_on_a_shared_namespace(manifest, config, rendered) -> None:
+    """`--network host` used to pass: the check compared config.network against a
+    runspec rendered from that same value, so it could only catch a stale file.
+    On the host namespace the firewall abox execs as root rewrites the
+    operator's own netfilter rules."""
+    _retamper_runspec(
+        rendered, lambda a: ["host" if x == config.network else x for x in a]
+    )
+    check = _boundary(manifest, config, rendered, "network")
+    assert not check.ok
+    assert "host" in check.detail
+
+
+def test_reserved_network_modes_are_refused_by_the_config(config) -> None:
+    for mode in ("host", "none", "bridge", "container:victim"):
+        with pytest.raises(pydantic.ValidationError):
+            GlobalConfig(network=mode)
+    assert GlobalConfig(network="abox-net").network == "abox-net"
+
+
+def test_doctor_agent_network_goes_red_on_a_shared_namespace(manifest, rendered) -> None:
+    """The doctor twin of the boundary check, read from the same argv."""
+    _retamper_runspec(rendered, lambda a: ["host" if x == "abox-net" else x for x in a])
+    checks = {c.id: c for c in doctor.check_agent_hygiene(rendered, manifest)}
+    assert checks["agent.network-isolated"].status is doctor.Status.fail
+
+
+def test_doctor_agent_hygiene_is_green_on_a_clean_render(manifest, rendered) -> None:
+    checks = {c.id: c for c in doctor.check_agent_hygiene(rendered, manifest)}
+    assert checks["agent.network-isolated"].status is doctor.Status.ok
 
 
 def test_firewall_marker_gates_the_run(runner_fake) -> None:

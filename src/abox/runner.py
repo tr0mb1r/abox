@@ -26,7 +26,14 @@ from typing import Any
 from . import dockerx, gateway, paths, render, shell, telemetry
 from .catalog import Catalog
 from .errors import AboxError, BoundaryError, HostToolError
-from .manifest import GlobalConfig, Manifest, PermissionMode, effective_allowlist
+from .manifest import (
+    RESERVED_NETWORK_MODES,
+    GlobalConfig,
+    Manifest,
+    PermissionMode,
+    effective_allowlist,
+)
+from .render import flag_value
 
 FIREWALL_MARKER = "firewall-ok"
 BUILD_TIMEOUT = 3600
@@ -95,7 +102,8 @@ def boundary_checks(
         checks.append(BoundaryCheck("artifacts", False, "no rendered runspec"))
         return checks
 
-    run_args = " ".join(rendered.get("run_args") or [])
+    argv = [str(a) for a in (rendered.get("run_args") or [])]
+    run_args = " ".join(argv)
     checks.append(
         BoundaryCheck(
             "capabilities",
@@ -103,11 +111,25 @@ def boundary_checks(
             "NET_ADMIN and NET_RAW are required for the firewall",
         )
     )
+
+    # Read the value out of the rendered argv and assert a *property* of it. The
+    # check used to be `config.network in run_args`, where run_args had just been
+    # rendered from config.network — a tautology that could only fail on a stale
+    # runspec, which artifacts-current already covers. It therefore said nothing
+    # about the one thing worth saying: that the agent joins an isolated bridge
+    # rather than a namespace someone else owns. `--network host` passed it,
+    # while NET_ADMIN plus a root firewall exec in the host namespace means abox
+    # rewrites the operator's own netfilter rules.
+    rendered_network = flag_value(argv, "--network")
+    reserved = rendered_network in RESERVED_NETWORK_MODES or rendered_network.startswith(
+        "container:"
+    )
     checks.append(
         BoundaryCheck(
             "network",
-            config.network in run_args,
-            f"agent must join {config.network}",
+            bool(rendered_network) and rendered_network == config.network and not reserved,
+            f"agent must join the isolated bridge {config.network!r}"
+            + (f", not the shared namespace {rendered_network!r}" if reserved else ""),
         )
     )
 

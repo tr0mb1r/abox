@@ -107,6 +107,24 @@ def ensure_artifacts_dir(workspace: Path) -> Path:
     return d
 
 
+def flag_value(argv: Iterable[str], flag: str) -> str:
+    """The value of ``flag`` in a rendered argv, or "" if it is not there.
+
+    Accepts both spellings Docker does — ``--network abox-net`` and
+    ``--network=abox-net``. Checks that want to assert something about what abox
+    will actually run have to read it out of the runspec; asserting against the
+    model instead is how a tautology gets written by accident.
+    """
+    args = [str(a) for a in argv]
+    prefix = f"{flag}="
+    for index, arg in enumerate(args):
+        if arg == flag:
+            return args[index + 1] if index + 1 < len(args) else ""
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+    return ""
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 

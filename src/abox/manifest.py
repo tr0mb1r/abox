@@ -32,6 +32,16 @@ MANIFEST_VERSION = 1
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 #: MCP server names come from the Docker catalog, which is not all-lowercase.
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: Docker's own network modes. Each one turns `--network` from "join this
+#: isolated bridge" into "share a namespace someone else owns". `host` is the
+#: dangerous one: abox execs `init-firewall.sh` as root with NET_ADMIN, so on
+#: the host network that script rewrites the *operator's* netfilter rules and
+#: the agent reaches every service on host loopback. `bridge` is the default
+#: bridge, which has no embedded DNS aliasing, so the gateway is unreachable by
+#: name; `none` leaves the agent with no network at all; `container:` borrows
+#: another container's stack.
+RESERVED_NETWORK_MODES = frozenset({"host", "none", "bridge", "default"})
+
 _HOST_LABEL = r"[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
 _HOST_RE = re.compile(rf"^{_HOST_LABEL}(\.{_HOST_LABEL})+$")
 _DIGEST_RE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
@@ -143,6 +153,17 @@ def _check_name(value: str, what: str) -> str:
             f"{what} must match {_NAME_RE.pattern} (lowercase, digits, dot, dash, underscore)"
         )
     return value
+
+
+def _check_network(value: str) -> str:
+    lowered = value.strip().lower()
+    if lowered in RESERVED_NETWORK_MODES or lowered.startswith("container:"):
+        raise ValueError(
+            f"network must be a user-defined bridge, not the reserved mode {value!r} — "
+            "abox execs the firewall as root with NET_ADMIN, so a shared namespace "
+            "means those rules land outside the sandbox"
+        )
+    return _check_name(value, "network name")
 
 
 def _check_server_name(value: str, what: str = "server name") -> str:
@@ -648,7 +669,7 @@ class GlobalConfig(StrictModel):
     @field_validator("network")
     @classmethod
     def _validate_network(cls, value: str) -> str:
-        return _check_name(value, "network name")
+        return _check_network(value)
 
     @model_validator(mode="after")
     def _profiles_have_unique_ports(self) -> Self:

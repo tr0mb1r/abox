@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from abox import gateway, paths, render
-from abox.manifest import GlobalConfig, Manifest
+from abox.manifest import RESERVED_NETWORK_MODES, GlobalConfig, Manifest
 
 
 @pytest.fixture
@@ -46,6 +46,10 @@ def test_rendered_runspec_holds_the_invariants(manifest, config, workspace, spec
     assert "privileged" not in joined
     assert "docker.sock" not in joined
     assert not any(a in ("-p", "--publish") or a.startswith("--publish=") for a in run_args)
+    # Literals, not `config.remote_user` / `config.network`. Comparing the
+    # rendered argv against the value that produced it is a tautology: it passed
+    # just as happily for `--user root` and `--network host`.
+    assert render.flag_value(run_args, "--network") not in RESERVED_NETWORK_MODES
 
 
 def test_masks_cover_glob_matches_and_literals(manifest, config, workspace, spec) -> None:
