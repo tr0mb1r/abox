@@ -9,6 +9,7 @@ it is selected.
 from __future__ import annotations
 
 import configparser
+import re
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from .manifest import (
     Manifest,
     ProfileConfig,
     _check_host,
+    _check_name,
 )
 
 #: Registries each toolchain needs to fetch dependencies.
@@ -220,9 +222,17 @@ class InitDraft:
     project: str
     profile: str
     servers: list[str] = field(default_factory=list)
+    #: Remote MCP servers the manifest declares. The picker never offers them —
+    #: they are not in the catalog it reads — but it has to know they exist, or
+    #: it prunes their narrowing as though they had been unticked.
+    remote_servers: list[str] = field(default_factory=list)
     tools: dict[str, list[str]] = field(default_factory=dict)
     toolchains: list[str] = field(default_factory=list)
     egress: list[str] = field(default_factory=list)
+    #: Hosts the operator already decided *not* to allow (`abox egress ignore`).
+    #: A manifest may not list a host in both, so re-suggesting one of these
+    #: pre-ticked made `init` die at Save with every answer already given.
+    egress_ignored: list[str] = field(default_factory=list)
     mask: list[str] = field(default_factory=list)
     context: list[str] = field(default_factory=list)
     permission_mode: str = "default"
@@ -273,21 +283,28 @@ def seed_draft(
     """
     found = list(detected if detected is not None else detect_toolchains(workspace))
     toolchains = list(existing.toolchains) if existing else found
+    ignored = list(existing.egress_ignored) if existing else []
     return InitDraft(
         project=project,
         profile=profile or (existing.profile if existing else next(iter(config.profiles))),
         servers=list(servers or (existing.servers if existing else [])),
+        remote_servers=list(existing.remote_servers) if existing else [],
         tools=dict(existing.tools) if existing else {},
         toolchains=toolchains,
-        egress=list(
-            dict.fromkeys(
+        # A host the operator ignored must not come back pre-ticked — see
+        # ``InitDraft.egress_ignored``.
+        egress=[
+            host
+            for host in dict.fromkeys(
                 [
                     *(existing.egress if existing else []),
                     *suggest_egress(toolchains, workspace),
                     *BASE_MANDATORY_EGRESS,
                 ]
             )
-        ),
+            if host not in ignored
+        ],
+        egress_ignored=ignored,
         mask=list(existing.mounts.mask) if existing else [],
         context=list(existing.mounts.context) if existing else [],
         permission_mode=existing.run.permission_mode.value if existing else "default",
@@ -341,6 +358,21 @@ def _server_choice(server: CatalogServer, *, checked: bool) -> questionary.Choic
     )
 
 
+def _absent_choice(name: str) -> questionary.Choice:
+    """A declared server this run's catalog does not carry.
+
+    Rendered *checked*, because the catalog is not always the same catalog: a
+    custom-servers.yaml that failed to parse, or a Docker Desktop that has not
+    materialised the local catalog, must not turn "abox cannot see it" into
+    "the operator unticked it". Dropping a declaration has to be a keystroke.
+    """
+    return questionary.Choice(
+        title=f"{name:<28} (not in the current catalog — kept from your manifest)",
+        value=name,
+        checked=True,
+    )
+
+
 def _server_choices(catalog: Catalog, preselected: Sequence[str]) -> list[questionary.Choice]:
     """Grouped, so a first-time reader is not handed 200 undifferentiated rows.
 
@@ -348,13 +380,15 @@ def _server_choices(catalog: Catalog, preselected: Sequence[str]) -> list[questi
     which files ``SQLite`` before ``duckduckgo`` and reads as a bug.
     """
     chosen = [catalog.require(n) for n in catalog.names() if n in preselected]
+    absent = sorted((n for n in preselected if n not in catalog), key=str.lower)
     rest = [catalog.require(n) for n in catalog.names() if n not in preselected]
 
     choices: list[questionary.Choice] = []
-    if chosen:
+    if chosen or absent:
         choices.append(questionary.Separator("── already in this project ──"))
         for server in sorted(chosen, key=lambda s: s.name.lower()):
             choices.append(_server_choice(server, checked=True))
+        choices.extend(_absent_choice(name) for name in absent)
 
     # Custom servers last: they are the operator's own, so they need no
     # introduction, and burying them keeps the catalog's own entries on top.
@@ -410,6 +444,24 @@ def pick_tools(
     )
     if not narrow:
         return {}
+    # A server whose tools this catalog cannot enumerate gets no checkbox — a
+    # custom entry with `all_tools`, a remote server, an entry the catalog has
+    # stopped carrying. Rebuilding `out` from the checkboxes alone therefore
+    # *deleted* their narrowing without asking, and the agent silently gained
+    # every tool they offer. Carry those filters forward and name them.
+    kept = [
+        name
+        for name in servers
+        if existing.get(name) and not (catalog.get(name) or _NO_SERVER).tools
+    ]
+    for name in kept:
+        out[name] = list(existing[name])
+    if kept:
+        questionary.print(
+            f"  keeping the tool filter for {', '.join(kept)} — this catalog does "
+            "not list their tools, so there is nothing to re-tick",
+            style="fg:ansibrightblack",
+        )
     for name in servers:
         server = catalog.get(name)
         if not server or not server.tools:
@@ -429,6 +481,24 @@ def pick_tools(
         if selected and len(selected) < len(server.tools):
             out[name] = list(selected)
     return out
+
+
+def _validate_profile_name(text: str) -> bool | str:
+    """``GlobalConfig``'s own rule, at the prompt rather than after the flow.
+
+    An invented name reaches both ``Manifest.profile`` and, once the manifest is
+    written, ``config.yaml`` — where nothing re-validates it. 'My Profile' cost
+    the operator every answer at Save, and the config that came back could not be
+    loaded again without hand-editing the YAML.
+    """
+    value = text.strip()
+    if not value:
+        return True  # blank is how you back out of inventing one
+    try:
+        _check_name(value, "profile name")
+    except ValueError as exc:
+        return str(exc)
+    return True
 
 
 def pick_profile(
@@ -468,9 +538,14 @@ def pick_profile(
     if picked != "__new__":
         return picked
 
-    name = questionary.text("new profile name:").ask()
+    name = ask_text("new profile name:", validate=_validate_profile_name).strip()
     if not name:
         raise AboxError("cancelled")
+    if name in config.profiles:
+        # Naming a profile that already exists is a *selection*, not a creation:
+        # allocating it a fresh port below would move the gateway for every
+        # project already on it, starting with the render this run performs.
+        return name
     used = {p.port for p in config.profiles.values()}
     port = 8811
     while port in used:
@@ -509,21 +584,59 @@ def _validate_egress_input(text: str) -> bool | str:
     return True
 
 
+def _ignored_egress_validator(ignored: Sequence[str]) -> Callable[[str], bool | str]:
+    """Refuse at the prompt a host the manifest would refuse at Save.
+
+    ``egress`` and ``egress_ignored`` may not both name a host, and the picker
+    cannot edit ``egress_ignored`` — so typing one here would only surface as a
+    validation failure after the whole review screen had been answered.
+    """
+    ignored_set = {host.strip().lower() for host in ignored}
+
+    def _validate(text: str) -> bool | str:
+        verdict = _validate_egress_input(text)
+        if verdict is not True:
+            return verdict
+        for token in text.replace(",", " ").split():
+            if token.strip().lower() in ignored_set:
+                return (
+                    f"{token!r} is on this project's ignore list — "
+                    f"run `abox egress unignore {token}` first"
+                )
+        return True
+
+    return _validate
+
+
 def pick_egress(
-    suggested: Sequence[str], existing: Sequence[str] = (), *, always_on: Sequence[str] = ()
+    suggested: Sequence[str],
+    existing: Sequence[str] = (),
+    *,
+    always_on: Sequence[str] = (),
+    ignored: Sequence[str] = (),
 ) -> list[str]:
     """Choose the outbound allowlist.
 
     ``always_on`` hosts are kept out of the checkbox and appended to the result:
     offering a tickbox for something that cannot be turned off is a lie, and
     ``BASE_MANDATORY_EGRESS`` is re-added unconditionally at merge time anyway.
+
+    ``ignored`` hosts are kept out of the offer entirely — see
+    ``InitDraft.egress_ignored``.
     """
     require_interactive("choosing egress")
-    pinned = list(dict.fromkeys(always_on))
+    ignored_set = {host.strip().lower() for host in ignored}
+    pinned = [host for host in dict.fromkeys(always_on) if host not in ignored_set]
     merged: list[str] = []
     for host in (*existing, *suggested):
-        if host not in merged and host not in pinned:
+        if host not in merged and host not in pinned and host not in ignored_set:
             merged.append(host)
+    if ignored_set:
+        questionary.print(
+            f"  not offered — you ignored {', '.join(sorted(ignored_set))} for this "
+            "project (`abox egress unignore` puts them back in play)",
+            style="fg:ansibrightblack",
+        )
 
     if pinned:
         questionary.print(
@@ -544,12 +657,38 @@ def pick_egress(
         )
     extra = ask_text(
         "additional domains (space or comma separated, blank to skip):",
-        validate=_validate_egress_input,
+        validate=(
+            _ignored_egress_validator(ignored) if ignored_set else _validate_egress_input
+        ),
     )
     for token in extra.replace(",", " ").split():
-        if token not in out and token not in pinned:
+        if token not in out and token not in pinned and token.lower() not in ignored_set:
             out.append(token)
     return [*out, *pinned]
+
+
+def _split_on_spaces(values: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split entries into the ones one space-separated line can carry, and the rest.
+
+    Both ``MountsConfig.mask`` and ``MountsConfig.context`` accept a space, but
+    the prompt joins on one and splits on one: a mask like ``client docs/*.pem``
+    came back as two globs that shadow nothing, and a context dir with a space
+    made the prompt's own validator reject its pre-filled default, so there was
+    no way to submit the row at all. Entries that cannot survive the round trip
+    are carried through untouched instead of being mangled or dropped.
+    """
+    editable = [v for v in values if not any(ch.isspace() for ch in v)]
+    kept = [v for v in values if any(ch.isspace() for ch in v)]
+    return editable, kept
+
+
+def _announce_kept(kept: Sequence[str], what: str) -> None:
+    if kept:
+        questionary.print(
+            f"  kept as-is: {', '.join(repr(k) for k in kept)} — a {what} with a "
+            "space in it cannot be edited on one line",
+            style="fg:ansibrightblack",
+        )
 
 
 def _validate_mask_input(text: str) -> bool | str:
@@ -575,12 +714,14 @@ def pick_masks(defaults: Sequence[str] = (), existing: Sequence[str] = ()) -> li
             f"  already masked everywhere: {', '.join(defaults)}",
             style="fg:ansibrightblack",
         )
+    editable, kept = _split_on_spaces(existing)
+    _announce_kept(kept, "glob")
     answer = ask_text(
         "Extra paths to hide from the agent (workspace-relative globs, blank for none):",
-        default=" ".join(existing),
+        default=" ".join(editable),
         validate=_validate_mask_input,
     )
-    return [token for token in answer.split() if token]
+    return [*(token for token in answer.split() if token), *kept]
 
 
 def pick_permission_mode(default: str = "default") -> str:
@@ -621,15 +762,31 @@ def _validate_context_input(text: str) -> bool | str:
 
 def pick_context_dirs(existing: Sequence[str] = ()) -> list[str]:
     require_interactive("choosing context dirs")
+    editable, kept = _split_on_spaces(existing)
+    _announce_kept(kept, "path")
     answer = ask_text(
         "Read-only context dirs to mount under /context (space separated, blank for none):",
-        default=" ".join(existing),
+        default=" ".join(editable),
         validate=_validate_context_input,
     )
-    return [token for token in answer.split() if token]
+    return [*(token for token in answer.split() if token), *kept]
 
 
 # -- secrets ---------------------------------------------------------------
+
+
+#: What ``SecretMapping`` accepts when the same name arrives via secrets.yaml
+#: (manifest.py). The catalog is the one path that reaches ``docker mcp secret
+#: set <name>`` without passing through that model, and a catalog entry is not
+#: the operator's own text: a leading '-' is read as a flag by the docker CLI,
+#: and an escape sequence in the getpass label can rewrite what the operator
+#: believes they are typing a credential for.
+_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _usable_secret_names(names: Sequence[str]) -> tuple[list[str], list[str]]:
+    ok = [name for name in names if _SECRET_NAME_RE.match(name)]
+    return ok, [name for name in names if not _SECRET_NAME_RE.match(name)]
 
 
 def offer_secrets(draft: InitDraft, ctx: InitContext) -> None:
@@ -645,7 +802,14 @@ def offer_secrets(draft: InitDraft, ctx: InitContext) -> None:
     stopped daemon.
     """
     require_interactive("setting secrets")
-    needed = ctx.catalog.secrets_for(draft.servers)
+    needed, refused = _usable_secret_names(ctx.catalog.secrets_for(draft.servers))
+    for name in refused:
+        # !r, never raw: the point of refusing the name is that printing it is
+        # itself the attack.
+        questionary.print(
+            f"  ✖ ignoring a secret name the catalog spells unsafely: {name!r}",
+            style="fg:ansired",
+        )
     if not needed:
         return
     # `needed` counts credentials, not servers — one server can declare several,
@@ -730,7 +894,9 @@ def _tools_value(draft: InitDraft, ctx: InitContext) -> str:
 
 def _secrets_value(draft: InitDraft, ctx: InitContext) -> str:
     """Counted from the catalog only — drawing a row must never touch Docker."""
-    needed = ctx.catalog.secrets_for(draft.servers)
+    # Same filter as ``offer_secrets``: a name the flow refuses to set must not
+    # be counted here as though it could be, nor rendered raw into the screen.
+    needed, _refused = _usable_secret_names(ctx.catalog.secrets_for(draft.servers))
     if not needed:
         return "(none needed)"
     stored = [n for n in needed if n in draft.stored_secrets]
@@ -754,6 +920,16 @@ def _server_network_value(draft: InitDraft, ctx: InitContext) -> str:
     if not cut:
         return f"all {len(draft.servers)} on the gateway network (outside the firewall)"
     return f"{_summarise(cut, empty='', limit=2)} cut off"
+
+
+def _servers_value(draft: InitDraft, ctx: InitContext) -> str:
+    text = _summarise(draft.servers, empty="(none — the agent gets no MCP tools)")
+    if draft.remote_servers:
+        # The picker cannot offer these — they are declared in the manifest, not
+        # in the catalog — but the agent reaches them all the same, so the screen
+        # that claims to show the MCP surface has to admit they are there.
+        text += f"  +{len(draft.remote_servers)} remote"
+    return text
 
 
 def _profile_value(draft: InitDraft, ctx: InitContext) -> str:
@@ -784,13 +960,36 @@ def _edit_profile(draft: InitDraft, ctx: InitContext) -> None:
 def _edit_servers(draft: InitDraft, ctx: InitContext) -> None:
     draft.servers = pick_servers(ctx.catalog, draft.servers)
     # Drop narrowing for servers that are no longer declared, or the manifest
-    # fails validation on a `tools` key with no matching server.
-    draft.tools = {k: v for k, v in draft.tools.items() if k in draft.servers}
-    offer_secrets(draft, ctx)
+    # fails validation on a `tools` key with no matching server. Remote servers
+    # count as declared: the picker never offers them, so pruning against the
+    # ticked list alone deleted their filter for merely opening this row.
+    declared = {*draft.servers, *draft.remote_servers}
+    draft.tools = {k: v for k, v in draft.tools.items() if k in declared}
+    # Same for `network: none` — left stale, the review screen went on reporting
+    # an unticked server as cut off while the ones actually declared sat on the
+    # gateway network, and only the write corrected it.
+    draft.server_network = {
+        k: v for k, v in draft.server_network.items() if k in draft.servers
+    }
+    try:
+        offer_secrets(draft, ctx)
+    except AboxError as exc:
+        # The selection above is already applied, so letting a cancel out of here
+        # would have the review screen report this row 'unchanged' when it was
+        # not. Cancelling the credential question costs the credential only.
+        _report(exc)
+        questionary.print(
+            "  credentials unchanged — `abox secrets set <name>` when you are ready",
+            style="fg:ansibrightblack",
+        )
 
 
 def _edit_tools(draft: InitDraft, ctx: InitContext) -> None:
-    draft.tools = pick_tools(ctx.catalog, draft.servers, draft.tools)
+    # Remote servers keep their narrowing too, and the manifest declares them
+    # even though the catalog the picker reads cannot describe them.
+    draft.tools = pick_tools(
+        ctx.catalog, [*draft.servers, *draft.remote_servers], draft.tools
+    )
 
 
 def _edit_toolchains(draft: InitDraft, ctx: InitContext) -> None:
@@ -808,6 +1007,7 @@ def _edit_egress(draft: InitDraft, ctx: InitContext) -> None:
         suggest_egress(draft.toolchains, ctx.workspace),
         draft.egress,
         always_on=always,
+        ignored=draft.egress_ignored,
     )
 
 
@@ -935,7 +1135,7 @@ ROWS: tuple[Row, ...] = (
         "servers",
         "MCP servers",
         "the tools the agent can call — everything else it cannot reach",
-        lambda d, c: _summarise(d.servers, empty="(none — the agent gets no MCP tools)"),
+        _servers_value,
         _edit_servers,
     ),
     Row(
@@ -1091,6 +1291,13 @@ def choose_setup_mode(project: str, *, existing: bool = False) -> str:
     )
 
 
+#: Rows the Custom walk skips because the row before it already asked. The
+#: servers row ends in ``offer_secrets``, so walking straight into the secrets
+#: row put the identical credential question on screen twice in a row — and a
+#: yes to the second one shells out to `docker mcp secret ls` again.
+_ASKED_BY_ANOTHER_ROW = frozenset({"secrets"})
+
+
 def walk_all(draft: InitDraft, ctx: InitContext) -> None:
     """Ask every question once, then hand over to the review screen.
 
@@ -1098,6 +1305,8 @@ def walk_all(draft: InitDraft, ctx: InitContext) -> None:
     already given — the old flow threw away everything for one wrong keystroke.
     """
     for row in ROWS:
+        if row.key in _ASKED_BY_ANOTHER_ROW:
+            continue
         try:
             row.edit(draft, ctx)
         except AboxError as exc:

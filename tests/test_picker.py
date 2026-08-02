@@ -16,6 +16,7 @@ import pytest
 from abox import paths, picker
 from abox.catalog import Catalog, CatalogServer
 from abox.errors import AboxError
+from abox.manifest import Manifest, RemoteServer
 
 
 class FakePrompt:
@@ -817,3 +818,337 @@ def test_seed_draft_carries_the_new_settings_from_an_existing_manifest(
     assert draft.connectors is True
     assert draft.timeout == 120
     assert draft.server_network == {"duckduckgo": "none"}
+
+
+# -- narrowing that must survive the picker --------------------------------
+
+
+def test_narrowing_survives_a_server_the_catalog_cannot_enumerate(q) -> None:
+    """`tools:` is the only thing keeping the agent off the rest of a server's
+    surface. A catalog that lists no tools for a server (a custom entry with
+    `all_tools`, every remote entry) offers no checkbox to re-tick — rebuilding
+    the filter from the checkboxes alone deleted it without asking."""
+    q.answers["confirm"] = True
+    q.answers["checkbox"] = ["search"]
+    catalog = Catalog(
+        servers={
+            "duckduckgo": _catalog().servers["duckduckgo"],
+            "fetch": CatalogServer(name="fetch", image="mcp/fetch@sha256:" + "1" * 64),
+        }
+    )
+    out = picker.pick_tools(
+        catalog, ["duckduckgo", "fetch"], {"duckduckgo": ["search"], "fetch": ["fetch"]}
+    )
+    assert out == {"duckduckgo": ["search"], "fetch": ["fetch"]}
+
+
+def test_opening_the_servers_row_keeps_a_remote_servers_narrowing(q, config, tmp_path):
+    """`Manifest.tools` is validated against servers *and* remote_servers, so a
+    filter for a remote server is legal — and pruning against the ticked list
+    alone dropped it for merely opening the row."""
+    q.answers["checkbox"] = ["duckduckgo"]
+    draft = _draft(
+        servers=["duckduckgo"],
+        remote_servers=["notion"],
+        tools={"notion": ["search"], "duckduckgo": ["search"]},
+    )
+    picker._edit_servers(draft, _ctx(tmp_path, config))
+    assert draft.tools == {"notion": ["search"], "duckduckgo": ["search"]}
+
+
+def test_the_tools_row_keeps_a_remote_servers_narrowing(q, config, tmp_path) -> None:
+    q.answers["confirm"] = True
+    q.answers["checkbox"] = ["search"]
+    draft = _draft(
+        servers=["duckduckgo"],
+        remote_servers=["notion"],
+        tools={"notion": ["search"], "duckduckgo": ["search"]},
+    )
+    picker._edit_tools(draft, _ctx(tmp_path, config))
+    assert draft.tools["notion"] == ["search"]
+
+
+def test_seed_draft_carries_the_manifests_remote_servers(workspace, config, manifest) -> None:
+    manifest.remote_servers = {"notion": RemoteServer(url="https://mcp.notion.com/mcp")}
+    draft = picker.seed_draft(
+        project="demo", workspace=workspace, config=config, existing=manifest
+    )
+    assert draft.remote_servers == ["notion"]
+
+
+def test_the_servers_row_admits_the_remote_servers_it_cannot_offer(q, config, tmp_path):
+    row = next(r for r in picker.ROWS if r.key == "servers")
+    value = row.value(
+        _draft(servers=["duckduckgo"], remote_servers=["notion"]), _ctx(tmp_path, config)
+    )
+    assert "remote" in value
+
+
+def test_a_declared_server_missing_from_the_catalog_stays_ticked(q) -> None:
+    """A custom-servers.yaml that failed to parse must not read as 'the operator
+    unticked it': the declaration would be gone from the manifest, unwarned."""
+    q.answers["checkbox"] = []
+    picker.pick_servers(_catalog(), preselected=["duckduckgo", "my-custom"])
+    absent = [c for c in q.calls["checkbox"][0]["choices"] if c.value == "my-custom"]
+    assert absent, "a declared server the catalog lost was not rendered at all"
+    assert absent[0].checked
+    assert "not in the current catalog" in absent[0].title
+
+
+# -- egress the operator already ruled on ----------------------------------
+
+
+def test_an_ignored_host_is_not_re_suggested_and_the_manifest_still_validates(
+    workspace, config
+) -> None:
+    """`abox egress ignore storage.googleapis.com` in a Go project used to make
+    the next `abox init` die at Save — a host may not be in both lists — after
+    every answer had been given."""
+    existing = Manifest(
+        project="demo",
+        profile="dev",
+        toolchains=["go"],
+        egress=["github.com"],
+        egress_ignored=["storage.googleapis.com"],
+    )
+    draft = picker.seed_draft(
+        project="demo", workspace=workspace, config=config, existing=existing
+    )
+    assert "storage.googleapis.com" not in draft.egress
+    # The answers have to make a manifest — that is where the old flow died.
+    Manifest(
+        project="demo",
+        profile="dev",
+        egress=draft.egress,
+        egress_ignored=existing.egress_ignored,
+    )
+
+
+def test_the_egress_row_neither_offers_nor_accepts_an_ignored_host(q, config, tmp_path):
+    q.answers["checkbox"] = []
+    q.answers["text"] = ""
+    draft = _draft(toolchains=["go"], egress_ignored=["storage.googleapis.com"])
+    picker._edit_egress(draft, _ctx(tmp_path, config))
+    offered = [c.value for c in q.calls["checkbox"][0]["choices"]]
+    assert "storage.googleapis.com" not in offered
+    assert "storage.googleapis.com" not in draft.egress
+    validate = q.calls["text"][0]["validate"]
+    assert "unignore" in str(validate("storage.googleapis.com"))
+
+
+# -- values a one-line prompt cannot round-trip ----------------------------
+
+
+def test_a_mask_glob_with_a_space_is_not_split_into_two(q) -> None:
+    """`client docs/*.pem` came back as `client` and `docs/*.pem`, neither of
+    which shadows anything — the agent could read the PEMs at the next up."""
+    q.answers["text"] = "*.pem"
+    out = picker.pick_masks([], ["client docs/*.pem", "*.pem"])
+    assert "client docs/*.pem" in out
+    assert "client" not in out
+    assert "client docs" not in q.calls["text"][0]["default"]
+
+
+def test_a_context_dir_with_a_space_survives_and_its_default_validates(q, tmp_path):
+    """The split default failed the prompt's own validator, so the row could not
+    be submitted at all — not even by accepting the existing value."""
+    spaced = tmp_path / "My Notes"
+    spaced.mkdir()
+    q.answers["text"] = ""
+    assert picker.pick_context_dirs([str(spaced)]) == [str(spaced)]
+    call = q.calls["text"][0]
+    assert call["validate"](call["default"]) is True
+
+
+# -- the profile name that could brick every command -----------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "ok"),
+    [("research", True), ("My Profile", False), ("bad name!", False), ("", True)],
+)
+def test_profile_name_validation_follows_the_config_rule(name: str, ok: bool) -> None:
+    assert (picker._validate_profile_name(name) is True) is ok
+
+
+def test_the_new_profile_prompt_validates_the_name(q, config) -> None:
+    q.answers["select"] = "__new__"
+    q.answers["text"] = "research"
+    picker.pick_profile(config)
+    assert q.calls["text"][0]["validate"] is picker._validate_profile_name
+
+
+def test_naming_a_profile_that_already_exists_keeps_its_port(q, config) -> None:
+    """Allocating a fresh port for it would move the gateway for every project
+    already on that profile — starting with the render this run performs."""
+    q.answers["select"] = "__new__"
+    q.answers["text"] = "secops"
+    sink: dict[str, Any] = {}
+    assert picker.pick_profile(config, created=sink) == "secops"
+    assert config.profiles["secops"].port == 8812
+    assert sink == {}
+
+
+# -- marks the supply-chain story depends on -------------------------------
+
+
+def _mixed_catalog() -> Catalog:
+    return Catalog(
+        servers={
+            "floating": CatalogServer(
+                name="floating", description="A moving tag.", image="mcp/floating:latest"
+            ),
+            "mine": CatalogServer(
+                name="mine",
+                description="My own.",
+                image="local/mine@sha256:" + "a" * 64,
+                source="custom",
+            ),
+            "context7": CatalogServer(
+                name="context7",
+                description="Hosted docs.",
+                remote_url="https://mcp.context7.com/mcp",
+                kind="remote",
+            ),
+        }
+    )
+
+
+def test_an_unpinned_custom_or_remote_server_says_so_in_the_list(q) -> None:
+    """UNPINNED is the picker's only signal that an MCP image is not
+    digest-pinned, and nothing exercised it."""
+    q.answers["checkbox"] = []
+    picker.pick_servers(_mixed_catalog())
+    choices = q.calls["checkbox"][0]["choices"]
+    titles = [c.title for c in choices]
+    assert any(t.startswith("floating") and "UNPINNED" in t for t in titles)
+    assert any(t.startswith("context7") and "remote" in t for t in titles)
+    assert any(t.startswith("mine") and "custom" in t for t in titles)
+    headings = [c.title for c in choices if isinstance(c, picker.questionary.Separator)]
+    assert any("your own" in h for h in headings)
+
+
+def test_a_pinned_catalog_server_carries_no_unpinned_mark(q) -> None:
+    """The positive path through the same mark: it has to be able to say no."""
+    q.answers["checkbox"] = []
+    picker.pick_servers(_catalog())
+    titles = [c.title for c in q.calls["checkbox"][0]["choices"]]
+    assert not any("UNPINNED" in t for t in titles)
+
+
+# -- Ctrl-C on a confirm ---------------------------------------------------
+
+
+def test_ctrl_c_on_a_confirm_is_a_cancel_not_a_silent_no(q) -> None:
+    q.answers["confirm"] = None
+    with pytest.raises(AboxError, match="cancelled"):
+        picker.ask_confirm("narrow the tool set?")
+
+
+def test_pick_tools_does_not_read_a_cancel_as_do_not_narrow(q) -> None:
+    """Under the review screen, None-as-False meant Ctrl-C quietly answering the
+    question — and the answer it gave away every tool the servers offer."""
+    q.answers["confirm"] = None
+    with pytest.raises(AboxError, match="cancelled"):
+        picker.pick_tools(_catalog(), ["duckduckgo"], {"duckduckgo": ["search"]})
+
+
+def test_cancelling_the_credential_question_keeps_the_servers_just_picked(q, config, tmp_path):
+    """_edit_servers has already replaced draft.servers by the time offer_secrets
+    runs, so a cancel escaping it made the review screen report the row
+    'unchanged' when it had in fact changed."""
+    q.answers["checkbox"] = ["github-official"]
+    q.answers["confirm"] = None  # Ctrl-C at 'set them now?'
+    draft = _draft(servers=["duckduckgo"])
+    picker._edit_servers(draft, _ctx(tmp_path, config))
+    assert draft.servers == ["github-official"]
+
+
+# -- one question, once ----------------------------------------------------
+
+
+def test_the_custom_walk_asks_for_credentials_once(q, config, tmp_path) -> None:
+    """The servers row ends in offer_secrets and the secrets row *is*
+    offer_secrets, so Custom mode asked the same thing twice in a row — and a
+    yes to the second shells out to `docker mcp secret ls` again."""
+    q.answers["select"] = "dev"
+    q.answers["checkbox"] = ["github-official"]
+    q.answers["text"] = ""
+    q.answers["confirm"] = False
+    picker.walk_all(_draft(), _ctx(tmp_path, config))
+    asked = [c["message"] for c in q.calls["confirm"] if "credential" in c["message"]]
+    assert len(asked) == 1, asked
+
+
+# -- what the screen says and what gets written ----------------------------
+
+
+def test_unticking_a_server_clears_what_the_screen_says_about_its_network(q, config, tmp_path):
+    """The write filters `server_network` to declared servers; the screen did
+    not, so it reported a server as cut off while the declared ones were all on
+    the gateway network."""
+    q.answers["checkbox"] = ["duckduckgo"]
+    draft = _draft(
+        servers=["duckduckgo", "github-official"],
+        server_network={"github-official": "none"},
+    )
+    ctx = _ctx(tmp_path, config)
+    picker._edit_servers(draft, ctx)
+    assert draft.server_network == {}
+    row = next(r for r in picker.ROWS if r.key == "server_network")
+    assert "cut off" not in row.value(draft, ctx)
+
+
+# -- catalog strings are not the operator's own ----------------------------
+
+
+def _unsafe_secret_catalog() -> Catalog:
+    return Catalog(
+        servers={
+            "evil": CatalogServer(
+                name="evil",
+                description="Crafted catalog entry.",
+                image="mcp/evil@sha256:" + "f" * 64,
+                secrets=("--transparent\n\x1b[2Jgithub.personal_access_token",),
+            )
+        }
+    )
+
+
+def test_a_secret_name_the_catalog_spells_unsafely_never_reaches_docker(
+    q, config, tmp_path, monkeypatch
+) -> None:
+    """The name goes on `docker mcp secret set` argv and onto the raw tty as the
+    getpass label; a leading '-' is a flag and an escape sequence rewrites what
+    the operator thinks they are typing a credential for."""
+    q.answers["confirm"] = True
+    q.answers["select"] = "type"
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", lambda: set())
+    monkeypatch.setattr(
+        picker.secrets_mod, "read_from_prompt", lambda *a, **k: pytest.fail("prompted anyway")
+    )
+    monkeypatch.setattr(
+        picker.secrets_mod, "set_secret", lambda *a, **k: pytest.fail("stored anyway")
+    )
+    draft = _draft(servers=["evil"])
+    picker.offer_secrets(draft, _ctx(tmp_path, config, _unsafe_secret_catalog()))
+    assert q.calls["confirm"] == []  # nothing left to ask about
+    assert "\x1b" not in repr(q.calls)
+
+
+def test_a_well_spelled_catalog_secret_is_still_offered(q, config, tmp_path, monkeypatch):
+    """The positive path through the same filter: it must not refuse everything."""
+    q.answers["confirm"] = True
+    q.answers["select"] = "type"
+    monkeypatch.setattr(picker.secrets_mod, "docker_secret_names", lambda: set())
+    monkeypatch.setattr(picker.secrets_mod, "read_from_prompt", lambda *a, **k: "v")
+    monkeypatch.setattr(picker.secrets_mod, "set_secret", lambda *a, **k: None)
+    draft = _draft(servers=["github-official"])
+    picker.offer_secrets(draft, _ctx(tmp_path, config))
+    assert draft.stored_secrets == ["github.personal_access_token"]
+
+
+def test_the_secrets_row_does_not_count_a_name_it_would_refuse(q, config, tmp_path) -> None:
+    row = next(r for r in picker.ROWS if r.key == "secrets")
+    value = row.value(_draft(servers=["evil"]), _ctx(tmp_path, config, _unsafe_secret_catalog()))
+    assert value == "(none needed)"
