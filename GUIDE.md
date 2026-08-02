@@ -615,6 +615,15 @@ abox secrets set github.personal_access_token    # if the server needs a secret
 abox up                              # pre-pull + reconcile the gateway
 ```
 
+**`tools:` is per-profile, not per-project.** One gateway serves every project
+bound to a profile and takes a single `--tools=` list, so if another project on
+the same profile declares the same server *without* a `tools:` filter, the union
+wins and the filter is dropped for everyone — narrowing cannot be enforced for
+one project while another wants the whole server. abox does not resolve that
+silently: `doctor` fails `gateway.tool-narrowing`, naming the project whose
+declaration widened it. Narrow it there too, or give this project its own
+profile.
+
 Import what this host already has:
 
 ```bash
@@ -1153,6 +1162,7 @@ execution-adjacent file snapshot after you have read the diff.
 | execution-adjacent files | `mounts.watch` paths — CI workflows, `Makefile`, `package.json` scripts, editor tasks — fingerprinted and re-checked. These execute outside the sandbox, so a change is its own finding rather than part of an ordinary workspace diff (§6) |
 | egress review queue | looked-up-but-not-allowed domains, with counts |
 | agent hygiene | no `docker.sock` mount, no published ports, no `--privileged`, a non-root `--user` and an isolated `--network` — all read out of the rendered runspec |
+| tool narrowing | a declared `tools:` filter is present in the running gateway's `--tools=` argv, or the check fails and names the project on this profile that widened it |
 | single MCP endpoint | one endpoint unless `run.connectors` deliberately turns on the claude.ai path |
 
 ---

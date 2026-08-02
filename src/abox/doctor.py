@@ -268,7 +268,93 @@ def check_servers(
                 else "",
             )
         )
+    checks.append(check_tool_narrowing(manifest, config, state))
     return checks
+
+
+def check_tool_narrowing(
+    manifest: Manifest, config: GlobalConfig, gateway_state: dict[str, Any] | None
+) -> Check:
+    """Is this project's ``tools:`` filter actually on the running gateway?
+
+    Read from the container's argv, not from the manifest, for the reason
+    `servers.network` gives: the manifest is the intent and the running process
+    is the instruction. The gateway is shared per profile and takes one
+    ``--tools=`` list, so a second project using the same server unfiltered
+    makes the union win and the flag disappear entirely — and nothing said so.
+    A narrowing that is not enforced and not reported is a permission boundary
+    that exists only in the file the operator wrote.
+    """
+    from . import gateway as gw
+
+    declared = {name: tools for name, tools in manifest.tools.items() if tools}
+    if not declared:
+        return Check(
+            id="gateway.tool-narrowing",
+            title="declared tool narrowing is enforced",
+            status=Status.skip,
+            detail="this project narrows no server's tools",
+        )
+
+    if not gateway_state:
+        return Check(
+            id="gateway.tool-narrowing",
+            title="declared tool narrowing is enforced",
+            status=Status.skip,
+            detail=f"gateway {paths.gateway_container(manifest.profile)} is not running, "
+            f"so the argv that would enforce {len(declared)} filter(s) cannot be read",
+            hint="run `abox up`, then re-check",
+        )
+
+    argv = [str(a) for a in (gateway_state.get("Args") or [])]
+    served = ""
+    for arg in argv:
+        if arg.startswith("--tools="):
+            served = arg[len("--tools=") :]
+    conflicts = gw.ProfileRegistry.load(manifest.profile).tool_conflicts()
+    culprits = sorted(
+        {p for name, projects in conflicts.items() if name in declared for p in projects}
+        - {manifest.project}
+    )
+
+    if not served:
+        return Check(
+            id="gateway.tool-narrowing",
+            title="declared tool narrowing is enforced",
+            status=Status.fail,
+            detail=(
+                f"the gateway serves every tool of {', '.join(sorted(declared))} — "
+                "no --tools= on the running container"
+            ),
+            hint=(
+                f"project(s) {', '.join(culprits)} on profile "
+                f"{manifest.profile!r} declare the same server without a `tools:` "
+                "filter, so the union wins — narrow it there too, or move this "
+                "project to its own profile"
+                if culprits
+                else "recreate with `abox gateway up --force`"
+            ),
+            data={"declared": declared, "served": [], "conflicts": conflicts},
+        )
+
+    allowed = set(served.split(","))
+    missing = sorted({t for tools in declared.values() for t in tools} - allowed)
+    if missing:
+        return Check(
+            id="gateway.tool-narrowing",
+            title="declared tool narrowing is enforced",
+            status=Status.warn,
+            detail=f"declared but not served: {', '.join(missing)}",
+            hint="the running gateway predates this manifest — `abox up`",
+            data={"declared": declared, "served": sorted(allowed)},
+        )
+    return Check(
+        id="gateway.tool-narrowing",
+        title="declared tool narrowing is enforced",
+        status=Status.ok,
+        detail=f"--tools= carries {len(allowed)} tool(s) for {len(declared)} narrowed server(s)",
+        data={"declared": declared, "served": sorted(allowed)},
+    )
 
 
 #: Servers whose whole purpose is reaching something the agent's own sandbox

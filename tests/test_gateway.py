@@ -103,6 +103,28 @@ def test_registry_narrows_tools_only_when_every_project_narrows() -> None:
     # One project wants the whole server: narrowing would silently break it.
     reg.register(project_hash="c", workspace="/c", project="c", servers=["db"], tools={})
     assert reg.tools == []
+    # ...and the projects that asked for a filter are named, not dropped in
+    # silence. Union is the deliberate resolution; being quiet about it was not.
+    assert reg.tool_conflicts() == {"db": ["c"]}  # c is why the filter was dropped
+
+
+def test_tool_conflicts_is_empty_when_every_user_narrows() -> None:
+    """The accessor must distinguish "resolved" from "nothing to resolve" — a
+    conflict list that is always non-empty would be as useless as one that is
+    always empty."""
+    reg = gateway.ProfileRegistry(profile="dev")
+    reg.register(
+        project_hash="a", workspace="/a", project="a", servers=["db"], tools={"db": ["read"]}
+    )
+    reg.register(
+        project_hash="b", workspace="/b", project="b", servers=["db"], tools={"db": ["write"]}
+    )
+    assert reg.tools == ["read", "write"]
+    assert reg.tool_conflicts() == {}
+
+    # A server nobody narrowed is not a conflict either.
+    reg.register(project_hash="c", workspace="/c", project="c", servers=["other"], tools={})
+    assert reg.tool_conflicts() == {}
 
 
 def test_registry_round_trips(tmp_path: Path) -> None:

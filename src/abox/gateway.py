@@ -222,14 +222,48 @@ class ProfileRegistry:
                 seen[name] = url
         return sorted(set(clashes))
 
+    def tool_conflicts(self) -> dict[str, list[str]]:
+        """Servers whose declared narrowing this profile cannot enforce.
+
+        Maps the server to the projects that use it **unfiltered** — the reason
+        the narrowing was dropped, which is what an operator needs in order to
+        do something about it. `network_conflicts` names disagreements for the
+        opposite resolution; this is the same courtesy for the union.
+
+        ``doctor`` fails on it: a narrowing that is enforced nowhere and
+        reported nowhere is a permission boundary that exists only in the file
+        the operator wrote.
+        """
+        narrowed: set[str] = set()
+        unfiltered_by: dict[str, set[str]] = {}
+        for entry in self.projects.values():
+            filters = entry.get("tools") or {}
+            project = str(entry.get("project") or "?")
+            for name in entry.get("servers") or []:
+                if name in filters:
+                    narrowed.add(name)
+                else:
+                    unfiltered_by.setdefault(name, set()).add(project)
+        return {
+            name: sorted(projects)
+            for name, projects in sorted(unfiltered_by.items())
+            if name in narrowed
+        }
+
     @property
     def tools(self) -> list[str]:
         """Union of per-server tool filters.
 
         A filter is only meaningful when *every* project that uses a server
         narrows it; if one project wants the whole server, the narrowing would
-        silently break it, so the union wins. Per-project narrowing beyond this
-        is the agent's ``.mcp.json`` job, not the shared gateway's.
+        silently break it, so the union wins.
+
+        There is no compensating control at the agent. This docstring used to
+        claim per-project narrowing was "the agent's ``.mcp.json`` job", and
+        `mcp_config` renders a URL and a bearer token and nothing else — so a
+        dropped filter was enforced precisely nowhere while reading as though it
+        were handled elsewhere. `tool_conflicts` names what was dropped and
+        `doctor` fails on it.
         """
         wanted: set[str] = set()
         narrowed: dict[str, set[str]] = {}

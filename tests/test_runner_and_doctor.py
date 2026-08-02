@@ -1047,3 +1047,91 @@ def test_doctor_skips_when_nothing_has_been_built(
 ) -> None:
     runner_fake.expect(r"image ls abox-agent-demo", "")
     assert doctor.check_agent_images(manifest, rendered).status is doctor.Status.skip
+
+
+# -- tool narrowing -------------------------------------------------------
+
+
+def _narrowing_manifest() -> Manifest:
+    return Manifest(
+        project="a",
+        profile="dev",
+        servers=["duckduckgo"],
+        tools={"duckduckgo": ["search"]},
+    )
+
+
+def test_tool_narrowing_fails_when_the_gateway_serves_every_tool(config) -> None:
+    """The reported bug, end to end: a co-tenant project that does not narrow
+    makes the union win, `--tools=` disappears from the gateway argv, and this
+    project's declared filter binds nowhere. It used to say nothing at all."""
+    reg = gateway.ProfileRegistry(profile="dev")
+    reg.register(
+        project_hash="a",
+        workspace="/a",
+        project="a",
+        servers=["duckduckgo"],
+        tools={"duckduckgo": ["search"]},
+    )
+    reg.register(
+        project_hash="b", workspace="/b", project="b", servers=["duckduckgo"], tools={}
+    )
+    reg.save()
+
+    running = {"Args": ["--transport=streaming", "--servers=duckduckgo", "--verify-signatures"]}
+    check = doctor.check_tool_narrowing(_narrowing_manifest(), config, running)
+
+    assert check.status is doctor.Status.fail
+    assert "duckduckgo" in check.detail
+    assert "b" in check.hint, "the co-tenant that caused the drop is not named"
+
+
+def test_tool_narrowing_passes_when_the_running_gateway_carries_the_filter(config) -> None:
+    """The positive path through the same argv read — a fail-only test cannot
+    tell an enforced filter from a check that never looked."""
+    reg = gateway.ProfileRegistry(profile="dev")
+    reg.register(
+        project_hash="a",
+        workspace="/a",
+        project="a",
+        servers=["duckduckgo"],
+        tools={"duckduckgo": ["search"]},
+    )
+    reg.save()
+
+    running = {"Args": ["--servers=duckduckgo", "--tools=search"]}
+    check = doctor.check_tool_narrowing(_narrowing_manifest(), config, running)
+    assert check.status is doctor.Status.ok
+
+
+def test_tool_narrowing_warns_when_the_gateway_predates_the_manifest(config) -> None:
+    running = {"Args": ["--servers=duckduckgo", "--tools=something_else"]}
+    check = doctor.check_tool_narrowing(_narrowing_manifest(), config, running)
+    assert check.status is doctor.Status.warn
+    assert "search" in check.detail
+
+
+def test_tool_narrowing_skips_without_asserting_anything_it_did_not_check(config) -> None:
+    """A stopped gateway must not read as "enforced". The check that cannot see
+    the argv says so, rather than reporting the clean-looking answer."""
+    check = doctor.check_tool_narrowing(_narrowing_manifest(), config, None)
+    assert check.status is doctor.Status.skip
+    assert "not running" in check.detail
+
+    plain = Manifest(project="a", profile="dev", servers=["duckduckgo"])
+    assert doctor.check_tool_narrowing(plain, config, {"Args": []}).status is doctor.Status.skip
+
+
+def test_tool_narrowing_reaches_the_doctor_report(config, catalog_file, runner_fake) -> None:
+    """The unit tests above call check_tool_narrowing directly, so all four pass
+    just as happily when nothing ever runs it. A check that does not reach the
+    report is the same as no check — so assert against the report the operator
+    actually sees, not against the function."""
+    from abox import catalog as catalog_mod
+
+    cat = catalog_mod.load(allow_oci_fallback=False)
+    ids = {
+        c.id
+        for c in doctor.check_servers(_narrowing_manifest(), cat, CustomServers(), config)
+    }
+    assert "gateway.tool-narrowing" in ids, "the check never reaches the report"
