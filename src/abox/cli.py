@@ -562,6 +562,14 @@ def _print_stream_event(line: str) -> None:
 def shell(
     directory: Annotated[Path | None, typer.Option("--dir", "-C")] = None,
     keep: Annotated[bool, typer.Option("--keep", help="Leave the container running.")] = False,
+    allow_broken_firewall: Annotated[
+        bool,
+        typer.Option(
+            "--allow-broken-firewall",
+            help="Hand over the tty even if the container never reported a working "
+            "firewall. The session then has unrestricted egress.",
+        ),
+    ] = False,
 ) -> None:
     """Open an interactive session in a fresh sandbox (also used for first login)."""
     try:
@@ -575,11 +583,23 @@ def shell(
             f"{render_mod.MCP_CONFIG_PATH}{strict}; `command claude` bypasses it "
             f"and sees no MCP servers.[/]"
         )
-        outcome = runner.shell_session(manifest, config, workspace, keep=keep)
+        outcome = runner.shell_session(
+            manifest,
+            config,
+            workspace,
+            keep=keep,
+            require_firewall=not allow_broken_firewall,
+        )
         console.print(
             f"[dim]session {outcome.run_id} ended (exit {outcome.exit_code}, "
             f"{outcome.duration_s:.0f}s)[/]"
         )
+        # These were computed, recorded to telemetry, and then never shown. The
+        # one that matters says the container reported no working firewall — the
+        # single most important thing to tell someone who just spent a session
+        # inside it, and it only ever reached `abox logs`.
+        for warning in outcome.warnings:
+            console.print(f"[yellow]![/] {warning}")
         if outcome.denied:
             console.print(f"[yellow]![/] {len(outcome.denied)} domain(s) in the egress queue")
         raise typer.Exit(outcome.exit_code)

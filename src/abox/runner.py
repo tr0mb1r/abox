@@ -732,21 +732,40 @@ def shell_session(
     *,
     keep: bool = False,
     on_line: Any = None,
+    require_firewall: bool = True,
 ) -> RunOutcome:
-    """Same provisioning as ``run``, but hands over an interactive tty."""
+    """Same provisioning as ``run``, and the same gate, but an interactive tty.
+
+    This used to be the soft path — ``enforce_boundaries(strict=False)`` and a
+    firewall check that only warned — which had the risk exactly backwards. An
+    interactive session is the *most* capable thing abox hands out: whatever the
+    manifest's permission mode says, the operator at that tty can run anything.
+    It was the one session with no gate at all, while SECURITY.md promised "no
+    marker, no agent" without qualification.
+
+    So the boundary gate now follows the manifest, as ``run`` does, and a
+    container that never reported a working firewall does not get a tty unless
+    the caller asks for that explicitly. `abox shell --allow-broken-firewall` is
+    the escape hatch, because the firewall failing is also exactly when you need
+    a shell to find out why — but it is a decision, and it is recorded.
+    """
     workspace = workspace.resolve()
     run_id = telemetry.new_run_id()
     started_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    enforce_boundaries(manifest, config, workspace, strict=False)
+    enforce_boundaries(manifest, config, workspace)
     provisioned = up(manifest, workspace, run_id=run_id, on_line=on_line)
 
     started = time.monotonic()
     warnings: list[str] = []
     try:
-        firewall = verify_firewall_live(provisioned.container_name, required=False)
+        firewall = verify_firewall_live(
+            provisioned.container_name, required=require_firewall
+        )
         if not firewall.ok:
-            warnings.append(firewall.detail)
+            warnings.append(
+                f"{firewall.detail} — this session ran with unrestricted egress"
+            )
         exit_code = interactive_shell(manifest, provisioned)
     finally:
         counters, _queries, denied = teardown(provisioned, manifest, config, remove=not keep)

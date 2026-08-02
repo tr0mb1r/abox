@@ -73,7 +73,7 @@ coverage that does not exist.
 |---|---|---|---|
 | Escalate to root via `sudo` | `sudo` purged from the image; the build asserts its absence | **build fails** if present; `sudo` fails at runtime | `tests/test_render.py::test_dockerfile_purges_sudo`, `test_sudo_is_absent_from_the_image`, `test_agent_cannot_become_root` *(docker)* |
 | Reach the Docker daemon from the agent | no socket bind in the runspec | **no socket to open** | `tests/test_integration_docker.py::test_agent_cannot_reach_the_docker_socket` *(docker)* |
-| Let the firewall silently fail and run anyway | the script writes a marker abox reads back through the socket | **no marker, no agent** | `tests/test_integration_docker.py::test_firewall_marker_proves_the_rules_are_live` *(docker)* |
+| Let the firewall silently fail and run anyway | the script writes a marker abox reads back through the socket. `run` and `shell` both refuse without it; the two exceptions are explicit — `run.permission_mode: plan`, and `abox shell --allow-broken-firewall`, which reports the unrestricted egress on exit and records it against the run | **no marker, no agent** | `tests/test_integration_docker.py::test_firewall_marker_proves_the_rules_are_live` *(docker)*, `tests/test_runner_and_doctor.py::test_shell_refuses_a_container_that_reported_no_firewall` |
 | Reach the gateway's MCP endpoint without the token | bearer auth on TCP transports | **401** | `tests/test_integration_docker.py::test_probe_is_rejected_without_the_token` *(docker)* |
 
 ### Filesystem and tampering

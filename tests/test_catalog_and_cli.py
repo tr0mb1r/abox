@@ -685,3 +685,58 @@ def test_server_network_is_dropped_for_a_server_you_removed(
     result = cli.invoke(app, ["init", "--dir", str(project)])
     assert result.exit_code == 0
     assert Manifest.load(project).server_network == {}
+
+
+def test_shell_prints_the_no_firewall_warning(
+    tmp_path: Path, catalog_file: Path, runner, monkeypatch
+) -> None:
+    """The warning was computed, recorded to telemetry, and then never printed.
+
+    `abox shell` showed only "session <id> ended", so an operator who had just
+    spent a session in a container with no firewall had no way to know from the
+    screen — it survived in `abox logs` alone.
+    """
+    from abox import runner as runner_mod
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+
+    monkeypatch.setattr(
+        runner_mod,
+        "shell_session",
+        lambda *a, **k: runner_mod.RunOutcome(
+            run_id="r1",
+            exit_code=0,
+            duration_s=1.0,
+            transcript=None,
+            warnings=["no working firewall — this session ran with unrestricted egress"],
+        ),
+    )
+    result = cli.invoke(app, ["shell", "--dir", str(project)])
+    assert "unrestricted egress" in result.stdout
+
+
+def test_shell_passes_the_firewall_gate_through(
+    tmp_path: Path, catalog_file: Path, runner, monkeypatch
+) -> None:
+    """--allow-broken-firewall is the only way to lower the gate, and it has to
+    reach the runner to mean anything."""
+    from abox import runner as runner_mod
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+
+    seen: list[bool] = []
+
+    def fake(*_args, require_firewall: bool = True, **_kw):
+        seen.append(require_firewall)
+        return runner_mod.RunOutcome(
+            run_id="r1", exit_code=0, duration_s=1.0, transcript=None
+        )
+
+    monkeypatch.setattr(runner_mod, "shell_session", fake)
+    cli.invoke(app, ["shell", "--dir", str(project)])
+    cli.invoke(app, ["shell", "--dir", str(project), "--allow-broken-firewall"])
+    assert seen == [True, False]

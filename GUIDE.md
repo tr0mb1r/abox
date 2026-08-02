@@ -1049,7 +1049,18 @@ from scratch), `--force-gateway` (recreate the gateway container).
 6. **Destroy** the container. The workspace and the auth volume persist.
 
 `abox run` flags: `--resume <session-id>`, `--continue`, `--keep` (leave the
-container for inspection), `--quiet`/`-q`. `abox shell` takes `--keep` too.
+container for inspection), `--quiet`/`-q`. `abox shell` takes `--keep` too, plus
+`--allow-broken-firewall`.
+
+**The gate applies to `shell` as well.** `abox shell` runs the same boundary
+checks as `abox run` and reads back the same in-container firewall marker, so a
+container whose firewall never came up does not get a tty. That is deliberate
+even though it is the inconvenient direction: an interactive session is the most
+capable thing abox hands out — whatever `run.permission_mode` says, the operator
+at that prompt can run anything — so it is the last place that should have the
+weakest gate. When the firewall is what you are trying to debug,
+`abox shell --allow-broken-firewall` proceeds and says on exit that the session
+had unrestricted egress; the note is recorded against the run in `abox logs`.
 
 **Lifecycle.** Containers are disposable — a fresh one per run, removed on exit.
 Only named volumes (`abox-claude-<hash>`), the workspace, and telemetry persist.
@@ -1195,7 +1206,7 @@ different tool.
 | `abox up` | `--no-build`, `--no-cache`, `--force-gateway` | network, gateway, artifacts, cached image build |
 | `abox render` | `-C/--dir` | re-render artifacts from the manifest, without building or running |
 | `abox run "<prompt>"` | `--resume`, `--continue`, `--keep`, `-q` | fresh container, headless `claude -p`, transcript captured, destroyed |
-| `abox shell` | `--keep` | same sandbox, interactive tty (use for the first login) |
+| `abox shell` | `--keep`, `--allow-broken-firewall` | same sandbox and the same gate, interactive tty (use for the first login) |
 | `abox mcp list` | `--all` | declared servers, or the whole catalog |
 | `abox mcp add <server>` | `--tool` | declare a catalog/custom server (narrow with `--tool`) |
 | `abox mcp rm <server>` | | undeclare |

@@ -237,6 +237,87 @@ def test_firewall_marker_can_be_advisory(runner_fake) -> None:
     assert not check.ok  # reported, not raised
 
 
+@pytest.fixture
+def shell_ready(rendered: Path, runner_fake, monkeypatch):
+    """A workspace where `shell_session` can get as far as the firewall check."""
+    runner_fake.expect(r"image inspect", '[{"Id":"sha256:aa"}]')
+    handovers: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "interactive_shell",
+        lambda _manifest, provisioned: handovers.append(provisioned.container_name) or 0,
+    )
+    return rendered, handovers
+
+
+def test_shell_refuses_a_container_that_reported_no_firewall(
+    manifest, config, shell_ready, runner_fake
+) -> None:
+    """SECURITY.md states "no marker, no agent" flatly. `shell` was the one path
+    where it was untrue — and it is the most capable session abox hands out,
+    since whatever the manifest's permission mode says, the operator at that tty
+    can run anything.
+    """
+    workspace, handovers = shell_ready
+    runner_fake.expect(r"firewall-ok", "", returncode=1)
+
+    with pytest.raises(BoundaryError, match="firewall did not come up"):
+        runner.shell_session(manifest, config, workspace)
+
+    assert handovers == [], "the tty was handed over despite the refusal"
+    # The refusal is only evidence if the check it rests on actually ran, and if
+    # the container it created did not outlive it.
+    assert runner_fake.find("firewall-ok"), "the marker was never read"
+    assert runner_fake.find("docker rm"), "the container was left running"
+
+
+def test_shell_hands_over_when_the_firewall_is_live(
+    manifest, config, shell_ready, runner_fake
+) -> None:
+    """The positive path through the same control — a refusal test alone cannot
+    tell "the gate held" from "the gate never ran"."""
+    workspace, handovers = shell_ready
+    runner_fake.expect(r"firewall-ok", "ok\n2026-08-02T00:00:00Z\ndomains=3\n")
+
+    outcome = runner.shell_session(manifest, config, workspace)
+
+    assert len(handovers) == 1
+    assert outcome.exit_code == 0
+    assert outcome.warnings == []
+
+
+def test_shell_can_be_told_to_proceed_and_says_what_that_cost(
+    manifest, config, shell_ready, runner_fake
+) -> None:
+    """The firewall failing is exactly when a shell is most useful for finding
+    out why, so there is an escape hatch — but it is explicit and it is named."""
+    workspace, handovers = shell_ready
+    runner_fake.expect(r"firewall-ok", "", returncode=1)
+
+    outcome = runner.shell_session(manifest, config, workspace, require_firewall=False)
+
+    assert len(handovers) == 1
+    assert outcome.warnings, "proceeding without a firewall was not reported"
+    assert "unrestricted egress" in outcome.warnings[0]
+
+
+def test_shell_obeys_the_manifests_own_boundary_gate(
+    manifest, config, shell_ready, runner_fake
+) -> None:
+    """`shell` used to pass strict=False, so a tampered artifact could not stop
+    it even under bypassPermissions. It now follows the manifest, as `run` does.
+    """
+    workspace, handovers = shell_ready
+    manifest.run.permission_mode = PermissionMode.bypass_permissions
+    script = render.ensure_artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    script.chmod(0o600)
+    script.write_text("#!/bin/sh\nexit 0\n")
+
+    with pytest.raises(BoundaryError, match="refusing to run"):
+        runner.shell_session(manifest, config, workspace)
+    assert handovers == []
+
+
 # -- doctor ---------------------------------------------------------------
 
 
