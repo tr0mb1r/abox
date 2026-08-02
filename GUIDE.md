@@ -1136,7 +1136,7 @@ execution-adjacent file snapshot after you have read the diff.
 | boundary gate | `bypassPermissions` ⇒ firewall script + `NET_ADMIN`/`NET_RAW` present |
 | egress proxy | if configured, the proxy is up; surfaces SNI refusals |
 | shared addresses | allowlisted domains that share an IP (domain-fronting exposure; moot when the proxy is on) |
-| git tamper | workspace `.git/config` checked for `core.hooksPath` / `alias.*` changes since the baseline |
+| git tamper | workspace `.git/config` fingerprinted key by key since the baseline. Everything not on a small benign list (the keys `git init`, `git branch` and `git remote` write themselves) is watched — `core.hooksPath`, `alias.*`, `core.pager`, `core.fsmonitor`, `core.sshCommand`, `filter.*.clean`, `diff.*.textconv`, `url.*.insteadOf` and the rest all run a command on an ordinary `git log`, on the host |
 | execution-adjacent files | `mounts.watch` paths — CI workflows, `Makefile`, `package.json` scripts, editor tasks — fingerprinted and re-checked. These execute outside the sandbox, so a change is its own finding rather than part of an ordinary workspace diff (§6) |
 | egress review queue | looked-up-but-not-allowed domains, with counts |
 | agent hygiene | no `docker.sock` mount, no published ports in the runspec |

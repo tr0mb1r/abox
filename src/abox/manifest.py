@@ -573,6 +573,10 @@ EXEC_ADJACENT_WATCH = [
     ".vscode/tasks.json",
     ".idea",
     "*.code-workspace",
+    # The other half of a git filter attack: `.git/config` names the command,
+    # `.gitattributes` decides which files run it. `.git/config` itself is
+    # covered more precisely by doctor's git.tamper check.
+    ".gitattributes",
 ]
 
 

