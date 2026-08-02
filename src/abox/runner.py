@@ -764,6 +764,7 @@ def run(
             servers=list(manifest.servers),
             denied_domains=len(denied),
             dropped_packets=counters.dropped_packets,
+            counters_read_ok=counters.read_ok,
             notes=warnings,
         ),
     )
@@ -842,6 +843,7 @@ def shell_session(
             servers=list(manifest.servers),
             denied_domains=len(denied),
             dropped_packets=counters.dropped_packets,
+            counters_read_ok=counters.read_ok,
             notes=warnings,
         ),
     )

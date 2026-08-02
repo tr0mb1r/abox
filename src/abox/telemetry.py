@@ -81,6 +81,11 @@ class RunRecord:
     servers: list[str] = field(default_factory=list)
     denied_domains: int = 0
     dropped_packets: int = 0
+    #: Did the teardown actually read the firewall counters? A failed
+    #: ``iptables -L`` yields zero for every count, so without this the history
+    #: shows a column of zeroes that reads as "the firewall refused nothing"
+    #: for a run where nobody looked. `abox logs --runs` renders `?` when False.
+    counters_read_ok: bool = True
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

@@ -610,6 +610,11 @@ def run(
             console.print(f"  transcript: {outcome.transcript}")
         if outcome.tool_calls:
             console.print(f"  tool calls: {len(outcome.tool_calls)}")
+        if outcome.counters and not outcome.counters.read_ok:
+            console.print(
+                "  [yellow]![/] firewall counters could not be read — this run's "
+                "drop count is unknown, not zero"
+            )
         if outcome.counters and outcome.counters.dropped_packets:
             console.print(
                 f"  [yellow]firewall dropped {outcome.counters.dropped_packets} packet(s)[/]"
@@ -1771,7 +1776,13 @@ def logs(
                         str(row.get("exit_code", "")),
                         f"{row.get('duration_s', 0):.0f}",
                         str(row.get("denied_domains", 0)),
-                        str(row.get("dropped_packets", 0)),
+                        # "?" rather than 0 when the counters could not be read.
+                        # A zero there is a claim about the firewall; a failed
+                        # read is a claim about nothing, and the two looked
+                        # identical in the one place an operator reviews runs.
+                        str(row.get("dropped_packets", 0))
+                        if row.get("counters_read_ok", True)
+                        else "[yellow]?[/]",
                         str(row.get("session_id", ""))[:12],
                     )
                 console.print(table)

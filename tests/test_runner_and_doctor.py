@@ -1508,3 +1508,29 @@ def test_the_proxy_checks_reach_the_run_gate(
     runner_fake.expect(r"docker container inspect", json.dumps({"State": {"Running": True}}))
     ids = {c.id for c in doctor.preflight(manifest, proxied, proxy_rendered).checks}
     assert {"egress.proxy", "egress.proxy-drift", "egress.proxy-allowlist"} <= ids
+
+
+def test_the_runner_records_that_the_counters_could_not_be_read(
+    manifest, config, shell_ready, runner_fake, monkeypatch
+) -> None:
+    """Asserted through the runner, not by building a RunRecord by hand.
+
+    A test that constructs the record itself passes just as happily when the
+    runner never populates the field — which is how the original defect looked:
+    read_ok existed, was persisted inside the counters file, and simply never
+    reached the run index the operator reads.
+    """
+    workspace, _handovers = shell_ready
+    runner_fake.expect(r"firewall-ok", "ok\n2026-08-02T00:00:00Z\n")
+    runner_fake.expect(r"iptables", "", returncode=1, stderr="Cannot connect")
+
+    captured: list = []
+    monkeypatch.setattr(
+        runner.telemetry, "record_run", lambda _ws, record: captured.append(record)
+    )
+    runner.shell_session(manifest, config, workspace)
+
+    assert captured, "no run was recorded"
+    assert captured[-1].counters_read_ok is False, (
+        "a failed counter read is recorded as a clean run"
+    )

@@ -256,3 +256,49 @@ def test_ignored_domains_leave_the_review_queue(workspace: Path) -> None:
     telemetry.collect_dns(workspace, "run1")
     denied = telemetry.review_queue(workspace, [], ignored=["telemetry.vendor.io"])
     assert [d.name for d in denied] == ["pastebin.com"]
+
+
+def test_a_failed_counter_read_is_not_recorded_as_zero_drops(workspace: Path) -> None:
+    """A column of zeroes that reads as a clean record.
+
+    `iptables -L` failing yields FirewallCounters with every count zero, which
+    landed in runs.jsonl as dropped_packets: 0 — indistinguishable from a run
+    the firewall never had to refuse. read_ok was persisted inside the counters
+    file but never reached RunRecord, so the one view an operator actually reads
+    still showed a bare 0.
+    """
+    failed = telemetry.FirewallCounters(raw="Cannot connect to the Docker daemon")
+    assert not failed.read_ok
+
+    telemetry.record_run(
+        workspace,
+        telemetry.RunRecord(
+            id="r1", ts="2026-08-02T00:00:00Z", project="p", profile="dev",
+            prompt_sha="x", duration_s=1.0, exit_code=0,
+            dropped_packets=failed.dropped_packets,
+            counters_read_ok=failed.read_ok,
+        ),
+    )
+    row = telemetry.runs(workspace)[-1]
+    assert row["dropped_packets"] == 0
+    assert row["counters_read_ok"] is False, "the failed read is invisible in the history"
+
+
+def test_a_real_zero_is_still_a_real_zero(workspace: Path) -> None:
+    """The positive path: a firewall that genuinely refused nothing must not be
+    reported as an unknown, or the marker becomes noise."""
+    live = telemetry.parse_iptables_counters(
+        "Chain OUTPUT (policy DROP 0 packets, 0 bytes)\n"
+        " pkts bytes target prot opt in out source destination\n"
+        "    0     0 DROP   all  --  *  *   0.0.0.0/0  0.0.0.0/0\n"
+    )
+    assert live.read_ok
+    telemetry.record_run(
+        workspace,
+        telemetry.RunRecord(
+            id="r2", ts="2026-08-02T00:00:01Z", project="p", profile="dev",
+            prompt_sha="x", duration_s=1.0, exit_code=0,
+            dropped_packets=live.dropped_packets, counters_read_ok=live.read_ok,
+        ),
+    )
+    assert telemetry.runs(workspace)[-1]["counters_read_ok"] is True
