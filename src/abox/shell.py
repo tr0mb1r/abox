@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import signal
 import subprocess
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -110,10 +111,11 @@ def _real_runner(argv: Sequence[str], opts: RunOptions) -> Result:
     return Result(tuple(argv), proc.returncode, proc.stdout, proc.stderr)
 
 
-#: How long a killed child gets to die before we stop waiting for it, and how
-#: long a pipe-reader thread gets to finish once the child is gone. Both are
-#: bounded because a grandchild can inherit the pipe and hold it open forever.
-_REAP_GRACE = 10
+#: How long a signalled process group gets to die before we escalate, and how
+#: long a pipe-reader thread gets to finish once nothing should be writing. Both
+#: are bounded: a process that escapes the group can hold a pipe open forever,
+#: and truncated output beats a wedged CLI.
+_TERM_GRACE = 5
 _PUMP_JOIN = 5
 
 
@@ -129,19 +131,33 @@ def _pump(pipe: IO[str], sink: list[str], on_line: Callable[[str], None] | None)
         pass
 
 
-def _terminate(proc: subprocess.Popen[str]) -> None:
-    """SIGTERM, then SIGKILL if it is still there, then reap it."""
+def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:
+    """Signal the child's whole process group, falling back to the child alone.
+
+    Killing only the direct child is not enough. ``sh -c 'sleep 20'`` *forks* on
+    Linux where it *execs* on macOS, so the shell dies on SIGTERM and the
+    grandchild lives on holding the inherited stdout and stderr — which means
+    the pipes never reach EOF and the reader threads never finish. The child is
+    started in its own session so there is a group to signal here.
+    """
     with contextlib.suppress(OSError):
-        proc.terminate()
+        os.killpg(os.getpgid(proc.pid), sig)
+        return
+    with contextlib.suppress(OSError):
+        proc.send_signal(sig)
+
+
+def _terminate(proc: subprocess.Popen[str]) -> None:
+    """SIGTERM the group, then SIGKILL if anything is still there, then reap."""
+    _signal_group(proc, signal.SIGTERM)
     try:
-        proc.wait(timeout=_REAP_GRACE)
+        proc.wait(timeout=_TERM_GRACE)
         return
     except subprocess.TimeoutExpired:
         pass
-    with contextlib.suppress(OSError):
-        proc.kill()
+    _signal_group(proc, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=_REAP_GRACE)
+        proc.wait(timeout=_TERM_GRACE)
 
 
 def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Result:
@@ -165,7 +181,7 @@ def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Resul
     chunks: list[str] = []
     err_chunks: list[str] = []
     timeout = opts.timeout or None
-    with subprocess.Popen(
+    proc = subprocess.Popen(
         list(argv),
         cwd=str(opts.cwd) if opts.cwd else None,
         env=env,
@@ -174,30 +190,47 @@ def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Resul
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-    ) as proc:
-        assert proc.stdout is not None and proc.stderr is not None  # noqa: S101
-        pumps = [
-            threading.Thread(
-                target=_pump, args=(proc.stdout, chunks, opts.on_line), daemon=True
-            ),
-            threading.Thread(target=_pump, args=(proc.stderr, err_chunks, None), daemon=True),
-        ]
-        for pump in pumps:
-            pump.start()
+        # Its own process group, so _signal_group can reach the grandchildren
+        # that inherited these pipes. Ctrl-C no longer reaches the child through
+        # the terminal as a side effect, so it is forwarded explicitly below.
+        start_new_session=True,
+    )
+    assert proc.stdout is not None and proc.stderr is not None  # noqa: S101
+    pumps = [
+        threading.Thread(target=_pump, args=(proc.stdout, chunks, opts.on_line), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, err_chunks, None), daemon=True),
+    ]
+    for pump in pumps:
+        pump.start()
+
+    timed_out = False
+    try:
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             _terminate(proc)
-            for pump in pumps:
-                pump.join(_PUMP_JOIN)
-            raise subprocess.TimeoutExpired(
-                list(argv), timeout or 0, output="".join(chunks), stderr="".join(err_chunks)
-            ) from None
-        # The child is gone; the pumps are draining what is left in the buffers.
-        # Bounded, because a grandchild holding the pipe would otherwise hang us
-        # here instead — truncated output beats a wedged CLI.
+        except BaseException:
+            # Ctrl-C, or anything else unwinding this thread. The child is in its
+            # own group and would otherwise be orphaned still running.
+            _terminate(proc)
+            raise
+    finally:
+        # Deliberately not `with subprocess.Popen(...)`. Its __exit__ closes the
+        # pipes and then calls wait() with no timeout, and closing a pipe blocks
+        # on an in-flight read in the pump thread — so a grandchild holding the
+        # pipe open turned into an unbounded wait inside the cleanup that was
+        # supposed to bound it. Everything here has a deadline.
         for pump in pumps:
             pump.join(_PUMP_JOIN)
+        for pipe in (proc.stdout, proc.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                pipe.close()
+
+    if timed_out:
+        raise subprocess.TimeoutExpired(
+            list(argv), timeout or 0, output="".join(chunks), stderr="".join(err_chunks)
+        )
     return Result(tuple(argv), proc.returncode, "".join(chunks), "".join(err_chunks))
 
 

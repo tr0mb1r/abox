@@ -12,6 +12,7 @@ test that hangs CI is worse than a test that fails it.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -88,27 +89,36 @@ def test_a_stalled_child_hits_its_timeout_instead_of_blocking_forever() -> None:
     assert elapsed < 15, f"waited {elapsed:.0f}s — the deadline did not drive the wait"
 
 
-def test_the_timed_out_child_is_killed_not_left_running() -> None:
-    """`TimeoutExpired` used to propagate out of the `with`, sending
-    `Popen.__exit__` into `wait()` with no timeout — and nothing ever killed the
-    child, so the CLI hung there instead."""
-    import subprocess
+def test_a_timed_out_grandchild_is_killed_not_just_its_parent(tmp_path) -> None:
+    """The pipe holder is often not the process abox spawned.
 
-    marker = "abox-timeout-probe-marker"
+    ``sh -c 'sleep 20'`` *forks* on Linux where it *execs* on macOS, so killing
+    the shell leaves the grandchild alive holding the inherited stdout and
+    stderr. The pipes never reach EOF, the reader threads never finish, and the
+    timeout that fired at 1s took 20s to return — which is what the Linux runner
+    caught and Docker Desktop could not. Hence the process *group*.
+
+    This asserts on the grandchild's own pid rather than scanning `ps`, which is
+    both sharper and one less binary to depend on.
+    """
+    pidfile = tmp_path / "child.pid"
     with pytest.raises(CommandTimeoutError):
         bounded(
             lambda: shell.run(
-                ["/bin/sh", "-c", f"# {marker}\nsleep 20"],
+                ["/bin/sh", "-c", f"sleep 20 & echo $! > {pidfile}; wait"],
                 timeout=1,
                 stream=True,
                 on_line=lambda _line: None,
             )
         )
-    time.sleep(0.5)
-    survivors = subprocess.run(
-        ["/bin/ps", "-Ao", "args"], capture_output=True, text=True, check=False
-    ).stdout
-    assert marker not in survivors, "the child outlived the timeout"
+    grandchild = int(pidfile.read_text().strip())
+    for _ in range(50):  # it is signalled, not reaped by us; give it a moment
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    pytest.fail(f"grandchild {grandchild} outlived the timeout still holding the pipes")
 
 
 def test_a_child_that_floods_stderr_does_not_deadlock() -> None:
