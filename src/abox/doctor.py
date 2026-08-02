@@ -1151,7 +1151,7 @@ def check_mandatory_egress(manifest: Manifest, config: GlobalConfig, workspace: 
     NXDOMAIN, and Claude Code reports `ENOTFOUND` with no hint that an
     allowlist was involved.
     """
-    script = render.artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    script = render.artifacts_path(workspace) / render.ARTIFACT_FIREWALL
     if not script.is_file():
         return Check(
             id="egress.mandatory",
@@ -1455,7 +1455,7 @@ def check_token_not_world_readable(workspace: Path) -> Check:
     readable as a side effect. It is staged through a volume instead; this
     confirms the host copy stayed private and the volume is actually mounted.
     """
-    source = render.artifacts_dir(workspace) / render.ARTIFACT_MCP
+    source = render.artifacts_path(workspace) / render.ARTIFACT_MCP
     if not source.is_file():
         return Check(
             id="agent.token-private",
@@ -1507,7 +1507,7 @@ def check_interactive_claude(workspace: Path) -> Check:
     that holds on one path and not the other is the kind of gap that only
     shows up when somebody types the obvious command.
     """
-    dockerfile = render.artifacts_dir(workspace) / render.ARTIFACT_DOCKERFILE
+    dockerfile = render.artifacts_path(workspace) / render.ARTIFACT_DOCKERFILE
     if not dockerfile.is_file():
         return Check(
             id="agent.interactive-mcp",

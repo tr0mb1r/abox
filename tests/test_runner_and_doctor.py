@@ -100,7 +100,7 @@ def test_boundary_checks_pass_on_a_clean_render(manifest, config, rendered) -> N
 
 def test_bypass_permissions_refuses_a_tampered_artifact(manifest, config, rendered) -> None:
     manifest.run.permission_mode = PermissionMode.bypass_permissions
-    script = render.artifacts_dir(rendered) / render.ARTIFACT_FIREWALL
+    script = render.ensure_artifacts_dir(rendered) / render.ARTIFACT_FIREWALL
     script.chmod(0o600)
     script.write_text("#!/bin/sh\nexit 0\n")
     with pytest.raises(BoundaryError, match="refusing to run"):
@@ -108,7 +108,7 @@ def test_bypass_permissions_refuses_a_tampered_artifact(manifest, config, render
 
 
 def test_default_mode_tolerates_what_bypass_refuses(manifest, config, rendered) -> None:
-    script = render.artifacts_dir(rendered) / render.ARTIFACT_FIREWALL
+    script = render.ensure_artifacts_dir(rendered) / render.ARTIFACT_FIREWALL
     script.chmod(0o600)
     script.write_text("#!/bin/sh\nexit 0\n")
     checks = runner.enforce_boundaries(manifest, config, rendered)  # must not raise
@@ -119,6 +119,26 @@ def test_boundary_fails_without_a_render(manifest, config, workspace) -> None:
     checks = runner.boundary_checks(manifest, config, workspace)
     assert checks[0].name == "artifacts"
     assert not checks[0].ok
+
+
+def _boundary(manifest, config, workspace, name: str):
+    return next(c for c in runner.boundary_checks(manifest, config, workspace) if c.name == name)
+
+
+def test_artifacts_private_goes_red_through_boundary_checks(manifest, config, rendered) -> None:
+    """The check must fail *through its caller*, not only when called directly.
+
+    `artifacts_dir_is_private` was already correct in isolation. What defeated
+    it was `boundary_checks` calling helpers that funnelled through the old
+    `artifacts_dir()`, whose body ends in `chmod(0o755)` — so the mode was
+    repaired seconds before the stat and the check reported the tampering it had
+    just undone. Asserting on the helper alone cannot catch that.
+    """
+    d = render.artifacts_path(rendered)
+    d.chmod(d.stat().st_mode | 0o022)
+
+    assert not _boundary(manifest, config, rendered, "artifacts-private").ok
+    assert d.stat().st_mode & 0o022, "boundary_checks repaired the mode it was asked to detect"
 
 
 def test_firewall_marker_gates_the_run(runner_fake) -> None:
@@ -557,7 +577,7 @@ def test_mandatory_egress_check_fails_on_a_hand_edited_firewall(
 ) -> None:
     """The symptom this exists to name: scoped DNS turns a missing allowlist
     entry into a bare ENOTFOUND with no mention of an allowlist."""
-    script = render.artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    script = render.ensure_artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
     script.chmod(0o600)
     script.write_text(
         script.read_text().replace('"platform.claude.com"', '"nope.invalid"')
@@ -596,7 +616,7 @@ def test_build_uses_the_artifacts_dir_as_context(
     influenced by the repository it is about to sandbox."""
     runner.build(manifest, rendered)
     call = runner_fake.find("docker build")[0]
-    context = str(render.artifacts_dir(rendered))
+    context = str(render.ensure_artifacts_dir(rendered))
     assert call.argv[-1] == context
     assert rendered not in Path(context).parents
     assert "--build-arg" in call.argv

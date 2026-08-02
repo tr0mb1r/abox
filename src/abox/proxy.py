@@ -61,9 +61,9 @@ def proxy_container(project: str) -> str:
 
 
 def conf_path(workspace: Path) -> Path:
-    from .render import artifacts_dir
+    from .render import artifacts_path
 
-    return artifacts_dir(workspace) / "proxy.conf"
+    return artifacts_path(workspace) / "proxy.conf"
 
 
 @dataclass(frozen=True)

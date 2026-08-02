@@ -209,7 +209,7 @@ def test_init_renders_the_artifacts(tmp_path: Path, catalog_file: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     cli.invoke(app, ["init", "--dir", str(project), "--yes"])
-    artifacts = render.artifacts_dir(project)
+    artifacts = render.artifacts_path(project)
     assert (artifacts / render.ARTIFACT_DEVCONTAINER).is_file()
     assert (artifacts / render.ARTIFACT_FIREWALL).is_file()
     assert (artifacts / render.ARTIFACT_MCP).is_file()

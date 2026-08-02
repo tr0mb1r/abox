@@ -76,17 +76,26 @@ def _env() -> Environment:
 def artifacts_path(workspace: Path) -> Path:
     """The artifacts directory as a plain path — no mkdir, no chmod.
 
-    `artifacts_dir` enforces the mode as a side effect of returning the path,
-    which is fine for callers about to write there and useless for a caller
-    about to *inspect* it: the enforcement lands before the stat, so a tampered
-    mode is corrected and then reported as fine. Anything auditing the mode has
-    to read it without touching it first.
+    `ensure_artifacts_dir` enforces the mode as a side effect of returning the
+    path, which is fine for callers about to write there and useless for a
+    caller about to *inspect* it: the enforcement lands before the stat, so a
+    tampered mode is corrected and then reported as fine. Anything auditing the
+    mode has to read it without touching it first.
+
+    Every reader takes this path. The mutating one is spelled `ensure_` so that
+    reaching for it is a decision rather than an accident — the check this
+    protects was defeated for months by callers that looked innocent.
     """
     return paths.project_state_dir(workspace) / "artifacts"
 
 
-def artifacts_dir(workspace: Path) -> Path:
-    d = paths.project_state_dir(workspace) / "artifacts"
+def ensure_artifacts_dir(workspace: Path) -> Path:
+    """The artifacts directory, created and with its mode enforced.
+
+    Only for callers about to *write* there, or about to hand the directory to
+    Docker as a mount source or a build context. Readers want `artifacts_path`.
+    """
+    d = artifacts_path(workspace)
     d.mkdir(parents=True, exist_ok=True)
     # 0755, not 0700: this directory is bind-mounted into containers that run as
     # their own uid — the agent as `vscode`, nginx as 101 — and Linux enforces
@@ -231,7 +240,7 @@ class RenderResult:
 
     @property
     def config_path(self) -> Path:
-        return artifacts_dir(self.workspace) / ARTIFACT_RUNSPEC
+        return artifacts_path(self.workspace) / ARTIFACT_RUNSPEC
 
     def hashes(self) -> dict[str, str]:
         return {name: sha256_text(body) for name, body in self.artifacts.items()}
@@ -281,7 +290,7 @@ def build_runspec(
     mounts: list[str] = [
         f"type=bind,source={workspace},target=/workspace",
         f"type=volume,source={volume},target=/home/{user}/.claude",
-        f"type=bind,source={artifacts_dir(workspace)},target=/opt/abox,readonly",
+        f"type=bind,source={artifacts_path(workspace)},target=/opt/abox,readonly",
         # mcp.json is staged here instead of riding the bind above: it carries
         # the gateway bearer token, and the bind has to be world-readable so
         # containers running as their own uid can read it at all.
@@ -412,7 +421,7 @@ def render(
         network=config.network,
         workspace=str(workspace),
         claude_volume=paths.claude_volume(workspace),
-        artifacts_dir=str(artifacts_dir(workspace)),
+        artifacts_dir=str(artifacts_path(workspace)),
         run_log_dir=str(paths.current_run_dir(workspace)),
         extra_mounts=extra_mounts,
         toolchains=manifest.toolchains,
@@ -506,7 +515,7 @@ def _assert_valid_json(text: str) -> None:
 def write(result: RenderResult, *, workspace_copy: bool = True) -> dict[str, Path]:
     """Write artifacts to the authoritative dir and (optionally) the workspace."""
     written: dict[str, Path] = {}
-    target_dir = artifacts_dir(result.workspace)
+    target_dir = ensure_artifacts_dir(result.workspace)
 
     for name, body in result.artifacts.items():
         path = target_dir / name
@@ -562,7 +571,7 @@ def write(result: RenderResult, *, workspace_copy: bool = True) -> dict[str, Pat
 
 
 def load_artifact_state(workspace: Path) -> dict[str, Any] | None:
-    path = artifacts_dir(workspace) / MANIFEST_OF_ARTIFACTS
+    path = artifacts_path(workspace) / MANIFEST_OF_ARTIFACTS
     if not path.is_file():
         return None
     try:
@@ -598,7 +607,7 @@ def detect_drift(manifest: Manifest, config: GlobalConfig, workspace: Path) -> D
     expected_digest = manifest_digest(manifest, config)
     tampered: list[str] = []
     review_diverged: list[str] = []
-    target_dir = artifacts_dir(workspace)
+    target_dir = artifacts_path(workspace)
     review_dir = paths.devcontainer_dir(workspace)
 
     for name, expected_hash in (state.get("hashes") or {}).items():
@@ -631,7 +640,7 @@ def detect_drift(manifest: Manifest, config: GlobalConfig, workspace: Path) -> D
 def clean(workspace: Path, *, workspace_copy: bool = True) -> list[Path]:
     """Remove generated artifacts. Used by ``abox nuke``."""
     removed: list[Path] = []
-    target_dir = artifacts_dir(workspace)
+    target_dir = artifacts_path(workspace)
     if target_dir.exists():
         for path in sorted(target_dir.iterdir()):
             path.unlink(missing_ok=True)
@@ -656,7 +665,7 @@ def clean(workspace: Path, *, workspace_copy: bool = True) -> list[Path]:
 
 def inspect_rendered(workspace: Path) -> dict[str, Any]:
     """Load the runspec — the argv abox will actually run."""
-    path = artifacts_dir(workspace) / ARTIFACT_RUNSPEC
+    path = artifacts_path(workspace) / ARTIFACT_RUNSPEC
     if not path.is_file():
         return {}
     try:
@@ -666,7 +675,7 @@ def inspect_rendered(workspace: Path) -> dict[str, Any]:
 
 
 def runspec_path(workspace: Path) -> Path:
-    return artifacts_dir(workspace) / ARTIFACT_RUNSPEC
+    return artifacts_path(workspace) / ARTIFACT_RUNSPEC
 
 
 def artifacts_dir_is_private(workspace: Path) -> bool:

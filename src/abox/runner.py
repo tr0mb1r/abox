@@ -81,6 +81,14 @@ def boundary_checks(
 ) -> list[BoundaryCheck]:
     """Static checks on the rendered config — run before the container exists."""
     checks: list[BoundaryCheck] = []
+
+    # First, before anything else touches the state dir. `render.artifacts_path`
+    # is inspect-only and every reader below now takes it, but this check is the
+    # one that has already been defeated once by a caller that looked innocent —
+    # reading the mode before any other statement runs is the cheap belt to that
+    # braces, and costs a stat.
+    artifacts_private = render.artifacts_dir_is_private(workspace)
+
     rendered = render.inspect_rendered(workspace)
 
     if not rendered:
@@ -120,14 +128,14 @@ def boundary_checks(
         BoundaryCheck("no-published-ports", not published, "agent must publish nothing")
     )
 
-    firewall = render.artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    firewall = render.artifacts_path(workspace) / render.ARTIFACT_FIREWALL
     checks.append(
         BoundaryCheck("firewall-script", firewall.is_file(), f"expected at {firewall}")
     )
     checks.append(
         BoundaryCheck(
             "artifacts-private",
-            render.artifacts_dir_is_private(workspace),
+            artifacts_private,  # stat'd at the top, before anything could repair it
             "the mounted artifacts dir must not be group/world accessible",
         )
     )
@@ -228,7 +236,7 @@ def build(
     repository it is about to sandbox.
     """
     runspec = load_runspec(workspace)
-    context = render.artifacts_dir(workspace)
+    context = render.ensure_artifacts_dir(workspace)
     argv = [
         "docker",
         "build",
@@ -427,7 +435,7 @@ def stage_mcp_config(config: GlobalConfig, workspace: Path) -> None:
     """
     from . import render
 
-    source = render.artifacts_dir(workspace) / render.ARTIFACT_MCP
+    source = render.artifacts_path(workspace) / render.ARTIFACT_MCP
     if not source.is_file():
         raise BoundaryError(
             f"no MCP config rendered at {source}",
@@ -584,7 +592,7 @@ def run(
     # If the token was re-minted or the port moved since the last render, the
     # agent would come up with no working MCP at all — catch it here rather
     # than as a confusing 401 in the middle of a session.
-    rendered_mcp = render.artifacts_dir(workspace) / render.ARTIFACT_MCP
+    rendered_mcp = render.artifacts_path(workspace) / render.ARTIFACT_MCP
     if rendered_mcp.is_file():
         current = json.loads(rendered_mcp.read_text(encoding="utf-8"))
         expected = gateway.mcp_config(spec)

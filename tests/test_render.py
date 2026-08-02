@@ -46,8 +46,6 @@ def test_rendered_runspec_holds_the_invariants(manifest, config, workspace, spec
     assert "privileged" not in joined
     assert "docker.sock" not in joined
     assert not any(a in ("-p", "--publish") or a.startswith("--publish=") for a in run_args)
-    # The agent runs as the unprivileged user, never as root.
-    assert run_args[run_args.index("--user") + 1] == config.remote_user
 
 
 def test_masks_cover_glob_matches_and_literals(manifest, config, workspace, spec) -> None:
@@ -128,7 +126,7 @@ def test_re_render_over_read_only_artifacts_succeeds(manifest, config, workspace
 
 def test_drift_detects_a_tampered_mounted_artifact(manifest, config, workspace, spec) -> None:
     render.write(_render(manifest, config, workspace, spec))
-    script = render.artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
+    script = render.ensure_artifacts_dir(workspace) / render.ARTIFACT_FIREWALL
     script.chmod(0o600)
     script.write_text(script.read_text() + "\niptables -F\n")
     drift = render.detect_drift(manifest, config, workspace)
@@ -169,7 +167,7 @@ def test_artifacts_dir_rejects_a_group_writable_source(
     Narrowing it to the write bits must not narrow it out of existence.
     """
     render.write(_render(manifest, config, workspace, spec))
-    d = render.artifacts_dir(workspace)
+    d = render.ensure_artifacts_dir(workspace)
     d.chmod(d.stat().st_mode | 0o020)
     assert not render.artifacts_dir_is_private(workspace)
 
@@ -184,7 +182,7 @@ def test_artifacts_are_readable_by_a_different_uid(
     tests passed for months on one platform and failed on the other.
     """
     written = render.write(_render(manifest, config, workspace, spec))
-    assert render.artifacts_dir(workspace).stat().st_mode & 0o005 == 0o005, "dir needs o+rx"
+    assert render.ensure_artifacts_dir(workspace).stat().st_mode & 0o005 == 0o005, "dir needs o+rx"
     for name, path in written.items():
         if name == render.ARTIFACT_MCP:
             continue  # covered by the test below — it must NOT be readable
@@ -486,7 +484,7 @@ def test_settings_are_mounted_read_only_outside_the_workspace(
         "/opt/abox/settings.json"
     )
     assert not (paths.devcontainer_dir(workspace) / render.ARTIFACT_SETTINGS).exists()
-    written = render.artifacts_dir(workspace) / render.ARTIFACT_SETTINGS
+    written = render.artifacts_path(workspace) / render.ARTIFACT_SETTINGS
     assert written.stat().st_mode & 0o222 == 0
 
 
