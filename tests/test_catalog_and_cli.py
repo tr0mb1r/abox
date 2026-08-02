@@ -244,6 +244,74 @@ def test_mcp_add_and_rm(tmp_path: Path, catalog_file: Path) -> None:
     assert Manifest.load(project).servers == []
 
 
+def test_mcp_rm_removes_a_narrowed_server(tmp_path: Path, catalog_file: Path) -> None:
+    """The manifest validates on assignment, so dropping the server before the
+    tools filter that names it raised a raw pydantic error — for the exact
+    narrowing `abox mcp add --tool` advertises."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    assert cli.invoke(
+        app,
+        ["mcp", "add", "github-official", "--tool", "list_issues", "--dir", str(project)],
+    ).exit_code == 0
+    assert Manifest.load(project).tools == {"github-official": ["list_issues"]}
+
+    result = cli.invoke(app, ["mcp", "rm", "github-official", "--dir", str(project)])
+    assert result.exit_code == 0, result.output + (result.stderr or "")
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    written = Manifest.load(project)
+    assert written.servers == []
+    assert written.tools == {}
+
+
+def test_mcp_rm_takes_the_servers_network_pin_with_it(
+    tmp_path: Path, catalog_file: Path
+) -> None:
+    """`server_network` was never cleared, so a server pinned to `network: none`
+    — the one setting Docker actually enforces — could not be removed at all."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    cli.invoke(app, ["mcp", "add", "duckduckgo", "--dir", str(project)])
+    manifest = Manifest.load(project)
+    manifest.server_network = {"duckduckgo": "none"}
+    manifest.write(project)
+
+    result = cli.invoke(app, ["mcp", "rm", "duckduckgo", "--dir", str(project)])
+    assert result.exit_code == 0, result.output + (result.stderr or "")
+    written = Manifest.load(project)
+    assert written.servers == []
+    assert written.server_network == {}
+
+
+def test_mcp_rm_remote_removes_a_narrowed_remote_server(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """Same ordering bug on the remote path: `remote_servers` was assigned
+    before the tools filter naming it was cleared."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    assert cli.invoke(
+        app,
+        [
+            "mcp", "add-remote", "hosted",
+            "--url", "https://mcp.example.com/mcp",
+            "--dir", str(project),
+        ],
+    ).exit_code == 0
+    manifest = Manifest.load(project)
+    manifest.tools = {"hosted": ["search"]}
+    manifest.write(project)
+
+    result = cli.invoke(app, ["mcp", "rm-remote", "hosted", "--dir", str(project)])
+    assert result.exit_code == 0, result.output + (result.stderr or "")
+    written = Manifest.load(project)
+    assert written.remote_servers == {}
+    assert written.tools == {}
+
+
 def test_mcp_add_warns_about_required_secrets(tmp_path: Path, catalog_file: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
@@ -307,6 +375,32 @@ def test_egress_ignore_removes_it_from_the_queue(tmp_path: Path, catalog_file: P
         app, ["egress", "unignore", "telemetry.vendor.io", "--dir", str(project)]
     ).exit_code == 0
     assert Manifest.load(project).egress_ignored == []
+
+
+def test_egress_ignore_rerenders_the_firewall(tmp_path: Path, catalog_file: Path) -> None:
+    """"Still blocked" is a claim about the rendered artifact, not the manifest.
+
+    `ignore` un-allowed the domain in agentbox.yaml and stopped there, so the
+    init-firewall.sh the next container actually runs kept it in ALLOW_DOMAINS —
+    and nothing gates a `run` on that drift.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    firewall = render.artifacts_path(project) / render.ARTIFACT_FIREWALL
+
+    assert cli.invoke(
+        app, ["egress", "add", "telemetry.vendor.io", "--dir", str(project)]
+    ).exit_code == 0
+    # The positive path: allowing it really does reach the rendered script, so
+    # its absence below means the re-render happened rather than that the
+    # allowlist never renders at all.
+    assert "telemetry.vendor.io" in firewall.read_text()
+
+    assert cli.invoke(
+        app, ["egress", "ignore", "telemetry.vendor.io", "--dir", str(project)]
+    ).exit_code == 0
+    assert "telemetry.vendor.io" not in firewall.read_text()
 
 
 # -- host inventory --------------------------------------------------------
@@ -419,6 +513,25 @@ def test_secrets_rm_refuses_while_referenced(tmp_path: Path, catalog_file: Path,
     assert runner.find("docker mcp secret rm")
 
 
+def test_secrets_rm_reports_a_refused_removal(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """Every sibling command exits 1 on failure; this one printed a yellow note
+    and exited 0, so `abox secrets rm leaked.key && echo revoked` said "revoked"
+    over a credential still in the keychain — and dropped the digest that a
+    later `check` would have needed to notice it was still there."""
+    from abox import secrets as secrets_mod
+
+    runner.expect(r"docker mcp secret ls", "docker/mcp/leaked.key | docker-pass\n")
+    secrets_mod.set_secret("leaked.key", "value", reference="test", source="test")
+    runner.expect(r"docker mcp secret rm", "", returncode=1, stderr="daemon busy")
+
+    result = cli.invoke(app, ["secrets", "rm", "leaked.key"])
+    assert result.exit_code == 1
+    assert "could not remove leaked.key" in result.output
+    assert secrets_mod.SyncState.load().digest_of("leaked.key") is not None
+
+
 def test_secrets_rm_drops_the_stale_digest(tmp_path: Path, catalog_file: Path, runner) -> None:
     """Leaving the digest would make a later `check` compare against a secret
     that no longer exists."""
@@ -524,6 +637,49 @@ def test_a_created_profile_is_saved_once_the_manifest_is(
     assert GlobalConfig.load().profiles["research"].port == 9999
 
 
+def test_a_profile_invented_then_backed_out_of_is_not_saved(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """The orphan-profile-holding-a-port defect, moved from cancel to save: every
+    created profile was written whether or not the manifest referenced it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def invent_then_reconsider(draft, ctx):
+        draft.created_profiles["research"] = ProfileConfig(port=9999)
+        draft.profile = "default"  # reopened the row and picked the existing one
+        return True
+
+    monkeypatch.setattr(picker, "review_and_edit", invent_then_reconsider)
+    assert cli.invoke(app, ["init", "--dir", str(project)]).exit_code == 0
+    assert "research" not in GlobalConfig.load().profiles
+    assert Manifest.load(project).profile == "default"
+
+
+def test_an_invented_name_that_already_exists_keeps_its_port(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """The picker allocates a port for every name it treats as new, including one
+    that is already taken — writing it would move the gateway port for every
+    project already on that profile."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    original = GlobalConfig.load().profiles["default"].port
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def retype_an_existing_name(draft, ctx):
+        draft.profile = "default"
+        draft.created_profiles["default"] = ProfileConfig(port=9999)
+        return True
+
+    monkeypatch.setattr(picker, "review_and_edit", retype_an_existing_name)
+    assert cli.invoke(app, ["init", "--dir", str(project)]).exit_code == 0
+    assert GlobalConfig.load().profiles["default"].port == original
+
+
 def test_a_credential_stored_before_cancelling_is_named(
     tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
 ) -> None:
@@ -541,6 +697,67 @@ def test_a_credential_stored_before_cancelling_is_named(
     result = cli.invoke(app, ["init", "--dir", str(project)])
     assert "github.personal_access_token" in result.output
     assert "abox secrets rm" in result.output
+
+
+def test_a_stale_tools_filter_does_not_sink_the_save(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """`--server` seeds the server list; a narrowing left over from the previous
+    manifest then named a server nobody declares, and the manifest only failed
+    validation at Save — after the review screen, with every answer lost."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes", "--server", "github-official"])
+    cli.invoke(
+        app,
+        ["mcp", "add", "duckduckgo", "--tool", "search", "--dir", str(project)],
+    )
+    cli.invoke(
+        app,
+        ["mcp", "add", "github-official", "--tool", "list_issues", "--dir", str(project)],
+    )
+    cli.invoke(
+        app,
+        ["mcp", "add-remote", "hosted", "--url", "https://mcp.example.com/mcp",
+         "--dir", str(project)],
+    )
+    manifest = Manifest.load(project)
+    manifest.tools = {**manifest.tools, "hosted": ["ask"]}
+    manifest.write(project)
+
+    result = cli.invoke(app, ["init", "--dir", str(project), "--yes", "--server", "duckduckgo"])
+    assert result.exit_code == 0, result.output + (result.stderr or "")
+    written = Manifest.load(project)
+    assert written.servers == ["duckduckgo"]
+    # The undeclared server's filter goes; the ones still declared stay — a
+    # filter dropped from a server you kept would silently widen its tool list.
+    assert written.tools == {"duckduckgo": ["search"], "hosted": ["ask"]}
+
+
+def test_a_credential_stored_before_ctrl_c_is_named(
+    tmp_path: Path, catalog_file: Path, monkeypatch: pytest.MonkeyPatch, runner
+) -> None:
+    """Ctrl-C is the documented way to cancel the whole thing, and it arrives as
+    AboxError('cancelled') — past the menu-Cancel branch that names what was
+    stored. Output used to be exactly 'error: cancelled'."""
+    from abox.errors import AboxError
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(picker, "interactive", lambda: True)
+    monkeypatch.setattr(picker, "choose_setup_mode", lambda *a, **k: "quick")
+
+    def stored_then_interrupted(draft, ctx):
+        draft.stored_secrets.append("github.personal_access_token")
+        raise AboxError("cancelled")
+
+    monkeypatch.setattr(picker, "review_and_edit", stored_then_interrupted)
+    result = cli.invoke(app, ["init", "--dir", str(project)])
+    combined = result.output + (result.stderr or "")
+    assert result.exit_code != 0
+    assert "github.personal_access_token" in combined
+    assert "abox secrets rm" in combined
+    assert not paths.manifest_path(project).is_file()
 
 
 def test_next_steps_names_the_login_step(
@@ -607,6 +824,8 @@ def test_up_removes_this_projects_superseded_images(
     project.mkdir()
     cli.invoke(app, ["init", "--dir", str(project), "--yes"])
     current = render.inspect_rendered(project)["image"]
+    # What an earlier `abox up` in this workspace left behind.
+    cli_mod._record_built_images(project, ["abox-agent-proj:oldoldoldold"])
     _ready(
         runner,
         f"{current}\tsha256:new\t1.4GB\nabox-agent-proj:oldoldoldold\tsha256:old\t1.35GB\n",
@@ -615,6 +834,65 @@ def test_up_removes_this_projects_superseded_images(
     removed = runner.find("image rm")
     assert [c.argv[-1] for c in removed] == ["abox-agent-proj:oldoldoldold"]
     assert "reclaimed 1.4 GB" in result.output or "reclaimed 1.3 GB" in result.output
+    # The tag is gone from the machine, so it must be gone from the ledger too.
+    assert cli_mod._built_images(project) == [current]
+
+
+def test_up_leaves_a_same_named_workspaces_images_alone(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """`project` defaults to the directory name, so it is not an identity.
+
+    ~/work/api and ~/personal/api build tags under the same `abox-agent-api`
+    repository. Pruning on the repository alone deleted the other workspace's
+    current image on every `abox up` — a multi-gigabyte rebuild each way, for
+    ever. Only what this workspace recorded building is in scope.
+    """
+    mine = tmp_path / "work" / "api"
+    mine.mkdir(parents=True)
+    theirs = tmp_path / "personal" / "api"
+    theirs.mkdir(parents=True)
+    cli.invoke(app, ["init", "--dir", str(mine), "--yes"])
+    cli.invoke(app, ["init", "--dir", str(theirs), "--yes", "--server", "duckduckgo"])
+    ours = render.inspect_rendered(mine)["image"]
+    hers = render.inspect_rendered(theirs)["image"]
+    assert ours.split(":")[0] == hers.split(":")[0] == "abox-agent-api"
+    assert ours != hers, "different manifests must build different tags — test is stale"
+
+    cli_mod._record_built_images(mine, ["abox-agent-api:mineold00000"])
+    cli_mod._record_built_images(theirs, [hers])
+    _ready(
+        runner,
+        f"{ours}\tsha256:new\t1.4GB\n{hers}\tsha256:hers\t1.4GB\n"
+        f"abox-agent-api:mineold00000\tsha256:old\t1.3GB\n",
+    )
+    cli.invoke(app, ["up", "--dir", str(mine)])
+    # The positive half: this workspace's own stale tag still gets reclaimed.
+    assert [c.argv[-1] for c in runner.find("image rm")] == ["abox-agent-api:mineold00000"]
+    assert cli_mod._built_images(theirs) == [hers]
+
+
+def test_up_skips_an_image_docker_refuses_to_remove(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """A tag a container still references is refused, and that is the right
+    answer — so the refusal is skipped rather than forced, nothing is claimed as
+    reclaimed, and the tag stays in the ledger for the next prune to retry."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    current = render.inspect_rendered(project)["image"]
+    cli_mod._record_built_images(project, ["abox-agent-proj:pinned000000"])
+    runner.expect(r"image rm", "", returncode=1, stderr="image is being used by container")
+    _ready(
+        runner,
+        f"{current}\tsha256:new\t1.4GB\nabox-agent-proj:pinned000000\tsha256:old\t1.35GB\n",
+    )
+    result = cli.invoke(app, ["up", "--dir", str(project)])
+    assert runner.find("image rm"), "the prune never tried"
+    assert "--force" not in runner.argv_blob
+    assert "reclaimed" not in result.output
+    assert "abox-agent-proj:pinned000000" in cli_mod._built_images(project)
 
 
 def test_up_never_removes_the_image_it_just_built(
@@ -770,6 +1048,98 @@ def test_nuke_only_sweeps_this_projects_containers(
         )
 
 
+def test_nuke_yes_keeps_the_auth_volume_and_drop_auth_is_its_own_flag(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """`--yes` means "take the default answer", and the prompt it replaces
+    defaults to keeping. It used to mean "delete", so `abox nuke -y` in a
+    cleanup script took the Claude login and the session history with it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    runner.expect(r"volume inspect", "{}")
+    auth = paths.claude_volume(project)
+
+    kept = cli.invoke(app, ["nuke", "--dir", str(project), "--yes"])
+    assert kept.exit_code == 0, kept.output
+    assert not runner.find(f"volume rm {auth}")
+    assert f"auth volume {auth} kept" in kept.output
+
+    # The positive path through the same control: asked for explicitly, it goes.
+    dropped = cli.invoke(app, ["nuke", "--dir", str(project), "--yes", "--drop-auth"])
+    assert dropped.exit_code == 0, dropped.output
+    assert runner.find(f"volume rm {auth}")
+
+
+def test_nuke_without_a_terminal_and_without_yes_refuses(
+    tmp_path: Path, catalog_file: Path, runner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confirmation was skipped rather than enforced when stdin was a pipe,
+    which made the non-tty path the least confirmed one."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    monkeypatch.setattr(picker, "interactive", lambda: False)
+
+    result = cli.invoke(app, ["nuke", "--dir", str(project)])
+    assert result.exit_code != 0
+    assert "refusing to nuke" in result.output + (result.stderr or "")
+    assert not runner.find("docker rm")
+    assert not runner.find("volume rm")
+
+
+def test_nuke_removes_only_the_images_this_workspace_built(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """Same collision as the prune: `abox-agent-api` is shared by every workspace
+    whose directory is called api, and a teardown of one is not a teardown of the
+    others. The image abox rendered for this workspace counts as this
+    workspace's even without a ledger entry."""
+    mine = tmp_path / "work" / "api"
+    mine.mkdir(parents=True)
+    theirs = tmp_path / "personal" / "api"
+    theirs.mkdir(parents=True)
+    cli.invoke(app, ["init", "--dir", str(mine), "--yes"])
+    cli.invoke(app, ["init", "--dir", str(theirs), "--yes", "--server", "duckduckgo"])
+    ours = render.inspect_rendered(mine)["image"]
+    hers = render.inspect_rendered(theirs)["image"]
+    cli_mod._record_built_images(mine, ["abox-agent-api:mineold00000"])
+    runner.expect(
+        r"image ls abox-agent-",
+        f"{ours}\tsha256:new\t1.4GB\n{hers}\tsha256:hers\t1.4GB\n"
+        f"abox-agent-api:mineold00000\tsha256:old\t1.3GB\n",
+    )
+
+    result = cli.invoke(app, ["nuke", "--dir", str(mine), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert {c.argv[-1] for c in runner.find("image rm")} == {
+        "abox-agent-api:mineold00000",
+        ours,
+    }
+    assert "removed 2 agent image(s)" in result.output
+
+
+def test_nuke_counts_only_the_images_docker_actually_removed(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """A tag pinned by a container is refused; reporting it as removed overstates
+    a teardown, and the teardown claim is part of the security story."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    current = render.inspect_rendered(project)["image"]
+    cli_mod._record_built_images(project, ["abox-agent-proj:pinned000000"])
+    runner.expect(r"image rm abox-agent-proj:pinned000000", "", returncode=1)
+    runner.expect(
+        r"image ls abox-agent-",
+        f"{current}\tsha256:new\t1.4GB\nabox-agent-proj:pinned000000\tsha256:old\t1.35GB\n",
+    )
+
+    result = cli.invoke(app, ["nuke", "--dir", str(project), "--yes"])
+    assert "removed 1 agent image(s)" in result.output
+    assert "removed 2 agent image(s)" not in result.output
+
+
 # -- agent text is data, not markup ---------------------------------------
 
 
@@ -907,3 +1277,76 @@ def test_a_custom_server_settles_the_collision_and_is_reported_as_yours(
     manifest = Manifest(project="p", profile="dev", servers=["github-official"])
     checks = {c.id: c for c in doctor_mod.check_servers(manifest, cat, custom, config)}
     assert checks["servers.catalog-shadowing"].status is doctor_mod.Status.ok
+
+
+def test_an_invented_profile_reaches_config_yaml(
+    tmp_path: Path, catalog_file: Path, monkeypatch
+) -> None:
+    """The guard used to ask the wrong object.
+
+    `pick_profile` inserts the invented profile into the same in-memory
+    GlobalConfig the picker was handed, so `manifest.profile not in
+    config.profiles` was answering "did the picker just add it" — always True —
+    and the save branch never ran. The manifest was then written pointing at a
+    profile config.yaml did not contain, and every later abox command exited 1
+    with `unknown profile`.
+
+    Reproduced at the guard by seeding exactly the state the picker leaves
+    behind: the profile in `created_profiles` AND already inserted into the
+    live config object.
+    """
+    from abox import picker as picker_mod
+    from abox.manifest import GlobalConfig
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    real_seed = picker_mod.seed_draft
+
+    def seed_and_invent(**kwargs):
+        draft = real_seed(**kwargs)
+        profile = ProfileConfig(port=8899)
+        kwargs["config"].profiles["research"] = profile  # what pick_profile does
+        draft.created_profiles["research"] = profile
+        draft.profile = "research"
+        return draft
+
+    monkeypatch.setattr(picker_mod, "seed_draft", seed_and_invent)
+    result = cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    assert result.exit_code == 0, result.output
+
+    saved = GlobalConfig.load()
+    assert "research" in saved.profiles, "invented profile never reached config.yaml"
+    assert Manifest.load(project).profile == "research"
+    # ...and the project is actually usable afterwards, which is the real claim.
+    assert cli.invoke(app, ["egress", "list", "--dir", str(project)]).exit_code == 0
+
+
+def test_egress_ignore_refuses_a_mandatory_host_cleanly(tmp_path: Path, catalog_file: Path) -> None:
+    """It must refuse, and refuse as an abox error — a pydantic ValidationError
+    escaping the command gives the operator a raw traceback where every other
+    abox failure is a formatted line."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+
+    result = cli.invoke(app, ["egress", "ignore", "api.anthropic.com", "--dir", str(project)])
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit), (
+        f"raw exception escaped the command: {result.exception!r}"
+    )
+    assert "cannot be ignored" in (result.output + (result.stderr or ""))
+
+
+def test_a_manifest_written_by_an_older_abox_still_loads(
+    tmp_path: Path, catalog_file: Path
+) -> None:
+    """Exactly what the previous version wrote. Refusing to load it would brick
+    every command, including the one that repairs it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    path = paths.manifest_path(project)
+    path.write_text(path.read_text() + "egress_ignored:\n  - api.anthropic.com\n", encoding="utf-8")
+
+    assert cli.invoke(app, ["egress", "list", "--dir", str(project)]).exit_code == 0
+    assert Manifest.load(project).egress_ignored == []

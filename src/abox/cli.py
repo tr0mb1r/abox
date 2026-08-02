@@ -31,6 +31,7 @@ from .manifest import (
     SecretsConfig,
     ServerNetwork,
     effective_allowlist,
+    effective_allowlist_mandatory,
     format_errors,
     merged_egress,
 )
@@ -181,10 +182,19 @@ def init(
     Opens a review screen with every setting already filled in from what abox
     detected; pick a line to change it, and nothing is written until you save.
     """
+    draft: picker.InitDraft | None = None
     try:
         workspace = (directory or Path.cwd()).expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         config = GlobalConfig.load()
+        # Snapshot before the picker runs. `pick_profile` inserts an invented
+        # profile straight into this same object so the rest of the screen can
+        # price it, which means `manifest.profile not in profiles_on_disk` below
+        # is answering "did the picker just add it", not "was it already on
+        # disk" — and it is always False. The save was dead code, and a project
+        # could be written pointing at a profile config.yaml did not contain,
+        # after which every abox command exited 1 with `unknown profile`.
+        profiles_on_disk = set(config.profiles)
         cat, _custom = _catalog()
         for warning in cat.warnings:
             console.print(f"[yellow]![/] {warning}")
@@ -227,14 +237,24 @@ def init(
 
         target = manifest.write(workspace)
         console.print(f"[green]✔[/] wrote {target}")
-        if draft.created_profiles:
-            # Deferred until the manifest exists: the picker used to save a new
-            # profile the moment it was named, so cancelling left an orphan
-            # profile holding a port in the global config.
-            config.profiles.update(draft.created_profiles)
+        # Deferred until the manifest exists: the picker used to save a new
+        # profile the moment it was named, so cancelling left an orphan profile
+        # holding a port in the global config. And only the profile the manifest
+        # actually ended up on — inventing one in the review screen and then
+        # picking something else left exactly that orphan again, one screen
+        # later. A name that already exists keeps its own port: the picker
+        # allocates one for every name it treats as new, and writing it would
+        # move the gateway for every project already on that profile.
+        invented = draft.created_profiles.get(manifest.profile)
+        if invented is not None and manifest.profile not in profiles_on_disk:
+            config.profiles[manifest.profile] = invented
             config.save()
-            for profile_name in draft.created_profiles:
-                console.print(f"[green]✔[/] added profile {profile_name} to the global config")
+            console.print(f"[green]✔[/] added profile {manifest.profile} to the global config")
+        elif invented is not None:
+            console.print(
+                f"[dim]profile {manifest.profile} already exists — keeping its port "
+                f"{config.profiles[manifest.profile].port}[/]"
+            )
 
         result = render_mod.render(manifest, config, workspace, _spec(manifest, config))
         written = render_mod.write(result)
@@ -252,6 +272,13 @@ def init(
         else:
             _print_next_steps(manifest)
     except AboxError as exc:
+        # Ctrl-C at the review screen is the documented way to cancel, and it
+        # arrives here as AboxError("cancelled") — past the menu-Cancel branch
+        # that names stored credentials. A secret typed during setup is already
+        # in the OS keychain by then and cancelling cannot take it back, so it
+        # gets named on every exit, not only the tidy one.
+        if draft is not None:
+            _warn_orphan_secrets(draft)
         _fail(exc)
 
 
@@ -281,7 +308,17 @@ def _manifest_from(
         "project": draft.project,
         "profile": draft.profile,
         "servers": draft.servers,
-        "tools": draft.tools,
+        # Only for servers still declared, for the same reason as
+        # `server_network` below. A `--server` list that drops a previously
+        # narrowed server used to reach validation with the stale filter still
+        # attached, so init exited 1 *after* the review screen and threw away
+        # every answer in it. Remote servers keep their filters: the picker does
+        # not edit them, and they are declared in the manifest this folds over.
+        "tools": {
+            name: tools
+            for name, tools in draft.tools.items()
+            if name in draft.servers or name in base.get("remote_servers", {})
+        },
         "toolchains": draft.toolchains,
         # Only for servers still declared: a `server_network` key naming a server
         # that is no longer in `servers` fails validation.
@@ -429,23 +466,65 @@ def up(
             )
         runspec = runner.load_runspec(workspace)
         console.print(f"[green]✔[/] agent image built: {runspec['image']}")
-        _prune_superseded_images(manifest.project, keep=str(runspec["image"]))
+        _prune_superseded_images(workspace, manifest.project, keep=str(runspec["image"]))
     except AboxError as exc:
         _fail(exc)
 
 
-def _prune_superseded_images(project: str, *, keep: str) -> None:
-    """Drop this project's older agent images once the new one exists.
+def _image_ledger(workspace: Path) -> Path:
+    return paths.project_state_dir(workspace) / "images.json"
+
+
+def built_images_for(workspace: Path) -> list[str]:
+    """Tags this workspace is recorded as having built. Public for `doctor`.
+
+    Doctor needs it to tell a superseded image abox can reclaim from one that
+    predates the ledger and belongs to nobody it can identify.
+    """
+    return _built_images(workspace)
+
+
+def _built_images(workspace: Path) -> list[str]:
+    """The agent image tags *this workspace* built. Ownership, not inventory.
+
+    The tag is ``abox-agent-<project>:<manifest-digest>`` and ``project``
+    defaults to the directory name, so ~/work/api and ~/personal/api share the
+    repository half of every tag they build. Selecting on that alone made a
+    routine ``abox up`` in one of them delete the other's current image — a
+    multi-gigabyte rebuild, and a permanent ping-pong once both were in use.
+    Every other per-workspace resource is keyed by ``paths.project_hash``; the
+    tag itself cannot be, so the workspace keeps its own ledger and never removes
+    a tag missing from it. An image built before this file existed is therefore
+    left alone: guessing wrong here deletes another workspace's image.
+    """
+    try:
+        data = json.loads(_image_ledger(workspace).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [str(tag) for tag in data] if isinstance(data, list) else []
+
+
+def _record_built_images(workspace: Path, tags: list[str]) -> None:
+    paths.ensure_project_state(workspace)
+    _image_ledger(workspace).write_text(json.dumps(tags, indent=2) + "\n", encoding="utf-8")
+
+
+def _prune_superseded_images(workspace: Path, project: str, *, keep: str) -> None:
+    """Drop this workspace's older agent images once the new one exists.
 
     The tag is content-addressed, so every edit to the manifest builds a new one
     and used to leave the last behind forever — well over a gigabyte a time, and
-    the review screen makes editing the normal thing to do. Only this project's
-    ``abox-agent-*`` tags are ever considered, and only after the replacement has
-    built: a failed build leaves you with the image you had.
+    the review screen makes editing the normal thing to do. Only tags this
+    workspace is recorded as having built are ever considered, and only after the
+    replacement has built: a failed build leaves you with the image you had.
     """
-    superseded = [img for img in dockerx.agent_images(project) if img.tag != keep]
-    if not superseded:
-        return
+    known = _built_images(workspace)
+    if keep not in known:
+        known.append(keep)
+    owned = set(known)
+    superseded = [
+        img for img in dockerx.agent_images(project) if img.tag != keep and img.tag in owned
+    ]
     removed, reclaimed = [], 0
     for image in superseded:
         # A tag still referenced by a container is refused by Docker; that is the
@@ -453,6 +532,7 @@ def _prune_superseded_images(project: str, *, keep: str) -> None:
         if dockerx.remove_image(image.tag):
             removed.append(image.tag)
             reclaimed += image.size
+    _record_built_images(workspace, [tag for tag in known if tag not in set(removed)])
     if not removed:
         return
     console.print(
@@ -896,6 +976,34 @@ def mcp_add_remote(
         _fail(exc if isinstance(exc, AboxError) else AboxError(str(exc)))
 
 
+def _drop_server(manifest: Manifest, name: str, *, remote: bool) -> Manifest:
+    """Undeclare a server and everything keyed on it, in one validation pass.
+
+    The model validates on assignment, so removing it field by field walks
+    through a state where ``tools`` — or ``server_network`` — still names a
+    server ``servers`` no longer declares. That raises a pydantic
+    ValidationError, which is not an AboxError and was caught by nothing: `abox
+    mcp rm` answered any narrowed server with a traceback and left it declared
+    and still exposed to the agent. ``server_network`` was never cleared at all,
+    so a server pinned to ``network: none`` could not be removed by any argument.
+    """
+    data = manifest.model_dump(mode="json")
+    if remote:
+        data["remote_servers"] = {
+            k: v for k, v in data["remote_servers"].items() if k != name
+        }
+    else:
+        data["servers"] = [s for s in data["servers"] if s != name]
+    data["tools"] = {k: v for k, v in data["tools"].items() if k != name}
+    data["server_network"] = {k: v for k, v in data["server_network"].items() if k != name}
+    try:
+        return Manifest.model_validate(data)
+    except ValidationError as exc:
+        raise AboxError(
+            f"removing {name!r} does not leave a valid manifest:\n" + format_errors(exc)
+        ) from exc
+
+
 @mcp_app.command("rm-remote")
 def mcp_rm_remote(
     name: Annotated[str, typer.Argument()],
@@ -906,10 +1014,7 @@ def mcp_rm_remote(
         workspace, manifest, config = _load(directory)
         if name not in manifest.remote_servers:
             raise AboxError(f"{name!r} is not a declared remote server")
-        manifest.remote_servers = {
-            k: v for k, v in manifest.remote_servers.items() if k != name
-        }
-        manifest.tools = {k: v for k, v in manifest.tools.items() if k != name}
+        manifest = _drop_server(manifest, name, remote=True)
         manifest.write(workspace)
         render_mod.write(render_mod.render(manifest, config, workspace, _spec(manifest, config)))
         _bind(workspace, manifest)
@@ -992,8 +1097,7 @@ def mcp_rm(
         workspace, manifest, config = _load(directory)
         if server not in manifest.servers:
             raise AboxError(f"{server!r} is not declared in this manifest")
-        manifest.servers = [s for s in manifest.servers if s != server]
-        manifest.tools = {k: v for k, v in manifest.tools.items() if k != server}
+        manifest = _drop_server(manifest, server, remote=False)
         manifest.write(workspace)
         render_mod.write(render_mod.render(manifest, config, workspace, _spec(manifest, config)))
         _bind(workspace, manifest)
@@ -1060,10 +1164,29 @@ def egress_ignore(
     you have already ruled on keeps reappearing until you stop reading the list.
     """
     try:
-        workspace, manifest, _config = _load(directory)
+        workspace, manifest, config = _load(directory)
+        # Refuse here, where the operator is making the decision, rather than by
+        # rejecting the file later: `merged_egress` unions these unconditionally,
+        # so recording one as ignored would print "still blocked" about a host
+        # the rendered firewall goes on allowing.
+        unconditional = set(effective_allowlist_mandatory(manifest, config))
+        refused = sorted({d.lower() for d in domains} & unconditional)
+        if refused:
+            raise AboxError(
+                f"{', '.join(refused)} cannot be ignored — it is allowlisted "
+                "unconditionally, so 'ignored' would be a decision abox does not "
+                "enforce",
+                hint="remove it from `defaults.egress_mandatory` in config.yaml "
+                "first if you really do not want it allowed",
+            )
         manifest.egress = [d for d in manifest.egress if d not in {x.lower() for x in domains}]
         manifest.egress_ignored = [*manifest.egress_ignored, *domains]
         manifest.write(workspace)
+        # The allowlist is baked into init-firewall.sh, so dropping a domain from
+        # the manifest alone left the rendered ipset still allowing it — and
+        # nothing gates a `run` on that drift. "Still blocked" has to be true of
+        # the artifact, not just of the manifest, before it is printed.
+        render_mod.write(render_mod.render(manifest, config, workspace, _spec(manifest, config)))
         console.print(
             f"[green]✔[/] ignoring {', '.join(domains)} — still blocked, no longer listed"
         )
@@ -1241,21 +1364,34 @@ def secrets_rm(
             )
 
         state = secrets_mod.SyncState.load()
+        failed: list[str] = []
         for name in names:
             if name not in present:
                 console.print(f"[dim]{name} was not in the store[/]")
+                gone = True
             elif secrets_mod.docker_secret_rm(name):
                 console.print(f"[green]✔[/] removed {name}")
+                gone = True
             else:
                 console.print(f"[yellow]![/] could not remove {name}")
-            # Drop the digest either way: keeping it would make a later `check`
-            # compare against a secret that no longer exists.
-            state.entries.pop(name, None)
+                gone = False
+                failed.append(name)
+            if gone:
+                # Drop the digest: keeping it would make a later `check` compare
+                # against a secret that no longer exists. A *failed* removal
+                # keeps it, because the secret is still there and `check` is the
+                # thing that would otherwise be able to say so.
+                state.entries.pop(name, None)
             for use in index.get(name, []):
                 console.print(
                     f"  [yellow]still referenced by {use.project} → {use.kind} {use.detail}[/]"
                 )
         state.save()
+        if failed:
+            # Revocation is scripted — `abox secrets rm x && echo revoked` used
+            # to print "revoked" over a credential still in the keychain and
+            # still injectable by the gateway.
+            raise typer.Exit(1)
     except AboxError as exc:
         _fail(exc)
 
@@ -1675,12 +1811,30 @@ def nuke(
     keep_auth: Annotated[
         bool, typer.Option("--keep-auth", help="Never touch the Claude auth volume.")
     ] = False,
-    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not prompt.")] = False,
+    drop_auth: Annotated[
+        bool,
+        typer.Option(
+            "--drop-auth",
+            help="Also remove the Claude auth volume (drops the login and session history).",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Do not prompt; take the default answer to each."),
+    ] = False,
 ) -> None:
     """Remove containers and generated artifacts for this project."""
     try:
         workspace, manifest, _config = _load(directory)
-        if not yes and picker.interactive():
+        if not yes:
+            # Without a terminal there is nobody to ask, and proceeding anyway
+            # made a piped `abox nuke` the one destructive path that ran with no
+            # confirmation at all.
+            if not picker.interactive():
+                raise AboxError(
+                    "refusing to nuke unconfirmed: there is no terminal to ask on",
+                    hint="pass --yes (which keeps the auth volume) to mean it",
+                )
             import questionary
 
             if not questionary.confirm(
@@ -1715,17 +1869,32 @@ def nuke(
                 f"{len(registry.projects)} other project(s) use it[/]"
             )
 
-        removed = render_mod.clean(workspace)
-        console.print(f"[green]✔[/] removed {len(removed)} generated artifact(s)")
+        # Read before clean(): the runspec is one of the artifacts it deletes,
+        # and the tag abox rendered for this workspace is the one image we can
+        # claim without the ledger — a workspace that built before the ledger
+        # existed still gets its current image torn down.
+        rendered_image = str(render_mod.inspect_rendered(workspace).get("image") or "")
+        artifacts = render_mod.clean(workspace)
+        console.print(f"[green]✔[/] removed {len(artifacts)} generated artifact(s)")
 
         # After the containers, so nothing still references them. A teardown that
-        # leaves gigabytes of this project's images behind is not a teardown.
-        images = dockerx.agent_images(manifest.project)
-        reclaimed = sum(img.size for img in images if dockerx.remove_image(img.tag))
-        if reclaimed:
+        # leaves gigabytes of this project's images behind is not a teardown —
+        # but `abox-agent-<project>` is not unique per workspace (see
+        # _built_images), so only what this workspace built is in scope, and only
+        # the tags Docker actually removed are counted.
+        owned = {*_built_images(workspace), *([rendered_image] if rendered_image else [])}
+        removed, reclaimed = [], 0
+        for image in dockerx.agent_images(manifest.project):
+            if image.tag in owned and dockerx.remove_image(image.tag):
+                removed.append(image.tag)
+                reclaimed += image.size
+        if removed:
             console.print(
-                f"[green]✔[/] removed {len(images)} agent image(s), "
+                f"[green]✔[/] removed {len(removed)} agent image(s), "
                 f"{_human_bytes(reclaimed)} reclaimed"
+            )
+            _record_built_images(
+                workspace, [tag for tag in _built_images(workspace) if tag not in set(removed)]
             )
 
         # Dropped unconditionally, unlike the auth volume: `abox up` rebuilds it
@@ -1740,8 +1909,13 @@ def nuke(
         if keep_auth or not dockerx.volume_exists(volume):
             console.print(f"[dim]auth volume {volume} kept[/]")
         else:
-            drop = yes
-            if not yes and picker.interactive():
+            # `--yes` means "take the default answer", and the default here is
+            # No — the prompt it replaces defaults to keeping. It used to mean
+            # "delete", so a cleanup script that only wanted disk back silently
+            # took the Claude login and the whole session history with it, for a
+            # volume the help text never put in scope.
+            drop = drop_auth
+            if not yes and not drop_auth and picker.interactive():
                 import questionary
 
                 drop = bool(
