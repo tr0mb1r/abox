@@ -201,14 +201,31 @@ abox run --resume <session-id> "and the tests?"
 abox doctor
 ```
 
-A healthy project looks like:
+The tally line at the bottom reads `<n> ok, <n> warn, 0 fail, <n> skipped`. The
+ok/warn/skip counts move with what your project declares; **the number to look
+at is `fail`, and on a healthy project it is `0`.**
 
-```
-26 ok, 1 warn, 0 fail, 1 skipped
-```
+Warns are not a to-do list. Two of them are standing facts about this design and
+will not go away:
 
-The usual warn is an unpinned gateway image; doctor prints the exact digest to
-paste into `~/.config/abox/config.yaml`.
+- **`agent.auth-credential`** — the Claude OAuth credential lives in the
+  per-project `~/.claude` volume, and the agent runs as the user that owns it.
+  It can read that credential and send it to any allowed domain. There is no
+  setting that removes this; the check exists so it is never silent.
+- **`servers.network`** — every MCP server you did *not* pin to `network: none`
+  runs on the gateway's network, which is outside the agent's firewall, the SNI
+  proxy and the scoped DNS all at once. Expected for a server that needs the
+  internet; fix it only for one that does not.
+
+Declare a remote server and you get **`remote.trust`** too — somebody else
+operates that endpoint and there is no digest to pin.
+
+What is *not* a warn: **`gateway.image-pinned` is a failure.** The gateway is the
+one container that mounts the Docker socket, so a mutable tag there is an offer
+to swap the most privileged process in the system, and abox ships that image
+digest-pinned by default. If you see it red, run `abox gateway update` — it
+resolves the tag and writes the digest back into
+`~/.config/abox/config.yaml` for you.
 
 The part worth reading every time is the **egress review queue** — names the
 agent looked up that the firewall refused:

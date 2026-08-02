@@ -250,11 +250,27 @@ Host prerequisites:
 
 **Linux and colima are not supported yet**, and the reason is not portability
 alone: off Docker Desktop, secrets fall back from the OS keychain to a `.env`
-file on disk, which changes a security claim rather than an install step. The
-two other blockers are the `iptables` backend (the image installs it from apt
-with no `nft`/`legacy` selection, so rules could be accepted and match nothing)
-and colima, which behaves more like Docker Desktop than like Linux because its
-bind mounts cross a filesystem shim. None of this has been run on Linux.
+file on disk, which changes a security claim rather than an install step.
+
+The test suite, however, *does* run on Linux, and that is where two of the
+security claims turned out to be false. `.github/workflows/ci.yml` runs the unit
+tests on `ubuntu-latest` under 3.12 and 3.13;
+`.github/workflows/linux-docker.yml` runs `uv run pytest -m docker` there
+against a live daemon, and both pass today. Getting there took fixing IPv6
+egress (an unconfigured `ip6tables` defaults to policy ACCEPT, so a client that
+prefers AAAA walked past the whole allowlist — unnoticed because Docker Desktop
+has no IPv6 while a Linux host may) and the
+`.abox` artifacts directory (mode 0700 owned by the host user: Linux enforces
+uid/mode on a bind mount, so every container got EACCES, and Docker Desktop
+hides that by ignoring both).
+
+What is still unmeasured is the `iptables` backend beyond the runner's kernel —
+the image installs `iptables` from apt with no `nft`/`legacy` selection, so on a
+distro that disagrees the rules could be accepted and match nothing — anything
+past Ubuntu's defaults (SELinux, rootless Docker, `systemd-resolved`), and
+colima, which behaves more like Docker Desktop than like Linux because its bind
+mounts cross a filesystem shim. See [SECURITY.md](SECURITY.md) for the row-level
+detail.
 
 **No npm, no Node, no `@devcontainers/cli` on the host.** abox drives the Docker
 CLI itself and bakes Claude Code into the image from its checksum-verified

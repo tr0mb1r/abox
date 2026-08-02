@@ -202,10 +202,23 @@ matters for "boundary-spanning" servers (§7.3, §13).
 the easy way to get it on macOS. But at least one security claim changes off
 Desktop: secrets fall back from the OS keychain to a `.env` file on disk.
 
-Two other blockers: the image installs `iptables` from apt with no
-`nft`/`legacy` selection, so rules could be accepted and match nothing; and
-colima behaves more like Docker Desktop than like Linux, because its bind mounts
-cross a filesystem shim. None of this has been run on Linux.
+The suite itself, though, runs on Linux.
+`.github/workflows/ci.yml` runs the unit tests on `ubuntu-latest` under 3.12 and
+3.13; `.github/workflows/linux-docker.yml` runs `uv run pytest -m docker` there
+against a live daemon. Both pass — but only after Linux showed two controls to
+be absent that macOS reported as present: IPv6 egress was unrestricted, because
+an unconfigured `ip6tables` defaults to policy ACCEPT and nothing set it (§9),
+and `.abox` was mode 0700 owned by the host user, which Docker Desktop ignores
+and Linux enforces, so every container that mounts it got EACCES. A control
+tested only where it cannot fail is not tested; SECURITY.md names both.
+
+What remains unmeasured: the `iptables` backend beyond the runner's own kernel —
+the image installs `iptables` from apt with no `nft`/`legacy` selection, so
+against a distro kernel that disagrees the rules could be accepted and match
+nothing; everything past Ubuntu's defaults (SELinux, AppArmor confinement,
+`systemd-resolved` on `127.0.0.53`, rootless Docker, Podman); and colima, which
+behaves more like Docker Desktop than like Linux, because its bind mounts cross
+a filesystem shim.
 
 There is **no npm, no Node, no `@devcontainers/cli`** on the host. abox drives
 the Docker CLI directly and bakes Claude Code into the agent image from its
@@ -466,7 +479,10 @@ attach`, etc. all edit it and re-render — but every one of those is just a typ
 mutation of this file. Re-running `abox init` is the interactive equivalent: it
 opens the review screen on what is already here, and merges rather than replaces,
 so fields the picker never asks about (`env_secrets`, `egress_ignored`,
-`mounts.watch`, everything in `run` bar the permission mode) survive untouched.
+`mounts.watch`, and `remote_servers` together with their tool narrowing) survive
+untouched. Everything under `run` *is* asked: the review screen has a row for
+each of `permission_mode`, `connectors`, `output` and `timeout`, so those four
+come back written from whatever the screen was saved with.
 
 ### `mounts.mask` vs `mounts.watch`
 
@@ -1098,17 +1114,24 @@ abox nuke -y             # don't prompt
 ### Running abox in CI
 
 `abox run` is headless and GitHub Actions is headless, so this looks like an
-obvious fit. **Don't, yet** — and the reason is not effort.
+obvious fit. **Not supported yet** — but the reason has changed, so it is worth
+being precise about what is now known.
 
 CI would want `permission_mode: bypassPermissions`, since a permission prompt in
-a headless job is a hang. That mode is gated on the firewall being present. What
-is not established is that the firewall *bites* on a Linux runner: the image
-installs `iptables` from apt with no backend selection, and an nft/legacy
-mismatch leaves rules that are accepted and match nothing (§3, and the Linux
-note). The `firewall-ok` marker will not catch it — it proves the script ran,
-and the script's assertions read back through the same binary that wrote the
-rules. A job like that runs an agent in the least-restricted mode behind an
-unmeasured firewall and reports green, which is worse than not running it.
+a headless job is a hang, and that mode is gated on the firewall being present.
+Until recently there was no evidence the firewall *bit* on a Linux runner. There
+is now: `linux-docker.yml` runs `pytest -m docker` on `ubuntu-latest`, and it
+asserts the redirect exists in `iptables -t nat -S OUTPUT`
+(`test_the_sni_agent_firewall_is_actually_live`), that an unallowed host is
+unreachable (`test_default_deny_egress`), and — the pairing that makes the
+refusal mean anything — that an *allowed* host reaches its destination through
+the proxy's own log rather than around it
+(`test_the_allowed_connection_goes_through_the_proxy`). That is the nft/legacy
+question answered for that kernel. It is not answered for a self-hosted runner
+on some other distro, where an accepted-but-matching-nothing ruleset would still
+report green: the `firewall-ok` marker will not catch that, because it proves
+the script ran and the script's assertions read back through the same binary
+that wrote the rules.
 
 Two more things worth knowing before anyone tries:
 
@@ -1116,15 +1139,17 @@ Two more things worth knowing before anyone tries:
   abox's own; the agent uses the `~/.claude` OAuth volume, which a fresh runner
   does not have. The supported route is `env_secrets: {ANTHROPIC_API_KEY: …}`,
   which is exactly the weakening `agent.env-secrets` reports — in CI the egress
-  allowlist becomes the only thing between a live API key and an attacker.
+  allowlist becomes the only thing between a live API key and an attacker. This
+  one is unchanged by any amount of Linux testing, and it is now the main reason
+  to stay away.
 - **A runner is already a disposable VM.** Ephemerality is what it is for, so
-  abox buys that property twice. What would still be worth having is the egress
-  allowlist, the review queue, and MCP behind one endpoint — and all three
-  depend on the firewall working, which is the open question.
+  abox buys that property twice. What is worth having is the egress allowlist,
+  the review queue, and MCP behind one endpoint — and those depend on the
+  firewall working, which on `ubuntu-latest` is now measured rather than assumed.
 
-The right first step is not `abox run` in Actions. It is running
-`uv run pytest -m docker` on a Linux host once and seeing what the firewall
-assertions do.
+So the first step for anyone attempting this on a runner that is not
+`ubuntu-latest` is still `uv run pytest -m docker` on that host, and reading
+what the firewall assertions do there before trusting a green run.
 
 ---
 
