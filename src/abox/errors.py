@@ -46,6 +46,25 @@ class DockerError(AboxError):
     """A ``docker`` invocation failed."""
 
 
+class CommandTimeoutError(AboxError):
+    """An external command exceeded its timeout and was killed.
+
+    ``subprocess.TimeoutExpired`` is not an ``AboxError``, so before this class
+    existed a timeout reached the user as a traceback — on the rare paths where
+    it could fire at all. The streaming path, which is every ``docker build``,
+    ``docker run`` and ``docker exec``, could not time out in the first place.
+    """
+
+    def __init__(self, argv: list[str], timeout: float) -> None:
+        super().__init__(
+            f"`{' '.join(argv[:3])}` exceeded its {timeout:.0f}s timeout and was killed",
+            hint="raise `run.timeout` in agentbox.yaml if the work is genuinely "
+            "this long, or check whether the container is wedged",
+        )
+        self.argv = argv
+        self.timeout = timeout
+
+
 class GatewayError(AboxError):
     """Gateway container is missing, unhealthy, or refused to start."""
 

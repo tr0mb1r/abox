@@ -17,11 +17,13 @@ import contextlib
 import os
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
-from .errors import HostToolError
+from .errors import CommandTimeoutError, HostToolError
 
 DEFAULT_TIMEOUT = 120
 
@@ -108,9 +110,61 @@ def _real_runner(argv: Sequence[str], opts: RunOptions) -> Result:
     return Result(tuple(argv), proc.returncode, proc.stdout, proc.stderr)
 
 
+#: How long a killed child gets to die before we stop waiting for it, and how
+#: long a pipe-reader thread gets to finish once the child is gone. Both are
+#: bounded because a grandchild can inherit the pipe and hold it open forever.
+_REAP_GRACE = 10
+_PUMP_JOIN = 5
+
+
+def _pump(pipe: IO[str], sink: list[str], on_line: Callable[[str], None] | None) -> None:
+    """Drain one pipe to EOF. Never raises into the caller's thread."""
+    try:
+        for line in pipe:
+            sink.append(line)
+            if on_line:
+                on_line(line.rstrip("\n"))
+    except (ValueError, OSError):
+        # The pipe was closed under us while the child was being killed.
+        pass
+
+
+def _terminate(proc: subprocess.Popen[str]) -> None:
+    """SIGTERM, then SIGKILL if it is still there, then reap it."""
+    with contextlib.suppress(OSError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=_REAP_GRACE)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_REAP_GRACE)
+
+
 def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Result:
-    """Run a long-lived command, forwarding stdout lines as they arrive."""
+    """Run a long-lived command, forwarding stdout lines as they arrive.
+
+    Both pipes are drained on their own threads while this one waits on the
+    child, which is what makes the timeout real. The obvious shape —
+    ``for line in proc.stdout`` then ``proc.wait(timeout=…)`` — is wrong twice
+    over, and streaming is the default path for every ``docker build``,
+    ``docker run`` and ``docker exec`` abox makes:
+
+    * the timeout was unreachable. A child that stalls without printing blocks
+      in the iterator forever and never arrives at ``wait``. Even on arrival,
+      ``TimeoutExpired`` propagating out of the ``with`` sent ``Popen.__exit__``
+      into ``wait()`` with no timeout at all, and nothing ever killed the child.
+    * stderr has its own ~64 KiB pipe buffer, and it was read only after stdout
+      hit EOF. A child that fills it blocks writing while we block reading
+      stdout — a deadlock with no timeout to break it. ``docker build`` puts the
+      whole BuildKit progress stream on stderr, so this was one long build away.
+    """
     chunks: list[str] = []
+    err_chunks: list[str] = []
+    timeout = opts.timeout or None
     with subprocess.Popen(
         list(argv),
         cwd=str(opts.cwd) if opts.cwd else None,
@@ -121,14 +175,30 @@ def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Resul
         text=True,
         bufsize=1,
     ) as proc:
-        assert proc.stdout is not None  # noqa: S101 - Popen contract with PIPE
-        for line in proc.stdout:
-            chunks.append(line)
-            if opts.on_line:
-                opts.on_line(line.rstrip("\n"))
-        proc.wait(timeout=opts.timeout)
-        stderr = proc.stderr.read() if proc.stderr else ""
-    return Result(tuple(argv), proc.returncode, "".join(chunks), stderr)
+        assert proc.stdout is not None and proc.stderr is not None  # noqa: S101
+        pumps = [
+            threading.Thread(
+                target=_pump, args=(proc.stdout, chunks, opts.on_line), daemon=True
+            ),
+            threading.Thread(target=_pump, args=(proc.stderr, err_chunks, None), daemon=True),
+        ]
+        for pump in pumps:
+            pump.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate(proc)
+            for pump in pumps:
+                pump.join(_PUMP_JOIN)
+            raise subprocess.TimeoutExpired(
+                list(argv), timeout or 0, output="".join(chunks), stderr="".join(err_chunks)
+            ) from None
+        # The child is gone; the pumps are draining what is left in the buffers.
+        # Bounded, because a grandchild holding the pipe would otherwise hang us
+        # here instead — truncated output beats a wedged CLI.
+        for pump in pumps:
+            pump.join(_PUMP_JOIN)
+    return Result(tuple(argv), proc.returncode, "".join(chunks), "".join(err_chunks))
 
 
 _runner: Runner = _real_runner
@@ -151,9 +221,23 @@ def using_runner(runner: Runner) -> Iterator[None]:
         set_runner(previous)
 
 
+def _invoke(argv: Sequence[str], opts: RunOptions) -> Result:
+    """Call the installed runner, turning a timeout into a user-facing error.
+
+    Both real paths can raise ``TimeoutExpired`` — ``subprocess.run`` does it
+    itself, and ``_stream`` now does it after killing the child — and nothing in
+    abox catches it, so it reached the CLI as a traceback. A timeout is an
+    expected failure, not a bug.
+    """
+    try:
+        return _runner(list(argv), opts)
+    except subprocess.TimeoutExpired as exc:
+        raise CommandTimeoutError(list(argv), float(exc.timeout or opts.timeout)) from exc
+
+
 def run(argv: Sequence[str], **kwargs: object) -> Result:
     """Run a command and capture its output."""
-    return _runner(list(argv), RunOptions(**kwargs))  # type: ignore[arg-type]
+    return _invoke(list(argv), RunOptions(**kwargs))  # type: ignore[arg-type]
 
 
 def run_piped(argv: Sequence[str], stdin_data: str, **kwargs: object) -> Result:
@@ -162,7 +246,7 @@ def run_piped(argv: Sequence[str], stdin_data: str, **kwargs: object) -> Result:
     The only sanctioned path for a secret value. Never log ``stdin_data``, never
     echo it back, never let it reach argv.
     """
-    return _runner(list(argv), RunOptions(stdin_data=stdin_data, **kwargs))  # type: ignore[arg-type]
+    return _invoke(list(argv), RunOptions(stdin_data=stdin_data, **kwargs))  # type: ignore[arg-type]
 
 
 def which(tool: str) -> str | None:
