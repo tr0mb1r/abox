@@ -1163,6 +1163,7 @@ execution-adjacent file snapshot after you have read the diff.
 | egress review queue | looked-up-but-not-allowed domains, with counts |
 | agent hygiene | no `docker.sock` mount, no published ports, no `--privileged`, a non-root `--user` and an isolated `--network` — all read out of the rendered runspec |
 | tool narrowing | a declared `tools:` filter is present in the running gateway's `--tools=` argv, or the check fails and names the project on this profile that widened it |
+| catalog shadowing | a declared server is defined by exactly one file under `~/.docker/mcp/catalogs/`. `docker mcp catalog import` writes there, files merge in filename order, and the last one wins — so an imported file can repoint an official server at any image, with its own digest satisfying `servers.pinned` |
 | single MCP endpoint | one endpoint unless `run.connectors` deliberately turns on the claude.ai path |
 
 ---

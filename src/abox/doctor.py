@@ -197,6 +197,7 @@ def check_servers(
         )
     )
     checks.extend(check_remote_servers(manifest, catalog, remote_catalog))
+    checks.append(check_catalog_shadowing(manifest, catalog))
     checks.extend(check_custom_servers(manifest, custom))
     checks.extend(check_boundary_spanning_servers(manifest))
     checks.append(check_server_network(manifest, config, catalog))
@@ -479,6 +480,55 @@ def check_server_network(
         "`server_network: {<name>: none}` for any server that does not need the "
         "internet; there is no setting that constrains one that does",
         data={"isolated": isolated, "unconstrained": unconstrained},
+    )
+
+
+def check_catalog_shadowing(manifest: Manifest, catalog: Catalog) -> Check:
+    """Is a declared server defined by more than one catalog file?
+
+    ``~/.docker/mcp/catalogs/`` is where ``docker mcp catalog import <url>``
+    puts third-party content, and abox merges every file there in filename
+    order with the last one winning. A file that sorts after ``docker-mcp`` can
+    therefore redefine ``github-official`` to any image it likes, and nothing
+    downstream notices: ``servers.declared`` passes because the name resolves,
+    and ``servers.pinned`` passes because the substituted entry carries the
+    substituter's own digest. Pinning proves an image cannot change under you.
+    It says nothing about whose image it was to begin with.
+
+    Scoped to declared servers on purpose. A collision between two entries this
+    project never uses is noise; a collision on one it runs is a supply-chain
+    substitution, so it fails rather than warns — unlike the custom-server
+    overlay, which the operator wrote themselves and which `catalog.load`
+    already reports.
+    """
+    affected = {
+        name: files for name, files in catalog.shadowed.items() if name in manifest.all_servers
+    }
+    if not affected:
+        return Check(
+            id="servers.catalog-shadowing",
+            title="declared servers come from one catalog file each",
+            status=Status.ok,
+            detail=f"{len(manifest.all_servers)} declared server(s), no cross-file collisions",
+        )
+    detail = "; ".join(
+        f"{name}: defined in {', '.join(files)} — {files[-1]} wins"
+        for name, files in sorted(affected.items())
+    )
+    winners = sorted({files[-1] for files in affected.values()})
+    return Check(
+        id="servers.catalog-shadowing",
+        title="declared servers come from one catalog file each",
+        status=Status.fail,
+        detail=detail,
+        hint=(
+            f"inspect ~/.docker/mcp/catalogs/{winners[0]}.yaml — an imported "
+            "catalog can repoint a server at any image, and a digest on that "
+            "entry proves only that the substitution is stable. Remove the file "
+            "or pin the server yourself in ~/.config/abox/custom-servers.yaml, "
+            "which takes precedence and is reported as yours"
+        ),
+        data={"shadowed": affected},
     )
 
 

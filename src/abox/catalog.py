@@ -107,6 +107,12 @@ class Catalog:
 
     servers: dict[str, CatalogServer] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: Names defined by more than one catalog *file*, in load order — the last
+    #: wins. Not the same as the custom-server overlay, which the operator wrote
+    #: deliberately: these files land in ~/.docker/mcp/catalogs/ via
+    #: `docker mcp catalog import`, so a collision here is a substitution the
+    #: operator never asked for. `doctor` fails on it for a declared server.
+    shadowed: dict[str, list[str]] = field(default_factory=dict)
 
     def __contains__(self, name: object) -> bool:
         return name in self.servers
@@ -176,13 +182,27 @@ def _parse_v3_registry(data: dict, source: str) -> dict[str, CatalogServer]:
     return out
 
 
-def load_local_catalogs() -> tuple[dict[str, CatalogServer], list[str]]:
-    """Parse every ``registry:``-shaped yaml under the Docker MCP catalog dir."""
+def load_local_catalogs() -> tuple[dict[str, CatalogServer], list[str], dict[str, list[str]]]:
+    """Parse every ``registry:``-shaped yaml under the Docker MCP catalog dir.
+
+    Files are merged in filename order and a later one wins, which is fine as a
+    rule and was silent as a behaviour. ``~/.docker/mcp/catalogs/`` is where
+    ``docker mcp catalog import <url>`` puts third-party content, so a file that
+    sorts after ``docker-mcp`` can redefine ``github-official`` to point at any
+    image it likes — and every downstream control still passes, because
+    ``servers.pinned`` is satisfied by the attacker's own digest.
+
+    The third return value records every name defined more than once, in load
+    order, so the winner is the last entry. abox already warns for the two other
+    shadowing directions (custom-over-catalog here, manifest-remote-over-catalog
+    in ``doctor``); this is the one that nobody authored deliberately.
+    """
     servers: dict[str, CatalogServer] = {}
     warnings: list[str] = []
+    origins: dict[str, list[str]] = {}
     directory = catalog_dir()
     if not directory.is_dir():
-        return servers, [f"no Docker MCP catalog dir at {directory}"]
+        return servers, [f"no Docker MCP catalog dir at {directory}"], {}
     for path in sorted(directory.glob("*.yaml")):
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -191,10 +211,19 @@ def load_local_catalogs() -> tuple[dict[str, CatalogServer], list[str]]:
             continue
         if not isinstance(data, dict) or "registry" not in data:
             continue
-        servers.update(_parse_v3_registry(data, source=path.stem))
+        parsed = _parse_v3_registry(data, source=path.stem)
+        for name in parsed:
+            origins.setdefault(name, []).append(path.stem)
+        servers.update(parsed)
+    shadowed = {name: files for name, files in origins.items() if len(files) > 1}
+    for name, files in sorted(shadowed.items()):
+        warnings.append(
+            f"catalog entry {name!r} is defined in {', '.join(files)} — "
+            f"{files[-1]} wins"
+        )
     if not servers:
         warnings.append(f"no catalog entries found under {directory}")
-    return servers, warnings
+    return servers, warnings, shadowed
 
 
 def load_oci_catalog(ref: str = DEFAULT_CATALOG_REF) -> tuple[dict[str, CatalogServer], list[str]]:
@@ -286,17 +315,24 @@ def load(
     allow_oci_fallback: bool = True,
 ) -> Catalog:
     """Load the merged catalog. Custom servers win on name collision."""
-    servers, warnings = load_local_catalogs()
+    servers, warnings, cross_file = load_local_catalogs()
     if not servers and allow_oci_fallback:
         oci, oci_warnings = load_oci_catalog()
-        servers, warnings = oci, [*warnings, *oci_warnings]
+        servers, warnings, cross_file = oci, [*warnings, *oci_warnings], {}
     custom = custom if custom is not None else CustomServers.load()
     overlay = custom_to_catalog(custom)
     shadowed = sorted(set(overlay) & set(servers))
     for name in shadowed:
         warnings.append(f"custom server {name!r} shadows the catalog entry of the same name")
     servers.update(overlay)
-    return Catalog(servers=servers, warnings=warnings)
+    # A custom entry the operator wrote themselves is the last word, and it is
+    # already reported above — so it settles the collision rather than leaving
+    # the imported file to be blamed for a name it no longer supplies.
+    return Catalog(
+        servers=servers,
+        warnings=warnings,
+        shadowed={k: v for k, v in cross_file.items() if k not in overlay},
+    )
 
 
 # -- host inventory --------------------------------------------------------
