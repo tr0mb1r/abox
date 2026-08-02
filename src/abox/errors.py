@@ -56,10 +56,14 @@ class CommandTimeoutError(AboxError):
     """
 
     def __init__(self, argv: list[str], timeout: float) -> None:
+        # No config pointer: `run.timeout` governs exactly one caller (the agent
+        # exec), and every other timeout here is a constant the operator cannot
+        # raise — so naming it sends most readers to edit a setting that has no
+        # bearing on the command that actually failed.
         super().__init__(
             f"`{' '.join(argv[:3])}` exceeded its {timeout:.0f}s timeout and was killed",
-            hint="raise `run.timeout` in agentbox.yaml if the work is genuinely "
-            "this long, or check whether the container is wedged",
+            hint="the process group was killed; check whether Docker or the "
+            "container is wedged, and `abox doctor` for the daemon",
         )
         self.argv = argv
         self.timeout = timeout

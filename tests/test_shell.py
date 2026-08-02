@@ -137,6 +137,56 @@ def test_a_child_that_floods_stderr_does_not_deadlock() -> None:
     assert "done" in result.stdout
 
 
+def _flooding_child(lines: int = 5000) -> list[str]:
+    """A child whose output goes well past one 64 KiB pipe buffer."""
+    pad = "pad" * 20
+    return ["/bin/sh", "-c", f"i=0; while [ $i -lt {lines} ]; do echo '{pad}'; i=$((i+1)); done"]
+
+
+def test_a_raising_on_line_surfaces_fast_instead_of_wedging_the_run() -> None:
+    """on_line runs on a pump thread now, so a callback that raises must not be
+    allowed to stop the drain.
+
+    This is the shape that matters in production: cli._print_stream_event hands
+    unescaped agent text to Rich, so an assistant message mentioning
+    "[/etc/hosts]" raises MarkupError. If that kills the pump, the child blocks
+    on a full pipe and the run wedges until its deadline — 3600s by default —
+    and reports a timeout instead of the error that caused it.
+    """
+    boom = RuntimeError("markup exploded")
+
+    def sink(_line: str) -> None:
+        raise boom
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="markup exploded"):
+        bounded(lambda: shell.run(_flooding_child(), timeout=20, stream=True, on_line=sink))
+    elapsed = time.monotonic() - started
+    assert elapsed < 10, f"took {elapsed:.0f}s — the callback failure stalled the drain"
+
+
+def test_an_on_line_oserror_is_not_swallowed_as_a_clean_run() -> None:
+    """OSError and ValueError are what the pipe-close guard catches, so a
+    callback raising either used to vanish into it: the pump died, the rest of
+    stdout was discarded, and shell.run returned ok with a truncated
+    transcript — a silent corruption reported as success."""
+    def sink(_line: str) -> None:
+        raise OSError(28, "No space left on device")
+
+    with pytest.raises(OSError, match="No space left"):
+        bounded(lambda: shell.run(_flooding_child(50), timeout=20, stream=True, on_line=sink))
+
+
+def test_a_callback_failure_beats_the_timeout_it_would_have_caused() -> None:
+    """If the drain stalls anyway, the reported error must still name the cause.
+    A CommandTimeoutError here sends the reader to look at Docker."""
+    def sink(_line: str) -> None:
+        raise RuntimeError("the real problem")
+
+    with pytest.raises(RuntimeError, match="the real problem"):
+        bounded(lambda: shell.run(_flooding_child(), timeout=2, stream=True, on_line=sink))
+
+
 def test_the_non_streaming_path_reports_a_timeout_the_same_way() -> None:
     """`subprocess.run` raised TimeoutExpired, which is not an AboxError, so a
     timeout reached the user as a traceback on the one path where it could

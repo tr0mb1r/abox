@@ -119,13 +119,39 @@ _TERM_GRACE = 5
 _PUMP_JOIN = 5
 
 
-def _pump(pipe: IO[str], sink: list[str], on_line: Callable[[str], None] | None) -> None:
-    """Drain one pipe to EOF. Never raises into the caller's thread."""
+def _pump(
+    pipe: IO[str],
+    sink: list[str],
+    on_line: Callable[[str], None] | None,
+    failure: list[BaseException],
+) -> None:
+    """Drain one pipe to EOF, whatever the caller's callback does.
+
+    Two separate guards, because they protect against opposite things and
+    collapsing them was a defect in its own right:
+
+    * the read can fail because the pipe was closed under us while the child
+      was being killed — expected, and nothing to report;
+    * the callback can raise for reasons that have nothing to do with the pipe.
+      ``cli._print_stream_event`` hands unescaped agent text to Rich, so an
+      assistant message mentioning ``[/etc/hosts]`` raises ``MarkupError``, and
+      ``abox up | head`` turns a ``BrokenPipeError`` into ``SystemExit``.
+
+    A callback failure must never stop the drain. ``on_line`` used to run on the
+    caller's thread, where it surfaced in milliseconds; on a pump thread, a
+    stopped drain means the child blocks on a full 64 KiB pipe and the whole run
+    wedges until its deadline — up to an hour — reported as a timeout rather
+    than as the error it is. So the exception is recorded, the callback is
+    dropped for the rest of the stream, and the pipe keeps draining.
+    """
     try:
         for line in pipe:
             sink.append(line)
-            if on_line:
-                on_line(line.rstrip("\n"))
+            if on_line is not None and not failure:
+                try:
+                    on_line(line.rstrip("\n"))
+                except BaseException as exc:  # including SystemExit — the caller's to raise
+                    failure.append(exc)
     except (ValueError, OSError):
         # The pipe was closed under us while the child was being killed.
         pass
@@ -196,9 +222,12 @@ def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Resul
         start_new_session=True,
     )
     assert proc.stdout is not None and proc.stderr is not None  # noqa: S101
+    sink_failure: list[BaseException] = []
     pumps = [
-        threading.Thread(target=_pump, args=(proc.stdout, chunks, opts.on_line), daemon=True),
-        threading.Thread(target=_pump, args=(proc.stderr, err_chunks, None), daemon=True),
+        threading.Thread(
+            target=_pump, args=(proc.stdout, chunks, opts.on_line, sink_failure), daemon=True
+        ),
+        threading.Thread(target=_pump, args=(proc.stderr, err_chunks, None, []), daemon=True),
     ]
     for pump in pumps:
         pump.start()
@@ -227,6 +256,12 @@ def _stream(argv: Sequence[str], opts: RunOptions, env: dict[str, str]) -> Resul
             with contextlib.suppress(OSError, ValueError):
                 pipe.close()
 
+    # Before the timeout: a callback that raised is the *cause* of any stall it
+    # produced, and reporting the symptom instead would send the reader to look
+    # at Docker. This is also where it surfaced before on_line moved off this
+    # thread, so callers see the same exception they always did.
+    if sink_failure:
+        raise sink_failure[0]
     if timed_out:
         raise subprocess.TimeoutExpired(
             list(argv), timeout or 0, output="".join(chunks), stderr="".join(err_chunks)
