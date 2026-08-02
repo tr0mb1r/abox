@@ -166,10 +166,19 @@ def logs(name: str, *, tail: int = 200, since: str | None = None) -> str:
     return result.stdout + result.stderr
 
 
-def list_managed(role: str | None = None) -> list[str]:
+def list_managed(role: str | None = None, project: str | None = None) -> list[str]:
+    """Managed containers, optionally narrowed to one role and one project.
+
+    ``project`` is not optional in spirit: every destructive caller must pass it.
+    abox runs one Docker daemon for every workspace on the machine, so a sweep
+    filtered on ``managed=true`` alone selects other projects' containers too —
+    including one that is mid-run.
+    """
     filters = ["--filter", f"label={LABEL_MANAGED}=true"]
     if role:
         filters += ["--filter", f"label={LABEL_ROLE}={role}"]
+    if project:
+        filters += ["--filter", f"label={LABEL_PROJECT}={project}"]
     result = docker("ps", "-a", *filters, "--format", "{{.Names}}", timeout=60)
     return result.lines
 

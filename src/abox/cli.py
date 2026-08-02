@@ -1673,7 +1673,13 @@ def nuke(
             ).ask():
                 raise typer.Exit(0)
 
-        for name in dockerx.list_managed(role="agent"):
+        # Narrowed to this project's label. The sweep used to filter on
+        # `managed=true` + `role=agent` alone, so a nuke in one workspace
+        # `docker rm -f`'d every other workspace's agent container on the host —
+        # including one mid-run, and including a `--keep` container someone was
+        # holding open to read after an incident. The prompt above names one
+        # project; this is what makes that true.
+        for name in dockerx.list_managed(role="agent", project=manifest.project):
             if dockerx.remove(name):
                 console.print(f"[green]✔[/] removed container {name}")
         if proxy_mod.down(manifest.project):

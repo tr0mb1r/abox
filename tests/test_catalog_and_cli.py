@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from abox import catalog as catalog_mod
-from abox import paths, picker, render
+from abox import dockerx, paths, picker, render
 from abox.cli import app
 from abox.manifest import CustomServer, CustomServers, GlobalConfig, Manifest, ProfileConfig
 
@@ -740,3 +740,29 @@ def test_shell_passes_the_firewall_gate_through(
     cli.invoke(app, ["shell", "--dir", str(project)])
     cli.invoke(app, ["shell", "--dir", str(project), "--allow-broken-firewall"])
     assert seen == [True, False]
+
+
+def test_nuke_only_sweeps_this_projects_containers(
+    tmp_path: Path, catalog_file: Path, runner
+) -> None:
+    """The prompt names one project; the sweep used to ignore it.
+
+    Filtering on `managed=true` + `role=agent` alone selects every abox agent
+    container on the host, so a nuke in one workspace `docker rm -f`'d another
+    workspace's container — including one mid-run, and including a `--keep`
+    container someone was holding open to read after an incident.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.invoke(app, ["init", "--dir", str(project), "--yes"])
+    # The daemon honours the filters, so what matters is what abox asks for.
+    runner.expect(r"ps -a .*role=agent", "agent-proj-r1\n")
+
+    cli.invoke(app, ["nuke", "--dir", str(project), "--yes"])
+
+    sweeps = [c for c in runner.find("ps -a") if "role=agent" in c.line]
+    assert sweeps, "nuke never listed agent containers"
+    for call in sweeps:
+        assert f"label={dockerx.LABEL_PROJECT}=proj" in call.line, (
+            f"unscoped sweep would hit every project: {call.line}"
+        )
