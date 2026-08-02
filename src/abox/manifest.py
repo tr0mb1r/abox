@@ -32,6 +32,9 @@ MANIFEST_VERSION = 1
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 #: MCP server names come from the Docker catalog, which is not all-lowercase.
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: POSIX user names, plus a bare numeric uid for anyone who prefers one.
+_REMOTE_USER_RE = re.compile(r"^([a-z_][a-z0-9_-]*|[1-9][0-9]*)$")
+
 #: Docker's own network modes. Each one turns `--network` from "join this
 #: isolated bridge" into "share a namespace someone else owns". `host` is the
 #: dangerous one: abox execs `init-firewall.sh` as root with NET_ADMIN, so on
@@ -155,6 +158,16 @@ def _check_name(value: str, what: str) -> str:
     return value
 
 
+def is_root_user(value: str) -> bool:
+    """Does this ``--user`` value resolve to uid 0?
+
+    Covers the spellings Docker accepts: the name, the bare uid, and either of
+    those with a `:group` suffix.
+    """
+    name = value.strip().split(":", 1)[0].strip().lower()
+    return name in ("root", "0") or name == ""
+
+
 def _check_network(value: str) -> str:
     lowered = value.strip().lower()
     if lowered in RESERVED_NETWORK_MODES or lowered.startswith("container:"):
@@ -164,6 +177,20 @@ def _check_network(value: str) -> str:
             "means those rules land outside the sandbox"
         )
     return _check_name(value, "network name")
+
+
+def _check_remote_user(value: str) -> str:
+    if is_root_user(value):
+        raise ValueError(
+            f"remote_user must not be root ({value!r}): root plus NET_ADMIN lets the "
+            "agent flush the firewall, kill the resolver and forge the marker abox "
+            "reads back as proof the sandbox came up"
+        )
+    if not _REMOTE_USER_RE.match(value.strip().split(":", 1)[0]):
+        raise ValueError(
+            f"remote_user must be a POSIX user name or a non-zero uid, got {value!r}"
+        )
+    return value
 
 
 def _check_server_name(value: str, what: str = "server name") -> str:
@@ -670,6 +697,11 @@ class GlobalConfig(StrictModel):
     @classmethod
     def _validate_network(cls, value: str) -> str:
         return _check_network(value)
+
+    @field_validator("remote_user")
+    @classmethod
+    def _validate_remote_user(cls, value: str) -> str:
+        return _check_remote_user(value)
 
     @model_validator(mode="after")
     def _profiles_have_unique_ports(self) -> Self:

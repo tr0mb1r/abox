@@ -162,6 +162,26 @@ def test_network_boundary_goes_red_on_a_shared_namespace(manifest, config, rende
     assert "host" in check.detail
 
 
+def test_agent_not_root_goes_red_on_a_root_runspec(manifest, config, rendered) -> None:
+    """Root plus NET_ADMIN can flush the firewall and forge the marker abox reads
+    back as proof the sandbox came up."""
+    _retamper_runspec(
+        rendered, lambda a: ["root" if x == config.remote_user else x for x in a]
+    )
+    check = _boundary(manifest, config, rendered, "agent-not-root")
+    assert not check.ok
+    assert "root" in check.detail
+
+
+def test_agent_not_root_goes_red_when_no_user_is_set(manifest, config, rendered) -> None:
+    def drop_user(args: list[str]) -> list[str]:
+        index = args.index("--user")
+        return args[:index] + args[index + 2 :]
+
+    _retamper_runspec(rendered, drop_user)
+    assert not _boundary(manifest, config, rendered, "agent-not-root").ok
+
+
 def test_reserved_network_modes_are_refused_by_the_config(config) -> None:
     for mode in ("host", "none", "bridge", "container:victim"):
         with pytest.raises(pydantic.ValidationError):
@@ -169,15 +189,28 @@ def test_reserved_network_modes_are_refused_by_the_config(config) -> None:
     assert GlobalConfig(network="abox-net").network == "abox-net"
 
 
-def test_doctor_agent_network_goes_red_on_a_shared_namespace(manifest, rendered) -> None:
-    """The doctor twin of the boundary check, read from the same argv."""
-    _retamper_runspec(rendered, lambda a: ["host" if x == "abox-net" else x for x in a])
+def test_root_remote_user_is_refused_by_the_config() -> None:
+    for user in ("root", "0", "0:0", "root:root"):
+        with pytest.raises(pydantic.ValidationError):
+            GlobalConfig(remote_user=user)
+    assert GlobalConfig(remote_user="vscode").remote_user == "vscode"
+    assert GlobalConfig(remote_user="1000").remote_user == "1000"
+
+
+def test_doctor_agent_hygiene_goes_red_on_root_and_host_network(manifest, rendered) -> None:
+    """The doctor twins of the two boundary checks, read from the same argv."""
+    _retamper_runspec(
+        rendered,
+        lambda a: ["host" if x == "abox-net" else "root" if x == "vscode" else x for x in a],
+    )
     checks = {c.id: c for c in doctor.check_agent_hygiene(rendered, manifest)}
+    assert checks["agent.not-root"].status is doctor.Status.fail
     assert checks["agent.network-isolated"].status is doctor.Status.fail
 
 
 def test_doctor_agent_hygiene_is_green_on_a_clean_render(manifest, rendered) -> None:
     checks = {c.id: c for c in doctor.check_agent_hygiene(rendered, manifest)}
+    assert checks["agent.not-root"].status is doctor.Status.ok
     assert checks["agent.network-isolated"].status is doctor.Status.ok
 
 

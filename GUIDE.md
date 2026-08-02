@@ -252,6 +252,7 @@ in prose would be the dishonest way to present this. `abox run` refuses
 | The agent's runspec mounts no Docker socket | no `docker.sock` bind in the rendered argv | `agent.no-docker-sock`, `boundary.no-docker-sock` |
 | The agent publishes nothing | no `-p`/`--publish` in the runspec; the gateway publishes nothing either | `agent.no-published-ports`, `gateway.no-published-ports` |
 | The agent is not privileged | no `--privileged` in the runspec | `agent.not-privileged` |
+| The agent runs as an unprivileged uid | `--user` in the rendered argv is not root, and `remote_user` refuses root at parse time. Root plus `NET_ADMIN` could flush the firewall and forge the marker that gates `bypassPermissions` | `agent.not-root`, `boundary.agent-not-root` |
 | The agent joins an isolated bridge | `--network` in the rendered argv names a user-defined network, never `host`/`none`/`bridge`/`container:` — abox execs the firewall as root, so a shared namespace would land those rules outside the sandbox | `agent.network-isolated`, `boundary.network` |
 | Default-deny egress | in-container iptables + ipset; only addresses resolved from the allowlist, on port 443 by default. The script asserts its own rules and leaves a marker `abox run` reads back — no marker, no agent | `boundary.capabilities`, `boundary.firewall-script` |
 | Domain-level egress (optional) | the SNI proxy decides by TLS server name, so a shared CDN address grants nothing (§9) | `egress.proxy` |
@@ -327,7 +328,7 @@ claude_version: latest                              # or an exact x.y.z to pin C
 toolchain_versions:                                 # fetched from upstream tarballs at build
   go: "1.24.5"
   node: "22.14.0"
-remote_user: vscode                                 # the unprivileged user in the agent image
+remote_user: vscode                                 # the unprivileged user in the agent image; root is refused
 egress_ports: [443]                                 # ports opened to allowlisted addresses; 80 is opt-in
 scoped_dns: true                                    # resolve only allowlisted names (NXDOMAIN else)
 
@@ -1140,7 +1141,7 @@ execution-adjacent file snapshot after you have read the diff.
 | git tamper | workspace `.git/config` fingerprinted key by key since the baseline. Everything not on a small benign list (the keys `git init`, `git branch` and `git remote` write themselves) is watched — `core.hooksPath`, `alias.*`, `core.pager`, `core.fsmonitor`, `core.sshCommand`, `filter.*.clean`, `diff.*.textconv`, `url.*.insteadOf` and the rest all run a command on an ordinary `git log`, on the host |
 | execution-adjacent files | `mounts.watch` paths — CI workflows, `Makefile`, `package.json` scripts, editor tasks — fingerprinted and re-checked. These execute outside the sandbox, so a change is its own finding rather than part of an ordinary workspace diff (§6) |
 | egress review queue | looked-up-but-not-allowed domains, with counts |
-| agent hygiene | no `docker.sock` mount, no published ports, no `--privileged`, and an isolated `--network` — all read out of the rendered runspec |
+| agent hygiene | no `docker.sock` mount, no published ports, no `--privileged`, a non-root `--user` and an isolated `--network` — all read out of the rendered runspec |
 | single MCP endpoint | one endpoint unless `run.connectors` deliberately turns on the claude.ai path |
 
 ---

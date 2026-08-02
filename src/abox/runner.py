@@ -32,6 +32,7 @@ from .manifest import (
     Manifest,
     PermissionMode,
     effective_allowlist,
+    is_root_user,
 )
 from .render import flag_value
 
@@ -130,6 +131,22 @@ def boundary_checks(
             bool(rendered_network) and rendered_network == config.network and not reserved,
             f"agent must join the isolated bridge {config.network!r}"
             + (f", not the shared namespace {rendered_network!r}" if reserved else ""),
+        )
+    )
+
+    # Root inside the container with NET_ADMIN can flush the firewall, kill the
+    # resolver, truncate the DNS log and forge the firewall-ok marker abox reads
+    # back as proof the sandbox came up. Nothing checked it: `remote_user` had no
+    # validator, and the render test compared the rendered argv to the value that
+    # produced it.
+    rendered_user = flag_value(argv, "--user")
+    checks.append(
+        BoundaryCheck(
+            "agent-not-root",
+            bool(rendered_user)
+            and rendered_user == config.remote_user
+            and not is_root_user(rendered_user),
+            f"agent must run as an unprivileged user, not {rendered_user!r}",
         )
     )
 

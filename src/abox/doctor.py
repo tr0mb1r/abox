@@ -33,6 +33,7 @@ from .manifest import (
     PermissionMode,
     SecretsConfig,
     effective_allowlist,
+    is_root_user,
     merged_egress,
     merged_watch,
 )
@@ -1323,6 +1324,38 @@ def check_egress_queue(
 # -- agent hygiene --------------------------------------------------------
 
 
+def _agent_user_check(run_args: list[str]) -> Check:
+    """Read the uid out of the rendered argv, not out of the config.
+
+    Root inside the agent container is not a lesser sandbox, it is no sandbox:
+    with NET_ADMIN it flushes the firewall, kills the resolver, truncates the
+    DNS log and writes its own ``firewall-ok`` — the marker abox reads back as
+    proof the sandbox came up before it grants ``bypassPermissions``.
+    """
+    user = render.flag_value(run_args, "--user")
+    if not user:
+        return Check(
+            id="agent.not-root",
+            title="agent runs unprivileged",
+            status=Status.fail,
+            detail="the runspec sets no --user, so the agent runs as the image's user",
+            hint="set `remote_user` in config.yaml and re-run `abox up`",
+        )
+    root = is_root_user(user)
+    return Check(
+        id="agent.not-root",
+        title="agent runs unprivileged",
+        status=Status.fail if root else Status.ok,
+        detail=f"--user {user}",
+        hint=(
+            "root plus NET_ADMIN can erase the firewall and forge the marker that "
+            "gates bypassPermissions — set `remote_user` to an unprivileged user"
+            if root
+            else ""
+        ),
+    )
+
+
 def _agent_network_check(run_args: list[str]) -> Check:
     """The agent must join an isolated bridge, not a namespace someone else owns.
 
@@ -1384,6 +1417,7 @@ def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> li
             status=Status.fail if privileged else Status.ok,
             detail=", ".join(privileged) if privileged else "no privileged flag",
         ),
+        _agent_user_check(run_args),
         _agent_network_check(run_args),
         _mcp_endpoint_check(manifest),
         check_interactive_claude(workspace),
