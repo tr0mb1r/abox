@@ -10,6 +10,7 @@ from typing import Annotated
 import typer
 from pydantic import ValidationError
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__, dockerx, doctor, gateway, paths, picker, runner, telemetry
@@ -417,7 +418,9 @@ def up(
             manifest,
             workspace,
             no_cache=no_cache,
-            on_line=lambda line: console.print(f"  [dim]{line[:160]}[/]"),
+            # escape: build output is not abox's text either — a Dockerfile
+            # step echoing "[/opt/x]" would raise MarkupError mid-build.
+            on_line=lambda line: console.print(f"  [dim]{escape(line[:160])}[/]"),
         )
         if not build.ok:
             raise AboxError(
@@ -508,7 +511,11 @@ def run(
             resume=resume,
             continue_last=continue_last,
             keep=keep,
-            on_line=None if quiet else (lambda line: console.print(f"[dim]{line[:160]}[/]")),
+            # The raw stream-json line carries the same agent text as the
+            # rendered events, so it needs the same escaping.
+            on_line=None
+            if quiet
+            else (lambda line: console.print(f"[dim]{escape(line[:160])}[/]")),
             on_event=None if quiet else _print_stream_event,
         )
 
@@ -540,22 +547,30 @@ def run(
 
 
 def _print_stream_event(line: str) -> None:
-    """Render Claude's stream-json into something readable."""
+    """Render Claude's stream-json into something readable.
+
+    Every value here is model-influenced, so every one of them is escaped
+    before it reaches a markup-enabled console. Rich reads ``[...]`` as markup,
+    and an assistant message saying it wrote to ``[/etc/hosts]`` — or quoting a
+    regex like ``s/[/]/-/g`` — raises MarkupError on an ordinary sentence.
+    Unescaped, agent text also *is* markup: it could paint its own output green,
+    or forge a line that reads like one of abox's.
+    """
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         return
     kind = event.get("type")
     if kind == "system" and event.get("subtype") == "init":
-        console.print(f"[dim]session {event.get('session_id', '?')}[/]")
+        console.print(f"[dim]session {escape(str(event.get('session_id', '?')))}[/]")
     elif kind == "assistant":
         for block in (event.get("message") or {}).get("content") or []:
             if block.get("type") == "text" and block.get("text", "").strip():
-                console.print(block["text"].strip())
+                console.print(escape(block["text"].strip()))
             elif block.get("type") == "tool_use":
-                console.print(f"[cyan]→ {block.get('name')}[/]")
+                console.print(f"[cyan]→ {escape(str(block.get('name')))}[/]")
     elif kind == "result":
-        console.print(f"[dim]result: {event.get('subtype', 'done')}[/]")
+        console.print(f"[dim]result: {escape(str(event.get('subtype', 'done')))}[/]")
 
 
 @app.command()

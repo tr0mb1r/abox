@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from abox import catalog as catalog_mod
+from abox import cli as cli_mod
 from abox import dockerx, paths, picker, render
 from abox.cli import app
 from abox.manifest import CustomServer, CustomServers, GlobalConfig, Manifest, ProfileConfig
@@ -766,3 +767,47 @@ def test_nuke_only_sweeps_this_projects_containers(
         assert f"label={dockerx.LABEL_PROJECT}=proj" in call.line, (
             f"unscoped sweep would hit every project: {call.line}"
         )
+
+
+# -- agent text is data, not markup ---------------------------------------
+
+
+HOSTILE_TEXT = [
+    "wrote the config to [/etc/hosts]",       # an absolute path in brackets
+    "the regex is s/[/]/-/g",                 # a quoted regex
+    "see [red]this[/blue] for details",       # unbalanced style tags
+    "[bold]not abox's voice[/bold]",          # markup abox uses itself
+]
+
+
+@pytest.mark.parametrize("text", HOSTILE_TEXT)
+def test_agent_text_is_escaped_not_interpreted_as_markup(text: str, capsys) -> None:
+    """Claude's output reaches a markup-enabled Rich console, so it used to be
+    markup: "[/etc/hosts]" raised MarkupError on an ordinary sentence, and that
+    exception — raised inside the stream pump — wedged the whole run until its
+    timeout. Unescaped it is also a spoofing surface: agent text could paint
+    itself green or forge a line that reads like one of abox's own.
+    """
+    event = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    )
+    cli_mod._print_stream_event(event)  # must not raise
+
+    out = capsys.readouterr().out
+    # The brackets survive as literal characters rather than being consumed.
+    assert "[" in out and "]" in out, f"markup was interpreted away: {out!r}"
+
+
+def test_a_tool_name_cannot_inject_markup_into_aboxs_own_line(capsys) -> None:
+    """The tool name is interpolated inside abox's `[cyan]→ …[/]`, so an
+    unescaped one does not merely crash — it closes abox's tag and opens its
+    own."""
+    event = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "x[/][green]safe"}]},
+        }
+    )
+    cli_mod._print_stream_event(event)
+    out = capsys.readouterr().out
+    assert "[/][green]" in out, f"tool name was interpreted as markup: {out!r}"
