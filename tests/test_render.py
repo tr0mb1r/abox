@@ -8,8 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from abox import gateway, paths, render
-from abox.manifest import RESERVED_NETWORK_MODES, GlobalConfig, Manifest, is_root_user
+from abox import gateway, paths, render, shell
+from abox import runner as runner_mod
+from abox.errors import BoundaryError
+from abox.manifest import (
+    RESERVED_NETWORK_MODES,
+    GlobalConfig,
+    Manifest,
+    PermissionMode,
+    is_root_user,
+)
 
 
 @pytest.fixture
@@ -566,3 +574,322 @@ def test_scoped_dns_can_be_turned_off(manifest, config, workspace, spec) -> None
     script = render.render(manifest, config, workspace, spec).artifacts[render.ARTIFACT_FIREWALL]
     assert "address=/#/" not in script
     assert 'echo "server=${UPSTREAM_DNS}"' in script
+
+
+# -- the argv abox actually runs -------------------------------------------
+
+
+@pytest.fixture
+def _gateway_is_up(config: GlobalConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        gateway,
+        "status",
+        lambda profile, _config, **_kw: gateway.GatewayStatus(
+            profile=profile,
+            container=f"abox-gateway-{profile}",
+            exists=True,
+            running=True,
+            healthy=True,
+            detail="ok",
+        ),
+    )
+
+
+def test_run_reads_the_mcp_path_out_of_the_runspec(
+    manifest, config, workspace, runner_fake, monkeypatch, _gateway_is_up
+) -> None:
+    """The argv used to say /opt/abox/mcp.json while every artifact said
+    /run/abox/mcp.json.
+
+    The split is not cosmetic: /opt/abox has to stay readable by whatever uid the
+    container runs as, and mcp.json carries the gateway bearer token — so it is
+    staged onto its own volume at 0400 owned by the agent's uid. Reading it back
+    through the bind meant the mitigation was inert, and meant EACCES on any host
+    whose user is not uid 1000. Assert against the rendered runspec, not against
+    the constant that produced it.
+    """
+    spec = gateway.build_spec("dev", config, servers=manifest.servers)
+    render.write(render.render(manifest, config, workspace, spec))
+    runner_fake.expect(r"image inspect", '[{"Id":"sha256:aa"}]')
+    runner_fake.expect(r"firewall-ok", "ok\n2026-08-02T00:00:00Z\ndomains=3\n")
+
+    executed: list[list[str]] = []
+
+    def capture(_manifest, _provisioned, argv, **_kw):
+        executed.append([str(a) for a in argv])
+        return shell.Result(tuple(argv), 0, "", "")
+
+    monkeypatch.setattr(runner_mod, "exec_in_container", capture)
+    runner_mod.run(manifest, config, workspace, None, "hello")
+
+    runspec = render.inspect_rendered(workspace)
+    assert executed, "claude was never invoked"
+    argv = executed[0]
+    rendered_path = runspec["mcp_config"]
+    assert argv[argv.index("--mcp-config") + 1] == rendered_path
+    # And the path the agent is told to read has to be one the runspec mounts.
+    mount_dir = str(Path(rendered_path).parent)
+    run_args = [str(a) for a in runspec["run_args"]]
+    assert any(f"target={mount_dir}" in a for a in run_args), run_args
+
+
+# -- container lifetime ----------------------------------------------------
+
+
+@pytest.fixture
+def provisionable(manifest, config, workspace, runner_fake) -> Path:
+    """A workspace where `up` can get as far as the firewall exec."""
+    spec = gateway.build_spec("dev", config, servers=manifest.servers)
+    render.write(render.render(manifest, config, workspace, spec))
+    runner_fake.expect(r"image inspect", '[{"Id":"sha256:aa"}]')
+    return workspace
+
+
+def test_up_removes_the_container_when_the_firewall_exec_raises(
+    manifest, provisionable, runner_fake, monkeypatch
+) -> None:
+    """`up` runs before `run`'s try/finally, so it has to own its own cleanup.
+
+    The exec that applies the firewall has a 300s deadline and the script can
+    hit it (`getent` with no timeout, dnsmasq, ipset, iptables). The raise
+    escaped `up` and `run` alike, leaving a container on the bridge with
+    /workspace read-write, the ~/.claude credential volume attached and no
+    firewall — and unreclaimable, because the next `up` removes a name built
+    from a different run_id.
+    """
+
+    def explode(*_args, **_kwargs):
+        raise TimeoutError("firewall exec blew its deadline")
+
+    monkeypatch.setattr(runner_mod, "_apply_firewall", explode)
+
+    with pytest.raises(TimeoutError):
+        runner_mod.up(manifest, provisionable, run_id="r1")
+
+    assert runner_fake.calls[-1].line.startswith("docker rm -f agent-demo-"), (
+        f"the container outlived the failure: {runner_fake.calls[-1].line}"
+    )
+
+
+def test_up_keeps_the_container_when_the_firewall_comes_up(
+    manifest, provisionable, runner_fake
+) -> None:
+    """The positive path through the same cleanup — a removal test alone cannot
+    tell "cleanup ran on failure" from "cleanup always runs"."""
+    provisioned = runner_mod.up(manifest, provisionable, run_id="r1")
+
+    assert provisioned.container_name.startswith("agent-demo-")
+    removals = [c for c in runner_fake.calls if c.line.startswith("docker rm -f agent-demo-")]
+    # Exactly the one `up` does up front to clear a stale name, and no more.
+    assert len(removals) == 1, [c.line for c in runner_fake.calls]
+    assert not runner_fake.calls[-1].line.startswith("docker rm")
+
+
+def test_teardown_removes_the_container_even_if_harvesting_fails(
+    manifest, config, workspace, runner_fake, monkeypatch
+) -> None:
+    """`dockerx.remove` used to be the last of six statements, five of them I/O.
+
+    A docker exec that failed while collecting the audit trail skipped it, and
+    the container survived the run that was supposed to dispose of it.
+    """
+    paths.ensure_project_state(workspace)
+    provisioned = runner_mod.Provisioned(
+        run_id="r1",
+        container_id="",
+        container_name="agent-demo-r1",
+        workspace=workspace,
+        config_path=render.runspec_path(workspace),
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "harvest_logs",
+        lambda _p: (_ for _ in ()).throw(RuntimeError("docker exec died mid-harvest")),
+    )
+
+    with pytest.raises(RuntimeError):
+        runner_mod.teardown(provisioned, manifest, config)
+
+    assert runner_fake.find("docker rm -f agent-demo-r1"), "the container was left running"
+
+
+# -- masks that went stale after the render ---------------------------------
+
+
+def test_a_file_that_started_matching_a_mask_glob_refuses_the_run(
+    manifest, config, workspace, spec
+) -> None:
+    """A mask overlay is a bind mount, fixed at container start.
+
+    So a glob covers only what was on disk at render time, and the default mask
+    is `.env*` — the canonical secret file class. Check out a branch, or let a
+    build step drop `.env.production`, and the run used to proceed with
+    bypassPermissions, every boundary check green, one warn line in preflight,
+    and the agent free to read and exfiltrate the file.
+    """
+    manifest.run.permission_mode = PermissionMode.bypass_permissions
+    render.write(_render(manifest, config, workspace, spec))
+    (workspace / ".env.production").write_text("STRIPE_KEY=sk_live_x\n")
+
+    with pytest.raises(BoundaryError, match="masks-current"):
+        runner_mod.enforce_boundaries(manifest, config, workspace)
+
+    # Nothing else moved: the artifacts still match the manifest that produced
+    # them, so this is the mask gate refusing and not a digest change.
+    checks = runner_mod.boundary_checks(manifest, config, workspace)
+    failed = [c for c in checks if not c.ok]
+    assert [c.name for c in failed] == ["masks-current"], [str(c) for c in failed]
+    assert ".env.production" in failed[0].detail
+
+
+def test_re_rendering_clears_the_stale_mask_and_lets_the_run_through(
+    manifest, config, workspace, spec
+) -> None:
+    """The positive path through the same gate: a refusal proves nothing unless
+    the control also passes when the thing it guards is actually in place."""
+    manifest.run.permission_mode = PermissionMode.bypass_permissions
+    render.write(_render(manifest, config, workspace, spec))
+    (workspace / ".env.production").write_text("STRIPE_KEY=sk_live_x\n")
+
+    result = _render(manifest, config, workspace, spec)
+    render.write(result)
+
+    assert ".env.production" in result.masked_paths
+    checks = runner_mod.enforce_boundaries(manifest, config, workspace)
+    assert all(c.ok for c in checks), [str(c) for c in checks if not c.ok]
+
+
+# -- the firewall self-test, actually executed -------------------------------
+
+
+_SELFTEST_STUBS = """
+set -uo pipefail
+have() { command -v "$1" >/dev/null 2>&1; }
+iptables() {
+  case "$*" in
+    "-S OUTPUT")
+      printf -- '-P OUTPUT DROP\\n'
+      printf -- '-A OUTPUT -p tcp --dport 8811 -j ACCEPT\\n'
+      printf -- '-A OUTPUT -j DROP\\n'
+      ;;
+    "-t nat -S OUTPUT")
+      printf -- '-A OUTPUT -p tcp --dport 443 -j DNAT --to-destination 10.0.0.9:8080\\n'
+      ;;
+  esac
+}
+ip6tables() { printf -- '-P OUTPUT DROP\\n'; }
+# Honours ABOX_TEST_RESOLVES so the "dnsmasq answers" assertion has a state
+# that can turn it red. Stubbing it to succeed unconditionally left one of the
+# three assertions removable with the suite still green.
+getent() {
+  [[ "${ABOX_TEST_RESOLVES:-1}" == "1" ]] || return 2
+  [[ "${2:-}" == "${GATEWAY_HOST}" ]] && echo "10.0.0.2 ${GATEWAY_HOST}"
+}
+USE_IPSET=0
+resolved_total=0
+"""
+
+
+def _run_selftest(
+    script: str, tmp_path: Path, *, resolver: str, dns_log: str, resolves: bool = True
+) -> tuple[int, str, Path]:
+    """Execute the rendered script's self-test block against a faked state.
+
+    The netfilter and resolver commands are stubbed so that the *only* thing
+    that can turn the self-test red is the DNS state under test.
+    """
+    import subprocess
+
+    log_dir = tmp_path / "abox-log"
+    log_dir.mkdir(exist_ok=True)
+    (log_dir / "dns.log").write_text(dns_log)
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text(resolver)
+
+    block = script[script.index("fail=0\nassert()") :]
+    harness = (
+        f"LOG_DIR={log_dir}\n"
+        f'MARKER="${{LOG_DIR}}/firewall-ok"\n'
+        f'DNS_LOG="${{LOG_DIR}}/dns.log"\n'
+        f"RESOLV_CONF={resolv}\n"
+        f"GATEWAY_HOST=abox-gw-dev\nGATEWAY_PORT=8811\n"
+        f"ABOX_TEST_RESOLVES={'1' if resolves else '0'}\n"
+        + _SELFTEST_STUBS
+        + block
+    )
+    path = tmp_path / "selftest.sh"
+    path.write_text(harness)
+    proc = subprocess.run(
+        ["/bin/bash", str(path)], capture_output=True, text=True, check=False
+    )
+    return proc.returncode, proc.stdout + proc.stderr, log_dir / "firewall-ok"
+
+
+def test_the_marker_certifies_the_resolver_that_is_actually_running(
+    manifest, config, workspace, spec, tmp_path
+) -> None:
+    """`setup_dns || true` discarded its own failure and nothing downstream
+    looked.
+
+    With dnsmasq not up, /etc/resolv.conf keeps Docker's embedded resolver at
+    127.0.0.11 — which this firewall permits, since it is reached over
+    `-o lo -j ACCEPT` — so the agent resolves arbitrary names and nothing is
+    logged. The marker was still written, `verify_firewall_live` read 'ok', and
+    the run was recorded with denied_domains=0: a negative result from an
+    observation channel that was never alive.
+    """
+    script = _render(manifest, config, workspace, spec).artifacts[render.ARTIFACT_FIREWALL]
+
+    code, out, marker = _run_selftest(
+        script, tmp_path, resolver="nameserver 127.0.0.1\noptions ndots:0\n", dns_log="q\n"
+    )
+    assert code == 0, out
+    assert marker.is_file()
+    assert "resolver=127.0.0.1" in marker.read_text()
+
+
+def test_a_resolver_that_does_not_answer_withholds_the_marker(
+    manifest, config, workspace, spec, tmp_path
+) -> None:
+    """dnsmasq is configured and logging, and simply does not resolve.
+
+    Without this case the "dnsmasq answers an allowlisted name" assertion could
+    be deleted from the template with the whole suite still green — the getent
+    stub succeeded unconditionally, so the assertion had no state that could
+    turn it red. A check nobody can break is not a check, and neither is a test.
+    """
+    script = _render(manifest, config, workspace, spec).artifacts[render.ARTIFACT_FIREWALL]
+
+    code, out, marker = _run_selftest(
+        script,
+        tmp_path,
+        resolver="nameserver 127.0.0.1\n",
+        dns_log="q\n",
+        resolves=False,
+    )
+    assert code != 0, out
+    assert not marker.is_file(), "the firewall certified a resolver that answers nothing"
+    assert "dnsmasq answers an allowlisted name" in out
+
+
+@pytest.mark.parametrize(
+    ("resolver", "dns_log", "expected"),
+    [
+        # dnsmasq never came up: Docker's embedded resolver is still in place.
+        ("nameserver 127.0.0.11\n", "q\n", "/etc/resolv.conf points at dnsmasq"),
+        # It came up but is writing nowhere, so the review queue is blind.
+        ("nameserver 127.0.0.1\n", "", "DNS queries are reaching"),
+    ],
+)
+def test_a_broken_resolver_withholds_the_marker(
+    manifest, config, workspace, spec, tmp_path, resolver, dns_log, expected
+) -> None:
+    """Break the state each new check inspects and confirm it goes red."""
+    script = _render(manifest, config, workspace, spec).artifacts[render.ARTIFACT_FIREWALL]
+
+    code, out, marker = _run_selftest(
+        script, tmp_path, resolver=resolver, dns_log=dns_log
+    )
+    assert f"selftest: FAIL — {expected}" in out, out
+    assert code == 3, out
+    assert not marker.exists(), "the firewall certified itself with no working resolver"

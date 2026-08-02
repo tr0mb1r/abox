@@ -15,6 +15,9 @@ set -euo pipefail
 LOG_DIR=/var/log/abox
 MARKER="${LOG_DIR}/firewall-ok"
 DNS_LOG="${LOG_DIR}/dns.log"
+# Named rather than inlined so the self-test below reads the same file setup_dns
+# writes, and so both can be pointed elsewhere when the checks are exercised.
+RESOLV_CONF=/etc/resolv.conf
 FW_LOG="${LOG_DIR}/firewall.log"
 ALLOW_SET=abox-allow
 EGRESS_PORTS="{{ egress_ports|join(",") }}"
@@ -91,7 +94,7 @@ setup_dns() {
   dnsmasq --conf-file=/etc/dnsmasq.conf
   # Point the container at it. /etc/resolv.conf is bind-mounted by Docker, so
   # rewrite in place rather than replacing the inode.
-  printf 'nameserver 127.0.0.1\noptions ndots:0\n' >/etc/resolv.conf
+  printf 'nameserver 127.0.0.1\noptions ndots:0\n' >"${RESOLV_CONF}"
   echo "dns: dnsmasq up, upstream ${UPSTREAM_DNS}, queries -> ${DNS_LOG}"
 }
 
@@ -173,6 +176,14 @@ else
   echo "WARN: ip6tables missing — IPv6 egress is NOT restricted" >&2
 fi
 
+# Not fatal here, because the self-test below asserts the *observed* resolver
+# state instead: a DNS failure then lands alongside every other failure rather
+# than aborting before the rules are in place. `|| true` used to be the whole
+# story, and the marker was written regardless: a container whose dnsmasq never
+# started kept Docker's embedded resolver at 127.0.0.11, which this firewall
+# permits (it is reached over `-o lo -j ACCEPT`), so the agent resolved
+# arbitrary names — the exfiltration channel scoped DNS exists to close — while
+# nothing was logged and the run recorded denied_domains=0.
 setup_dns || true
 
 # The gateway is addressed by container name; resolve it on the bridge.
@@ -310,6 +321,26 @@ final_drop_present() {
 gateway_rule_present() {
   iptables -S OUTPUT | grep -q -- "--dport ${GATEWAY_PORT} -j ACCEPT"
 }
+resolver_is_dnsmasq() {
+  # Docker bind-mounts /etc/resolv.conf, so this is the file the resolver
+  # library actually reads — not the config abox rendered.
+  grep -qE '^nameserver[[:space:]]+127\.0\.0\.1([[:space:]]|$)' "${RESOLV_CONF}"
+}
+resolver_answers() {
+  # Through /etc/resolv.conf, so it is dnsmasq on 127.0.0.1 answering and not
+  # Docker's embedded resolver. The gateway is the probe because scoped DNS
+  # forwards it by name and it resolves on the bridge — so the assertion holds
+  # on a host with no internet, where an external probe would fail for an
+  # unrelated reason and take the whole run down with it.
+  getent ahostsv4 "${GATEWAY_HOST}"
+}
+dns_queries_are_logged() {
+  # dnsmasq writes its startup banner and every query here, and the lookups
+  # above have already gone through it — so an empty log means nobody was
+  # listening. Without this, `abox run` reports denied_domains=0 for a resolver
+  # that was never recording, which reads as "the agent asked for nothing".
+  [[ -s "${DNS_LOG}" ]]
+}
 {%- if proxy_enabled %}
 proxy_redirect_present() {
   iptables -t nat -S OUTPUT | grep -q -- "--dport 443 .*DNAT"
@@ -320,6 +351,9 @@ assert "OUTPUT policy is DROP" policy_is_drop
 assert "IPv6 OUTPUT policy is DROP" ipv6_is_denied
 assert "terminal DROP rule installed" final_drop_present
 assert "gateway reachable on tcp/${GATEWAY_PORT}" gateway_rule_present
+assert "/etc/resolv.conf points at dnsmasq" resolver_is_dnsmasq
+assert "dnsmasq answers an allowlisted name" resolver_answers
+assert "DNS queries are reaching ${DNS_LOG}" dns_queries_are_logged
 {%- if proxy_enabled %}
 assert "443 redirected to the SNI proxy" proxy_redirect_present
 {%- endif %}
@@ -338,6 +372,10 @@ if [[ "${fail}" -eq 0 ]]; then
     echo "domains={{ egress | length }}"
     echo "addresses=${resolved_total}"
     echo "ipset=${USE_IPSET}"
+    # Observed, not rendered: `verify_firewall_live` echoes these lines back, so
+    # the operator sees which resolver the container actually ended up on.
+    echo "resolver=$(awk '/^nameserver/{print $2; exit}' "${RESOLV_CONF}")"
+    echo "dns={% if scoped_dns %}scoped{% else %}forwarding{% endif %}"
   } >"${MARKER}"
   chmod 0444 "${MARKER}"
   echo "== abox firewall ready =="

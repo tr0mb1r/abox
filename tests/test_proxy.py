@@ -127,11 +127,88 @@ def test_fingerprint_covers_how_it_is_run(manifest, proxied, workspace, spec) ->
     assert proxy.build_spec(manifest, proxied, workspace).fingerprint() != before
 
 
+def test_spec_egress_equals_the_rendered_map(manifest, proxied, workspace, spec) -> None:
+    """What abox reports must be what nginx enforces.
+
+    `ProxySpec.egress` is the number `abox up` prints and the list doctor's
+    shared-address analysis examines; the map in the rendered proxy.conf is the
+    allowlist. With `run.connectors` on, the map carried a host the spec did not
+    — an allowed, connected domain that every report treated as blocked.
+    """
+    manifest.run.connectors = True
+    render.write(render.render(manifest, proxied, workspace, spec))
+    mapped = doctor.proxy_allowlist(workspace)
+    assert mapped is not None
+    assert "mcp-proxy.anthropic.com" in mapped
+    assert set(proxy.build_spec(manifest, proxied, workspace).egress) == set(mapped)
+
+
 def test_fingerprint_covers_the_allowlist(manifest, proxied, workspace, spec) -> None:
     render.write(render.render(manifest, proxied, workspace, spec))
     before = proxy.build_spec(manifest, proxied, workspace).fingerprint()
     manifest.egress = [*manifest.egress, "example.com"]
     assert proxy.build_spec(manifest, proxied, workspace).fingerprint() != before
+
+
+def _staged_container_states(monkeypatch, container: str) -> None:
+    """`docker inspect` before the create, then after it.
+
+    The fake runner answers a pattern the same way every time, and `up` inspects
+    the container on both sides of `docker run`.
+    """
+    from abox import dockerx
+
+    states = [
+        dockerx.ContainerState(container, exists=False, running=False),
+        dockerx.ContainerState(container, exists=True, running=True, status="running"),
+    ]
+
+    def fake(name: str) -> dockerx.ContainerState:
+        return states.pop(0) if len(states) > 1 else states[0]
+
+    monkeypatch.setattr(proxy.dockerx, "container_state", fake)
+
+
+def test_an_unpinned_proxy_image_is_pulled_not_adopted(
+    manifest, proxied, workspace, spec, runner, monkeypatch
+) -> None:
+    """`image_present` is a local `docker image inspect`, so anything able to
+    tag an image `nginx:alpine` on this daemon became the process deciding which
+    SNIs are allowed — no pull, no digest, no signature check."""
+    render.write(render.render(manifest, proxied, workspace, spec))
+    _staged_container_states(monkeypatch, proxy.proxy_container("demo"))
+    runner.expect(r"docker image inspect", '{"Id": "sha256:local"}')  # already there
+    proxy.up(manifest, proxied, workspace)
+    assert runner.find("docker pull nginx:alpine")
+
+
+def test_a_digest_pinned_proxy_image_is_used_from_the_daemon(
+    manifest, proxied, workspace, spec, runner, monkeypatch
+) -> None:
+    """The other half: a digest names its own content, so a local copy is the
+    image it claims to be and needs no pull. Without this the rule above would
+    be 'always pull', which proves nothing about pinning."""
+    proxied.egress_proxy.image = "nginx@sha256:" + "e" * 64
+    render.write(render.render(manifest, proxied, workspace, spec))
+    _staged_container_states(monkeypatch, proxy.proxy_container("demo"))
+    runner.expect(r"docker image inspect", '{"Id": "sha256:local"}')
+    proxy.up(manifest, proxied, workspace)
+    assert not runner.find("docker pull")
+
+
+def test_an_unpinned_proxy_image_fails_closed_when_the_pull_fails(
+    manifest, proxied, workspace, spec, runner, monkeypatch
+) -> None:
+    """Falling back to the local tag here would be exactly the substitution the
+    pull exists to prevent."""
+    render.write(render.render(manifest, proxied, workspace, spec))
+    _staged_container_states(monkeypatch, proxy.proxy_container("demo"))
+    runner.expect(r"docker image inspect", '{"Id": "sha256:local"}')
+    runner.expect(r"docker pull", "", returncode=1, stderr="no route to host")
+    with pytest.raises(AboxError, match="could not pull the egress proxy image") as exc:
+        proxy.up(manifest, proxied, workspace)
+    assert "sha256" in (exc.value.hint or "")
+    assert not runner.find("docker run -d")
 
 
 def test_up_refuses_without_a_rendered_config(manifest, proxied, workspace, runner) -> None:
@@ -169,6 +246,27 @@ def test_shared_addresses_stop_mattering_with_the_proxy(manifest, proxied, runne
         socket.getaddrinfo = real
     assert check.status is doctor.Status.ok
     assert "decides by name" in check.detail
+
+
+def test_an_unreadable_sni_log_is_not_reported_as_no_denials(manifest, runner) -> None:
+    """A stopped or removed proxy fails the exec. Returning [] made that
+    indistinguishable from a clean run, and the denial report only speaks when
+    the list is non-empty — so the evidence simply vanished."""
+    runner.expect(r"cat /var/log/nginx/sni.log", "", returncode=1, stderr="No such container")
+    log = proxy.read_denials("demo")
+    assert not log.ok
+    assert log.entries == ()
+    assert "could not read" in log.detail and "No such container" in log.detail
+
+
+def test_a_readable_empty_sni_log_reports_no_denials(manifest, runner) -> None:
+    """The positive path: readable and empty is a real answer, and must not read
+    as a failure — otherwise the new state is as uninformative as the old one."""
+    runner.expect(r"cat /var/log/nginx/sni.log", "")
+    log = proxy.read_denials("demo")
+    assert log.ok
+    assert log.entries == ()
+    assert log.detail == ""
 
 
 def test_denied_names_parses_refusals(manifest, runner) -> None:

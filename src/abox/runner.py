@@ -188,6 +188,26 @@ def boundary_checks(
             + (f" (tampered: {', '.join(drift.tampered)})" if drift.tampered else ""),
         )
     )
+
+    # A mask glob can only cover what was on disk at render time — the overlay is
+    # a bind mount, fixed at container start. The default mask is `.env*`, so the
+    # canonical secret file class is exactly the one with the hole: check out a
+    # branch, or let a build step write `.env.production`, and the next run hands
+    # the agent the unmasked file while every other check passes. Hence a gate,
+    # not a warning: bypassPermissions is refused while a mask glob has matches
+    # that nothing is shadowing.
+    checks.append(
+        BoundaryCheck(
+            "masks-current",
+            not drift.stale_masks,
+            "every mask glob must be re-expanded before the run"
+            + (
+                f" (uncovered: {', '.join(drift.stale_masks)})"
+                if drift.stale_masks
+                else ""
+            ),
+        )
+    )
     return checks
 
 
@@ -354,7 +374,19 @@ def up(
         config_path=render.runspec_path(workspace),
         remote_user=str(runspec.get("remote_user") or "vscode"),
     )
-    _apply_firewall(provisioned, runspec, on_line=on_line)
+    try:
+        _apply_firewall(provisioned, runspec, on_line=on_line)
+    except BaseException:
+        # `up` either hands back a live container or leaves nothing behind. It is
+        # called *before* `run`'s try/finally, so anything escaping here used to
+        # leak a container running `sleep infinity` with /workspace bind-mounted
+        # read-write, the per-project ~/.claude credential volume attached, and a
+        # half-applied firewall. Nothing reclaimed it either — the name carries a
+        # fresh run_id, so the next `up` removes a different container.
+        # BaseException, not Exception: a Ctrl-C while the firewall is coming up
+        # is exactly the case that leaked in practice.
+        dockerx.remove(container_id or container)
+        raise
     return provisioned
 
 
@@ -397,12 +429,21 @@ def claude_argv(
     continue_last: bool = False,
     extra: list[str] | None = None,
     settings: str = "",
+    mcp_config: str = render.MCP_CONFIG_PATH,
 ) -> list[str]:
     """Build the in-container ``claude`` invocation.
 
     ``--strict-mcp-config`` is not optional here: it is what makes "exactly one
     MCP endpoint" true rather than aspirational, by refusing any MCP server the
     agent might find in the workspace or in its own config dir.
+
+    ``mcp_config`` is a parameter rather than a literal because it used to be
+    one: the argv said ``/opt/abox/mcp.json`` while the runspec, the Dockerfile
+    wrapper and the shell banner all said ``/run/abox/mcp.json``. The staged
+    volume exists precisely because the /opt/abox bind has to be readable by
+    whatever uid the container runs as, and this file carries the gateway bearer
+    token — so the run was reading the copy the split was meant to retire, and
+    got EACCES on any host whose uid is not 1000.
     """
     argv = ["claude"]
     if prompt is not None:
@@ -415,7 +456,7 @@ def claude_argv(
         "--permission-mode",
         manifest.run.permission_mode.value,
         "--mcp-config",
-        "/opt/abox/mcp.json",
+        mcp_config,
     ]
     if manifest.run.single_mcp_endpoint:
         # Refuses any MCP server the agent might find in the workspace or its
@@ -579,19 +620,29 @@ def teardown(
     *,
     remove: bool = True,
 ) -> tuple[telemetry.FirewallCounters, list[telemetry.DnsQuery], list[telemetry.DeniedDomain]]:
-    counters = collect_counters(provisioned)
-    telemetry.record_counters(provisioned.workspace, provisioned.run_id, counters)
-    harvest_logs(provisioned)
-    queries = telemetry.collect_dns(provisioned.workspace, provisioned.run_id)
-    allow = effective_allowlist(manifest, config)
-    denied = telemetry.review_queue(
-        provisioned.workspace,
-        allow,
-        since_run=provisioned.run_id,
-        ignored=manifest.egress_ignored,
-    )
-    if remove:
-        dockerx.remove(provisioned.container_id or provisioned.container_name)
+    # Removal is in a `finally` because it used to be the last of six statements,
+    # five of which perform I/O: a docker exec that failed while harvesting the
+    # audit trail skipped it and left the container alive. Telemetry is the
+    # cheaper thing to lose — collect what we can, then destroy the container
+    # whatever happened.
+    counters = telemetry.FirewallCounters()
+    queries: list[telemetry.DnsQuery] = []
+    denied: list[telemetry.DeniedDomain] = []
+    try:
+        counters = collect_counters(provisioned)
+        telemetry.record_counters(provisioned.workspace, provisioned.run_id, counters)
+        harvest_logs(provisioned)
+        queries = telemetry.collect_dns(provisioned.workspace, provisioned.run_id)
+        allow = effective_allowlist(manifest, config)
+        denied = telemetry.review_queue(
+            provisioned.workspace,
+            allow,
+            since_run=provisioned.run_id,
+            ignored=manifest.egress_ignored,
+        )
+    finally:
+        if remove:
+            dockerx.remove(provisioned.container_id or provisioned.container_name)
     return counters, queries, denied
 
 
@@ -662,12 +713,17 @@ def run(
         if not firewall.ok:
             warnings.append(firewall.detail)
 
+        # Both of these come out of the rendered runspec rather than a literal:
+        # the runspec is the artifact doctor audits, so anything the argv asserts
+        # has to be read from it or the two can drift apart unnoticed.
+        runspec = load_runspec(workspace)
         argv = claude_argv(
             manifest,
             prompt,
             resume=resume,
             continue_last=continue_last,
-            settings=str(load_runspec(workspace).get("settings") or ""),
+            settings=str(runspec.get("settings") or ""),
+            mcp_config=str(runspec.get("mcp_config") or render.MCP_CONFIG_PATH),
         )
         with transcript.open("w", encoding="utf-8") as fh:
 

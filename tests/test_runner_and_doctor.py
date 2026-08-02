@@ -36,7 +36,10 @@ def rendered(manifest: Manifest, config: GlobalConfig, workspace: Path) -> Path:
 def test_claude_argv_pins_a_single_mcp_endpoint(manifest: Manifest) -> None:
     argv = runner.claude_argv(manifest, "hello")
     assert "--mcp-config" in argv
-    assert argv[argv.index("--mcp-config") + 1] == "/opt/abox/mcp.json"
+    # The argv used to say /opt/abox/mcp.json while everything else staged the
+    # token volume at /run/abox — EACCES on any host whose user is not uid 1000.
+    assert argv[argv.index("--mcp-config") + 1] == render.MCP_CONFIG_PATH
+    assert render.MCP_CONFIG_PATH == "/run/abox/mcp.json"
     # Without --strict-mcp-config, an .mcp.json in the workspace would be picked
     # up too, and "exactly one MCP endpoint" would stop being true.
     assert "--strict-mcp-config" in argv
@@ -1025,11 +1028,31 @@ def test_docker_sizes_are_parsed(text: str, expected: int) -> None:
 def test_doctor_warns_about_superseded_images(
     manifest: Manifest, rendered: Path, runner_fake
 ) -> None:
+    """A superseded image this workspace is recorded as having built."""
+    from abox import cli as cli_mod
+
+    stale = IMAGE_LS.splitlines()[0].split("\t")[0]
+    cli_mod._record_built_images(rendered, [stale])
     runner_fake.expect(r"image ls abox-agent-demo", IMAGE_LS)
     check = doctor.check_agent_images(manifest, rendered)
     assert check.status is doctor.Status.warn
     assert "reclaimable" in check.detail
     assert check.data["count"] == 2
+
+
+def test_doctor_does_not_promise_to_reclaim_what_it_cannot_attribute(
+    manifest: Manifest, rendered: Path, runner_fake
+) -> None:
+    """An image built before the ledger existed belongs to no workspace abox can
+    identify, so no abox command will ever remove it. Calling it "reclaimable"
+    and naming `abox up` sends the operator to run something that does nothing,
+    on every single run — which is how a real warning becomes noise."""
+    runner_fake.expect(r"image ls abox-agent-demo", IMAGE_LS)
+    check = doctor.check_agent_images(manifest, rendered)
+    assert check.status is doctor.Status.warn
+    assert "cannot be attributed" in check.detail
+    assert "reclaimable" not in check.detail
+    assert "remove by hand" in check.hint
 
 
 def test_doctor_is_quiet_when_only_the_current_image_exists(
@@ -1135,3 +1158,353 @@ def test_tool_narrowing_reaches_the_doctor_report(config, catalog_file, runner_f
         for c in doctor.check_servers(_narrowing_manifest(), cat, CustomServers(), config)
     }
     assert "gateway.tool-narrowing" in ids, "the check never reaches the report"
+
+
+# -- the egress review queue must be evidence, not silence -----------------
+
+
+def _record_run(workspace: Path, run_id: str) -> None:
+    from abox import telemetry
+
+    telemetry.record_run(
+        workspace,
+        telemetry.RunRecord(
+            id=run_id,
+            ts="2026-08-02T00:00:00Z",
+            project="demo",
+            profile="dev",
+            prompt_sha="x",
+            duration_s=1.0,
+            exit_code=0,
+        ),
+    )
+
+
+def test_egress_queue_fails_when_a_run_recorded_no_dns_at_all(
+    manifest, config, workspace: Path
+) -> None:
+    """An empty queue looks identical whether nothing was denied or nothing was
+    watching. The second is a real state — dnsmasq absent, Docker's embedded
+    resolver still in /etc/resolv.conf, every name resolving and nothing logged
+    — and it used to read as `ok — nothing undecided`."""
+    _record_run(workspace, "r1")
+
+    check, denied = doctor.check_egress_queue(manifest, config, workspace)
+
+    assert check.status is doctor.Status.fail
+    assert "r1" in check.detail
+    assert denied == []
+
+
+def test_egress_queue_is_quiet_once_the_dns_stream_carries_that_run(
+    manifest, config, workspace: Path, tmp_path: Path
+) -> None:
+    """The positive path through the same control: a fail-only test cannot tell
+    "the stream was checked" from "the check never ran"."""
+    from abox import telemetry
+
+    _record_run(workspace, "r1")
+    log = tmp_path / "dns.log"
+    log.write_text("query[A] github.com from 172.18.0.3\n")
+    telemetry.collect_dns(workspace, "r1", log=log)
+
+    check, _ = doctor.check_egress_queue(manifest, config, workspace)
+    assert check.status is doctor.Status.ok
+    assert "nothing undecided" in check.detail
+
+
+def test_egress_queue_still_warns_on_a_denied_name(
+    manifest, config, workspace: Path, tmp_path: Path
+) -> None:
+    from abox import telemetry
+
+    _record_run(workspace, "r1")
+    log = tmp_path / "dns.log"
+    log.write_text("query[A] exfil.example from 172.18.0.3\n")
+    telemetry.collect_dns(workspace, "r1", log=log)
+
+    check, denied = doctor.check_egress_queue(manifest, config, workspace)
+    assert check.status is doctor.Status.warn
+    assert [d.name for d in denied] == ["exfil.example"]
+
+
+def test_egress_queue_says_nothing_before_the_first_run(
+    manifest, config, workspace: Path
+) -> None:
+    """No run recorded is not a blind observation channel — it is no observation
+    to make, and failing there would be a red the operator cannot clear."""
+    check, _ = doctor.check_egress_queue(manifest, config, workspace)
+    assert check.status is doctor.Status.ok
+
+
+# -- mask overlays are only real in the argv -------------------------------
+
+
+def _drop_mask_mounts(spec) -> None:
+    """Remove every overlay under /workspace/, leaving masked_paths untouched."""
+    args = [str(a) for a in spec["run_args"]]
+    kept: list[str] = []
+    index = 0
+    while index < len(args):
+        if (
+            args[index] == "--mount"
+            and index + 1 < len(args)
+            and "target=/workspace/" in args[index + 1]
+        ):
+            index += 2
+            continue
+        kept.append(args[index])
+        index += 1
+    spec["run_args"] = kept
+
+
+def test_mask_overlays_pass_on_a_clean_render(manifest, config, rendered) -> None:
+    check = doctor.check_mask_overlays(manifest, config, rendered)
+    assert check.status is doctor.Status.ok
+    assert ".env" in check.detail
+
+
+def test_mask_overlays_go_red_when_the_render_drops_the_mounts(
+    manifest, config, workspace, monkeypatch
+) -> None:
+    """The only thing that masks `.env` is an empty read-only bind in run_args.
+
+    A regression in `mask_mounts` is not tampering — `abox up` re-renders,
+    re-hashes and rebuilds — so every artifact check stayed green while the
+    agent bind-mounted the real /workspace/.env. The runspec is re-rendered here
+    rather than hand-edited for exactly that reason: the hashes must still match
+    or the test proves only that artifacts.integrity works.
+    """
+    monkeypatch.setattr(render, "mask_mounts", lambda _workspace, _entries: [])
+    spec = gateway.build_spec("dev", config, servers=manifest.servers)
+    render.write(render.render(manifest, config, workspace, spec))
+
+    checks = {c.id: c for c in doctor.check_artifacts(manifest, config, workspace)}
+    assert checks["artifacts.integrity"].status is doctor.Status.ok, "not a tampering test"
+    assert checks["artifacts.current"].status is doctor.Status.ok
+    assert checks["artifacts.masks-mounted"].status is doctor.Status.fail
+    assert ".env" in checks["artifacts.masks-mounted"].detail
+    assert (workspace / ".env").read_text() == "TOKEN=hunter2\n", "the fixture secret moved"
+
+
+def test_mask_overlays_go_red_when_the_render_recorded_nothing(
+    manifest, config, rendered
+) -> None:
+    """Reached from the other side: a render that drops every entry records no
+    masked_paths either, so there is nothing to reconcile — ask the workspace."""
+    _mutate_runspec(rendered, _drop_mask_mounts)
+    state_path = render.artifacts_path(rendered) / "artifacts.json"
+    state = json.loads(state_path.read_text())
+    state["masked_paths"] = []
+    state_path.chmod(0o600)
+    state_path.write_text(json.dumps(state))
+
+    check = doctor.check_mask_overlays(manifest, config, rendered)
+    assert check.status is doctor.Status.fail
+    assert "recorded no mask at all" in check.detail
+
+
+def test_mask_check_reaches_the_doctor_report(manifest, config, rendered, runner_fake) -> None:
+    """Calling the check directly proves nothing about whether anything calls it."""
+    assert "artifacts.masks-mounted" in {
+        c.id for c in doctor.check_artifacts(manifest, config, rendered)
+    }
+    report = doctor.preflight(manifest, config, rendered)
+    assert "artifacts.masks-mounted" in {c.id for c in report.checks}
+
+
+# -- the gateway's image must be attributable ------------------------------
+
+
+def test_gateway_digest_fails_on_an_image_with_no_repo_digest(config, runner) -> None:
+    """`docker build -t docker/mcp-gateway:<tag> .` and start it by hand: the
+    container is up and holding the Docker socket, and its image carries an
+    empty RepoDigests. That single None used to mean "not running", so the one
+    check written to catch a swapped gateway went grey against exactly it — and
+    said something false about the machine while doing so."""
+    image_id = "sha256:" + "a" * 64
+    runner.expect(r"docker container inspect", json.dumps({"State": {"Running": True},
+                                                           "Image": image_id}))
+    runner.expect(r"docker image inspect", json.dumps({"RepoDigests": []}))
+
+    check = doctor.check_gateway_image_drift("dev", config)
+
+    assert check.status is doctor.Status.fail
+    assert image_id in check.detail
+
+
+def test_container_image_keeps_the_three_states_apart(runner) -> None:
+    runner.expect(r"docker container inspect", "", returncode=1)
+    absent = dockerx.container_image("abox-gw-dev")
+    assert not absent.exists and not absent.digest
+
+    runner.responses.clear()
+    runner.expect(r"docker container inspect", json.dumps({"Image": "sha256:aa"}))
+    runner.expect(r"docker image inspect", json.dumps({"RepoDigests": []}))
+    local = dockerx.container_image("abox-gw-dev")
+    assert local.exists and local.image_id == "sha256:aa" and not local.digest
+
+
+# -- the MCP endpoint the argv actually names ------------------------------
+
+
+def _hygiene(workspace: Path, manifest: Manifest, check_id: str):
+    return {c.id: c for c in doctor.check_agent_hygiene(workspace, manifest)}[check_id]
+
+
+def test_single_mcp_endpoint_reads_the_runspec_not_a_constant(manifest, rendered) -> None:
+    check = _hygiene(rendered, manifest, "agent.single-mcp-endpoint")
+    assert check.status is doctor.Status.ok
+    assert check.data["mcp_config"] == render.MCP_CONFIG_PATH
+
+
+def test_single_mcp_endpoint_goes_red_when_the_argv_leaves_the_staged_volume(
+    manifest, rendered
+) -> None:
+    """The exact divergence that shipped: the argv said /opt/abox/mcp.json — the
+    world-readable bind — while the volume carrying the gateway bearer token is
+    mounted at /run/abox. The check restated a constant and reported ok."""
+    _mutate_runspec(rendered, lambda spec: spec.update(mcp_config="/opt/abox/mcp.json"))
+
+    check = _hygiene(rendered, manifest, "agent.single-mcp-endpoint")
+    assert check.status is doctor.Status.fail
+    assert "/opt/abox/mcp.json" in check.detail
+
+
+def test_single_mcp_endpoint_goes_red_when_the_volume_is_not_mounted(
+    manifest, rendered
+) -> None:
+    def drop_volume(spec) -> None:
+        args = [str(a) for a in spec["run_args"]]
+        kept: list[str] = []
+        index = 0
+        while index < len(args):
+            if args[index] == "--mount" and "target=/run/abox" in args[index + 1]:
+                index += 2
+                continue
+            kept.append(args[index])
+            index += 1
+        spec["run_args"] = kept
+
+    _mutate_runspec(rendered, drop_volume)
+    assert _hygiene(rendered, manifest, "agent.single-mcp-endpoint").status is doctor.Status.fail
+
+
+# -- the SNI proxy enforces a config, not a heartbeat ----------------------
+
+
+@pytest.fixture
+def proxied(config: GlobalConfig) -> GlobalConfig:
+    config.egress_proxy.enabled = True
+    return config
+
+
+@pytest.fixture
+def proxy_rendered(manifest: Manifest, proxied: GlobalConfig, workspace: Path) -> Path:
+    spec = gateway.build_spec("dev", proxied, servers=manifest.servers)
+    render.write(render.render(manifest, proxied, workspace, spec))
+    return workspace
+
+
+def _proxy_checks(manifest, proxied, workspace, runner_fake, *, running: bool = True):
+    if running:
+        runner_fake.expect(r"docker container inspect", json.dumps({"State": {"Running": True}}))
+    return {c.id: c for c in doctor.check_egress_proxy(manifest, proxied, workspace)}
+
+
+def test_proxy_drift_passes_when_the_container_matches_the_rendered_config(
+    manifest, proxied, proxy_rendered, runner_fake
+) -> None:
+    from abox import proxy as proxy_mod
+
+    fingerprint = proxy_mod.build_spec(manifest, proxied, proxy_rendered).fingerprint()
+    proxy_mod._fingerprint_path(manifest.project).write_text(fingerprint, encoding="utf-8")
+
+    checks = _proxy_checks(manifest, proxied, proxy_rendered, runner_fake)
+    assert checks["egress.proxy-drift"].status is doctor.Status.ok
+
+
+def test_proxy_drift_fails_when_the_running_proxy_predates_the_render(
+    manifest, proxied, proxy_rendered, runner_fake
+) -> None:
+    """nginx reads its config once, at start, and proxy.conf is a bind abox
+    rewrites in place. A container that outlived a re-render is still enforcing
+    the previous, wider map — and `egress.proxy` calls that running."""
+    from abox import proxy as proxy_mod
+
+    proxy_mod._fingerprint_path(manifest.project).write_text("older", encoding="utf-8")
+
+    checks = _proxy_checks(manifest, proxied, proxy_rendered, runner_fake)
+    assert checks["egress.proxy-drift"].status is doctor.Status.fail
+    assert "reads proxy.conf once" in checks["egress.proxy-drift"].detail
+
+
+def test_proxy_drift_fails_when_no_fingerprint_was_recorded(
+    manifest, proxied, proxy_rendered, runner_fake
+) -> None:
+    """A missing file is not a match: it means what the container was started
+    with cannot be established at all."""
+    checks = _proxy_checks(manifest, proxied, proxy_rendered, runner_fake)
+    assert checks["egress.proxy-drift"].status is doctor.Status.fail
+    assert "no fingerprint" in checks["egress.proxy-drift"].detail
+
+
+def _drop_from_the_sni_map(workspace: Path, domain: str) -> None:
+    conf = render.artifacts_path(workspace) / render.ARTIFACT_PROXY
+    conf.chmod(0o600)
+    conf.write_text(
+        "\n".join(
+            line for line in conf.read_text().splitlines() if f'"{domain}"' not in line
+        )
+        + "\n"
+    )
+
+
+def test_mandatory_egress_reads_the_sni_map_in_proxy_mode(
+    manifest, proxied, proxy_rendered
+) -> None:
+    check = doctor.check_mandatory_egress(manifest, proxied, proxy_rendered)
+    assert check.status is doctor.Status.ok
+    assert "SNI map" in check.detail
+
+
+def test_mandatory_egress_fails_when_the_sni_map_drops_a_claude_endpoint(
+    manifest, proxied, proxy_rendered
+) -> None:
+    """In proxy mode ALLOW_DOMAINS is rendered and never consumed — the template
+    skips the resolve/ipset loop entirely — so grepping the firewall script
+    proved a property of an inert string list while nginx's map decided."""
+    _drop_from_the_sni_map(proxy_rendered, "platform.claude.com")
+
+    check = doctor.check_mandatory_egress(manifest, proxied, proxy_rendered)
+    assert check.status is doctor.Status.fail
+    assert check.data["missing"] == ["platform.claude.com"]
+
+
+def test_proxy_allowlist_fails_when_the_map_loses_a_domain(
+    manifest, proxied, proxy_rendered, runner_fake
+) -> None:
+    _drop_from_the_sni_map(proxy_rendered, "github.com")
+
+    checks = _proxy_checks(manifest, proxied, proxy_rendered, runner_fake)
+    check = checks["egress.proxy-allowlist"]
+    assert check.status is doctor.Status.fail
+    assert check.data["missing"] == ["github.com"]
+
+
+def test_proxy_allowlist_passes_on_the_rendered_map(
+    manifest, proxied, proxy_rendered, runner_fake
+) -> None:
+    checks = _proxy_checks(manifest, proxied, proxy_rendered, runner_fake)
+    assert checks["egress.proxy-allowlist"].status is doctor.Status.ok
+
+
+def test_the_proxy_checks_reach_the_run_gate(
+    manifest, proxied, proxy_rendered, runner_fake
+) -> None:
+    """`abox run` gates on preflight, which did not look at the proxy at all —
+    so the enforcement point with the widest blast radius was checked only by
+    `abox doctor`, and only for liveness."""
+    runner_fake.expect(r"docker container inspect", json.dumps({"State": {"Running": True}}))
+    ids = {c.id for c in doctor.preflight(manifest, proxied, proxy_rendered).checks}
+    assert {"egress.proxy", "egress.proxy-drift", "egress.proxy-allowlist"} <= ids

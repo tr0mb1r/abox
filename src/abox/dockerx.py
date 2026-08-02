@@ -259,8 +259,26 @@ def remove_image(tag: str) -> bool:
     return docker("image", "rm", tag, timeout=120).ok
 
 
-def container_image_digest(name: str) -> str | None:
-    """Return the ``repo@sha256:…`` a running container was actually started from.
+@dataclass(frozen=True)
+class ContainerImage:
+    """What a container was actually started from, with the cases kept apart.
+
+    This used to be one ``str | None``, and the None conflated three states: the
+    container does not exist, it exists but records no image, and — the one that
+    matters — it exists and its image carries an empty ``RepoDigests``, which is
+    exactly what a locally built, ``docker load``ed or hand-retagged image looks
+    like. The gateway drift check read that None as "not running" and went grey
+    against precisely the state it was written to catch.
+    """
+
+    name: str
+    exists: bool
+    image_id: str = ""
+    digest: str = ""
+
+
+def container_image(name: str) -> ContainerImage:
+    """Resolve a container's image to its repo digest.
 
     ``Config.Image`` records the reference the operator typed, which is exactly
     the thing that can lie when it is a tag. The image *id* cannot, so resolve
@@ -268,11 +286,14 @@ def container_image_digest(name: str) -> str | None:
     """
     data = inspect("container", name)
     if not data:
-        return None
+        return ContainerImage(name=name, exists=False)
     image_id = str(data.get("Image") or "")
-    if not image_id:
-        return None
-    return image_digest(image_id)
+    return ContainerImage(
+        name=name,
+        exists=True,
+        image_id=image_id,
+        digest=(image_digest(image_id) or "") if image_id else "",
+    )
 
 
 # -- volumes --------------------------------------------------------------

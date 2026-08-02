@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import itertools
 import json
 import os
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -35,8 +37,12 @@ from .manifest import (
     effective_allowlist,
     is_root_user,
     merged_egress,
+    merged_masks,
     merged_watch,
 )
+
+if TYPE_CHECKING:  # `proxy` is imported lazily below to keep the import graph flat
+    from .proxy import ProxyStatus
 
 
 class Status(StrEnum):
@@ -756,14 +762,31 @@ def check_gateway_image_drift(profile: str, config: GlobalConfig) -> Check:
     repo digest, because ``Config.Image`` only echoes whatever was typed.
     """
     container = paths.gateway_container(profile)
-    running = dockerx.container_image_digest(container)
-    if running is None:
+    image = dockerx.container_image(container)
+    if not image.exists:
         return Check(
             id="gateway.image-digest",
             title="running gateway matches the pinned digest",
             status=Status.skip,
-            detail=f"{container} is not running",
+            detail=f"{container} does not exist",
         )
+    if not image.digest:
+        # Absence of a repo digest is not absence of evidence — it *is* the
+        # evidence. An image with an empty RepoDigests was built, loaded or
+        # retagged locally, so nothing ties the container holding the Docker
+        # socket to anything a registry ever published. This used to be the same
+        # None as "not running" and skipped.
+        return Check(
+            id="gateway.image-digest",
+            title="running gateway matches the pinned digest",
+            status=Status.fail,
+            detail=f"{container} runs image {image.image_id or '(unrecorded)'}, which "
+            "carries no registry digest — it was built or loaded locally",
+            hint="`abox gateway up --force` recreates it from the pinned image; if that "
+            "image is still digest-less, something replaced it on this daemon",
+            data={"image_id": image.image_id},
+        )
+    running = image.digest
     configured = (
         config.gateway_image
         if config.gateway_image_pinned
@@ -892,7 +915,92 @@ def check_artifacts(manifest: Manifest, config: GlobalConfig, workspace: Path) -
                 data={"paths": drift.stale_masks},
             )
         )
+    checks.append(check_mask_overlays(manifest, config, workspace))
     return checks
+
+
+def _readonly_mount_targets(run_args: Iterable[str]) -> set[str]:
+    """In-container targets of every read-only ``--mount`` in the rendered argv."""
+    args = [str(a) for a in run_args]
+    targets: set[str] = set()
+    for flag, value in itertools.pairwise(args):
+        if flag != "--mount":
+            continue
+        parts = [p.strip() for p in value.split(",")]
+        if "readonly" not in parts and "ro" not in parts:
+            continue
+        for part in parts:
+            key, _, target = part.partition("=")
+            if key in ("target", "destination", "dst"):
+                targets.add(target)
+    return targets
+
+
+def check_mask_overlays(manifest: Manifest, config: GlobalConfig, workspace: Path) -> Check:
+    """Is every recorded mask actually an overlay in the argv abox will run?
+
+    A mask is enforced by exactly one thing: an empty read-only bind over the
+    path in the runspec's ``run_args``. Nothing reconciled that argv against the
+    ``masked_paths`` the same render wrote into artifacts.json, so a regression
+    that dropped the mounts while still recording the paths left every artifact
+    check green — matching hashes, matching manifest — with the real
+    ``/workspace/.env`` mounted read-write underneath. Read from the rendered
+    argv rather than the model, for the reason `agent.no-docker-sock` gives.
+    """
+    rendered = render.inspect_rendered(workspace)
+    if not rendered:
+        return Check(
+            id="artifacts.masks-mounted",
+            title="declared masks are mounted over the workspace",
+            status=Status.skip,
+            detail="nothing rendered yet",
+        )
+    state = render.load_artifact_state(workspace) or {}
+    recorded = [str(p) for p in (state.get("masked_paths") or [])]
+    mounted = _readonly_mount_targets(rendered.get("run_args") or [])
+    missing = sorted(rel for rel in recorded if f"/workspace/{rel}" not in mounted)
+    if missing:
+        return Check(
+            id="artifacts.masks-mounted",
+            title="declared masks are mounted over the workspace",
+            status=Status.fail,
+            detail=f"recorded as masked but not mounted: {', '.join(missing)}",
+            hint="the agent reads these paths as they are on disk. `abox up` "
+            "re-renders; if they are still missing, the render dropped them",
+            data={"missing": missing, "recorded": recorded},
+        )
+    if not recorded:
+        # A render that dropped every entry has nothing to reconcile against, so
+        # ask the workspace instead: a declared mask with something to shadow and
+        # no overlay is the same hole reached from the other side.
+        unrendered = sorted(
+            e.relpath
+            for e in render.expand_masks(workspace, merged_masks(manifest, config))
+            if e.mountable
+        )
+        if unrendered:
+            return Check(
+                id="artifacts.masks-mounted",
+                title="declared masks are mounted over the workspace",
+                status=Status.fail,
+                detail=f"the render recorded no mask at all, but {len(unrendered)} "
+                f"declared path(s) are maskable: {', '.join(unrendered[:8])}",
+                hint="`abox up` to re-render the mask overlays",
+                data={"missing": unrendered, "recorded": []},
+            )
+        return Check(
+            id="artifacts.masks-mounted",
+            title="declared masks are mounted over the workspace",
+            status=Status.ok,
+            detail="no declared mask has anything to shadow in this workspace",
+        )
+    return Check(
+        id="artifacts.masks-mounted",
+        title="declared masks are mounted over the workspace",
+        status=Status.ok,
+        detail=f"{len(recorded)} overlay(s) in the runspec: {', '.join(recorded[:8])}",
+        data={"recorded": recorded},
+    )
 
 
 def check_boundary(manifest: Manifest, config: GlobalConfig, workspace: Path) -> list[Check]:
@@ -1207,6 +1315,130 @@ def check_exec_surface(
     )
 
 
+#: One entry of the rendered ``map $ssl_preread_server_name`` block:
+#: ``    "github.com" "github.com:443";``
+_PROXY_MAP_ENTRY = re.compile(r'^\s*"(?P<name>[^"]+)"\s+"(?P<upstream>[^"]+)"\s*;')
+
+
+def proxy_allowlist(workspace: Path) -> dict[str, str] | None:
+    """The names the rendered proxy.conf actually routes, name -> upstream.
+
+    None when nothing is rendered. The deny sentinel is excluded: a name mapped
+    there is refused, so counting it as allowed would invert the answer.
+    """
+    from . import proxy as proxy_mod
+
+    path = render.artifacts_path(workspace) / render.ARTIFACT_PROXY
+    if not path.is_file():
+        return None
+    mapped: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = _PROXY_MAP_ENTRY.match(line)
+        if match and match.group("upstream") != proxy_mod.DENY_SENTINEL:
+            mapped[match.group("name")] = match.group("upstream")
+    return mapped
+
+
+def check_proxy_drift(
+    manifest: Manifest, config: GlobalConfig, workspace: Path, status: ProxyStatus
+) -> Check:
+    """Is the *running* nginx enforcing the allowlist that is rendered on disk?
+
+    nginx reads its config once, at start, and proxy.conf is a bind of a file
+    `abox up` rewrites in place — so a container that outlived a re-render is
+    serving the previous, wider map while `egress.proxy` calls it running. The
+    gateway gets `gateway.drift` for exactly this; the proxy had liveness and
+    nothing else, which is backwards for the control with the wider blast
+    radius. The fingerprint `proxy.up` stores already covers the conf text and
+    the run options; it was simply never read back.
+    """
+    from . import proxy as proxy_mod
+
+    title = "the running proxy matches the rendered allowlist"
+    if not status.exists:
+        return Check(
+            id="egress.proxy-drift",
+            title=title,
+            status=Status.skip,
+            detail=f"{status.container} does not exist, so there is nothing to compare",
+        )
+    spec = proxy_mod.build_spec(manifest, config, workspace)
+    # Reached through proxy's own helper rather than rebuilt here: the path is
+    # where `up` writes, and two spellings of it would drift.
+    path = proxy_mod._fingerprint_path(manifest.project)
+    if not path.is_file():
+        return Check(
+            id="egress.proxy-drift",
+            title=title,
+            status=Status.fail,
+            detail=f"no fingerprint recorded for {status.container}, so what it was "
+            "started with cannot be established",
+            hint="a missing fingerprint is not a match — `abox up` recreates the "
+            "proxy from the rendered config and records it",
+        )
+    if path.read_text(encoding="utf-8").strip() != spec.fingerprint():
+        return Check(
+            id="egress.proxy-drift",
+            title=title,
+            status=Status.fail,
+            detail=f"{status.container} was started with a different config — nginx "
+            "reads proxy.conf once, at start, so it is still enforcing the old map",
+            hint="`abox up` re-renders and recreates it; until then a domain you "
+            "removed is still reachable and one you added is not",
+        )
+    return Check(
+        id="egress.proxy-drift",
+        title=title,
+        status=Status.ok,
+        detail=f"{status.container} was started with the config on disk",
+    )
+
+
+def check_proxy_allowlist(manifest: Manifest, workspace: Path) -> Check:
+    """Does the rendered nginx map carry the domains the render recorded?
+
+    In proxy mode the ``map $ssl_preread_server_name`` block is the allowlist —
+    the firewall's ALLOW_DOMAINS array is not even consumed. Nothing read that
+    file, so a template regression dropping a domain was invisible everywhere.
+    """
+    mapped = proxy_allowlist(workspace)
+    title = "the rendered SNI map carries the allowlist"
+    if mapped is None:
+        return Check(
+            id="egress.proxy-allowlist",
+            title=title,
+            status=Status.skip,
+            detail="nothing rendered yet",
+        )
+    state = render.load_artifact_state(workspace) or {}
+    recorded = [str(d) for d in (state.get("egress") or [])]
+    missing = sorted(set(recorded) - set(mapped))
+    extra = sorted(set(mapped) - set(recorded))
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("absent from the map: " + ", ".join(missing))
+        if extra:
+            parts.append("routed but not allowlisted: " + ", ".join(extra))
+        return Check(
+            id="egress.proxy-allowlist",
+            title=title,
+            status=Status.fail,
+            detail="; ".join(parts),
+            hint="the map is what nginx enforces, so it and the recorded allowlist "
+            "disagreeing means one of them is not what the operator asked for. "
+            "`abox up` re-renders",
+            data={"missing": missing, "extra": extra},
+        )
+    return Check(
+        id="egress.proxy-allowlist",
+        title=title,
+        status=Status.ok,
+        detail=f"{len(mapped)} domain(s) routed by name, everything else refused",
+        data={"mapped": sorted(mapped)},
+    )
+
+
 def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path) -> list[Check]:
     """The SNI proxy, when the operator has turned it on.
 
@@ -1232,6 +1464,8 @@ def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path
             else "",
         )
     ]
+    checks.append(check_proxy_drift(manifest, config, workspace, status))
+    checks.append(check_proxy_allowlist(manifest, workspace))
     if status.published_ports:
         checks.append(
             Check(
@@ -1263,9 +1497,25 @@ def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path
             data={"container": proxy_mod.proxy_container(manifest.project)},
         )
     )
-    denied = proxy_mod.denied_names(manifest.project)
-    if denied:
-        names = sorted({d["sni"] for d in denied})
+    # read_denials, not denied_names: the wrapper collapses "could not read the
+    # log" into "nothing was denied", and this check only ever spoke when the
+    # list was non-empty — so a stopped proxy, a removed container or a failed
+    # exec produced a report byte-identical to a clean run.
+    log = proxy_mod.read_denials(manifest.project)
+    if not log.ok:
+        checks.append(
+            Check(
+                id="egress.proxy-denied",
+                title="connections refused by SNI",
+                status=Status.warn,
+                detail=log.detail,
+                hint="the refusals themselves still happen — this is the record "
+                "of them that could not be read, so treat the queue as unknown "
+                "rather than empty",
+            )
+        )
+    elif log.entries:
+        names = sorted({d["sni"] for d in log.entries})
         checks.append(
             Check(
                 id="egress.proxy-denied",
@@ -1283,12 +1533,41 @@ def check_egress_proxy(manifest: Manifest, config: GlobalConfig, workspace: Path
 def check_mandatory_egress(manifest: Manifest, config: GlobalConfig, workspace: Path) -> Check:
     """Are the hosts Claude Code cannot run without actually in the allowlist?
 
-    Read from the *rendered firewall script*, not from the model, because the
-    model is what abox intends and the script is what the container enforces.
-    A name missing here does not fail loudly: with scoped DNS the agent gets
-    NXDOMAIN, and Claude Code reports `ENOTFOUND` with no hint that an
-    allowlist was involved.
+    Read from the *rendered artifact*, not from the model, because the model is
+    what abox intends and the artifact is what the container enforces. A name
+    missing here does not fail loudly: with scoped DNS the agent gets NXDOMAIN,
+    and Claude Code reports `ENOTFOUND` with no hint that an allowlist was
+    involved.
+
+    Which artifact decides depends on the mode. In proxy mode the firewall's
+    ALLOW_DOMAINS array is rendered and then never consumed — the template skips
+    the resolve/ipset loop entirely — so grepping it there proved a property of
+    an inert string list while nginx's map made the actual decision.
     """
+    if config.egress_proxy.enabled:
+        mapped = proxy_allowlist(workspace)
+        if mapped is None:
+            return Check(
+                id="egress.mandatory",
+                title="Claude Code's own endpoints are allowlisted",
+                status=Status.skip,
+                detail="nothing rendered yet",
+            )
+        absent = [host for host in BASE_MANDATORY_EGRESS if host not in mapped]
+        return Check(
+            id="egress.mandatory",
+            title="Claude Code's own endpoints are allowlisted",
+            status=Status.ok if not absent else Status.fail,
+            detail="all present in the SNI map"
+            if not absent
+            else f"missing from the rendered SNI map: {', '.join(absent)}",
+            hint="`abox up` re-renders. These are not optional — without them the "
+            "agent cannot authenticate or refresh a token, and the proxy refuses "
+            "an unmapped name with a bare TLS failure that names nothing"
+            if absent
+            else "",
+            data={"missing": absent},
+        )
     script = render.artifacts_path(workspace) / render.ARTIFACT_FIREWALL
     if not script.is_file():
         return Check(
@@ -1422,6 +1701,27 @@ def check_git_tamper(workspace: Path, *, update: bool = False) -> Check:
 # -- egress review queue --------------------------------------------------
 
 
+def _run_without_dns_evidence(workspace: Path) -> str:
+    """The id of the last run that recorded no DNS query at all, or "".
+
+    An empty queue reads the same whether nothing was denied or nothing was
+    watching, and the second is a real state: if dnsmasq never started, the
+    container keeps Docker's embedded resolver, every name resolves, nothing is
+    logged, and the review queue — "the single most useful signal this design
+    produces" — reports ``nothing undecided`` for an observation channel that
+    was never alive. The firewall selftest asserts the resolver from inside the
+    container; this asserts the harvested end of the same pipe, because a log
+    that never reached the host is exactly as blind.
+    """
+    recorded = telemetry.runs(workspace, limit=1)
+    if not recorded:
+        return ""  # nothing has run yet, so an empty queue is honest
+    last = str(recorded[-1].get("id") or "")
+    if any(str(row.get("run") or "") == last for row in telemetry.dns_queries(workspace)):
+        return ""
+    return last
+
+
 def check_egress_queue(
     manifest: Manifest, config: GlobalConfig, workspace: Path
 ) -> tuple[Check, list[telemetry.DeniedDomain]]:
@@ -1433,6 +1733,22 @@ def check_egress_queue(
         else ""
     )
     if not denied:
+        blind = _run_without_dns_evidence(workspace)
+        if blind:
+            return (
+                Check(
+                    id="egress.queue",
+                    title="egress review queue",
+                    status=Status.fail,
+                    detail=f"run {blind} recorded no DNS query at all — this queue is "
+                    "empty because nothing was observed, not because nothing was denied",
+                    hint="dnsmasq did not come up, or /var/log/abox/dns.log never reached "
+                    "the host. Read the firewall selftest in `abox logs` — until it says "
+                    "the resolver is dnsmasq, treat this project's egress evidence as absent",
+                    data={"run": blind},
+                ),
+                [],
+            )
         return (
             Check(
                 id="egress.queue",
@@ -1555,7 +1871,7 @@ def check_agent_hygiene(workspace: Path, manifest: Manifest | None = None) -> li
         ),
         _agent_user_check(run_args),
         _agent_network_check(run_args),
-        _mcp_endpoint_check(manifest),
+        _mcp_endpoint_check(manifest, rendered, workspace),
         check_interactive_claude(workspace),
         check_token_not_world_readable(workspace),
     ]
@@ -1733,8 +2049,38 @@ def check_interactive_claude(workspace: Path) -> Check:
     )
 
 
-def _mcp_endpoint_check(manifest: Manifest | None) -> Check:
-    """State the endpoint count as it actually is, not as the design prefers."""
+def _mcp_volume_target(run_args: Iterable[str], workspace: Path) -> str:
+    """Where the runspec mounts the volume mcp.json is staged into, or "".
+
+    Matched on the source, not the path: ``/opt/abox`` is a read-only mount too,
+    and it is precisely the wrong one — it is the world-readable bind the token
+    was moved off.
+    """
+    volume = paths.mcp_volume(workspace)
+    args = [str(a) for a in run_args]
+    for flag, value in itertools.pairwise(args):
+        if flag != "--mount":
+            continue
+        parts = [p.strip() for p in value.split(",")]
+        fields = dict(p.partition("=")[::2] for p in parts)
+        if fields.get("source") == volume and ("readonly" in parts or "ro" in parts):
+            return fields.get("target", "")
+    return ""
+
+
+def _mcp_endpoint_check(
+    manifest: Manifest | None, rendered: dict[str, Any], workspace: Path
+) -> Check:
+    """State the endpoint count as it actually is, not as the design prefers.
+
+    The path is read out of the rendered runspec and reconciled against the
+    volume the runspec mounts, because this check used to restate a constant and
+    assert a fact about the invocation it had never looked at: ``claude_argv``
+    said ``/opt/abox/mcp.json`` while the runspec, the Dockerfile wrapper and
+    the staging step all said ``/run/abox/mcp.json``. The agent read the copy on
+    the world-readable bind — and on a host whose uid is not 1000, got EACCES —
+    while this reported ok.
+    """
     if manifest is not None and not manifest.run.single_mcp_endpoint:
         return Check(
             id="agent.single-mcp-endpoint",
@@ -1747,12 +2093,27 @@ def _mcp_endpoint_check(manifest: Manifest | None) -> Check:
             "declared in agentbox.yaml — prefer `abox mcp add <name>` for anything "
             "the Docker catalog carries",
         )
+    configured = str(rendered.get("mcp_config") or "")
+    staged = _mcp_volume_target(rendered.get("run_args") or [], workspace)
+    if not configured or not staged or str(Path(configured).parent) != staged:
+        return Check(
+            id="agent.single-mcp-endpoint",
+            title="agent has exactly one MCP endpoint",
+            status=Status.fail,
+            detail=f"the runspec invokes claude with --mcp-config "
+            f"{configured or '(unset)'}, which is not on the volume it stages the "
+            f"config into ({staged or 'not mounted at all'})",
+            hint="mcp.json carries the gateway bearer token, so it is staged into a "
+            "volume rather than the world-readable /opt/abox bind; an argv pointing "
+            "anywhere else reads a copy nothing keeps current. `abox up` re-renders",
+            data={"mcp_config": configured},
+        )
     return Check(
         id="agent.single-mcp-endpoint",
         title="agent has exactly one MCP endpoint",
         status=Status.ok,
-        detail=f"claude is invoked with --mcp-config {render.MCP_CONFIG_PATH} "
-        "--strict-mcp-config",
+        detail=f"claude is invoked with --mcp-config {configured} --strict-mcp-config",
+        data={"mcp_config": configured},
     )
 
 
@@ -1774,6 +2135,11 @@ def preflight(
     for check in check_artifacts(manifest, config, workspace):
         report.add(check)
     for check in check_boundary(manifest, config, workspace):
+        report.add(check)
+    # The proxy is an enforcement point `abox run` depends on: with it configured
+    # the firewall permits exactly one destination, so a proxy that is down or
+    # serving a stale map is not a detail to notice later.
+    for check in check_egress_proxy(manifest, config, workspace):
         report.add(check)
     for check in check_agent_hygiene(workspace, manifest):
         report.add(check)
@@ -1806,19 +2172,54 @@ def check_agent_images(manifest: Manifest, workspace: Path) -> Check:
     current = str(render.inspect_rendered(workspace).get("image") or "")
     stale = [img for img in images if img.tag != current]
     stale_bytes = sum(img.size for img in stale)
+
+    # The tag carries the project name, not the workspace, so two workspaces
+    # with the same directory name share a repository. abox therefore prunes
+    # only tags this workspace recorded building — which means an image built
+    # before that ledger existed can never be attributed to anyone, and no abox
+    # command will remove it. Saying "reclaimable" and naming `abox up` would be
+    # sending the operator to run something that does nothing, every single run.
+    from .cli import built_images_for  # local: cli imports doctor
+
+    known = set(built_images_for(workspace))
+    reclaimable = [img for img in stale if img.tag in known]
+    orphaned = [img for img in stale if img.tag not in known]
+    reclaimable_bytes = sum(img.size for img in reclaimable)
+    orphan_bytes = sum(img.size for img in orphaned)
+
+    detail = f"{len(images)} image(s), {_gb(total)}"
+    if reclaimable:
+        detail += f" — {len(reclaimable)} superseded, {_gb(reclaimable_bytes)} reclaimable"
+    if orphaned:
+        detail += (
+            f" — {len(orphaned)} ({_gb(orphan_bytes)}) predate the build ledger and "
+            "cannot be attributed to a workspace"
+        )
+    hints = []
+    if reclaimable:
+        hints.append(
+            "`abox up` prunes superseded images after a successful build; "
+            "`abox nuke` removes this workspace's"
+        )
+    if orphaned:
+        hints.append(
+            "the unattributable ones may belong to another workspace of the same "
+            f"name — check `docker image ls abox-agent-{manifest.project}` and "
+            "remove by hand if they are yours"
+        )
     return Check(
         id="agent.images",
         title="agent images on disk",
         status=Status.warn if stale else Status.ok,
-        detail=(
-            f"{len(images)} image(s), {_gb(total)}"
-            + (f" — {len(stale)} superseded, {_gb(stale_bytes)} reclaimable" if stale else "")
-        ),
-        hint="`abox up` prunes superseded images after a successful build; "
-        "`abox nuke` removes all of this project's"
-        if stale
-        else "",
-        data={"total_bytes": total, "stale_bytes": stale_bytes, "count": len(images)},
+        detail=detail,
+        hint=" · ".join(hints),
+        data={
+            "total_bytes": total,
+            "stale_bytes": stale_bytes,
+            "reclaimable_bytes": reclaimable_bytes,
+            "orphan_bytes": orphan_bytes,
+            "count": len(images),
+        },
     )
 
 
