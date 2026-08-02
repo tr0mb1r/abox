@@ -186,12 +186,27 @@ class FirewallCounters:
     rules: list[dict[str, Any]] = field(default_factory=list)
     raw: str = ""
 
+    @property
+    def read_ok(self) -> bool:
+        """Did this read actually produce counters?
+
+        The runner builds ``FirewallCounters(raw=<stderr>)`` when
+        ``iptables -L`` fails, and every count is then zero. A read that yielded
+        no rule at all is not evidence that the firewall refused nothing — it is
+        evidence that nobody looked.
+        """
+        return bool(self.rules)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "dropped_packets": self.dropped_packets,
             "dropped_bytes": self.dropped_bytes,
             "accepted_packets": self.accepted_packets,
             "rules": self.rules,
+            # Persisted so a failed read is distinguishable in the history from
+            # a run the firewall never had to refuse.
+            "read_ok": self.read_ok,
+            "error": "" if self.read_ok else self.raw.strip()[:200],
         }
 
 
@@ -236,9 +251,13 @@ def record_counters(workspace: Path, run_id: str, counters: FirewallCounters) ->
             history = {}
     runs_map = history.setdefault("runs", {})
     runs_map[run_id] = {"ts": _now(), **counters.to_dict()}
-    # Keep the file bounded; the transcripts carry the detail.
+    # Keep the file bounded; the transcripts carry the detail. Evict by
+    # timestamp, never by key: run ids are random hex, so sorting the keys
+    # dropped an arbitrary slice of the *newest* runs — sometimes the one just
+    # written — while keeping months-old ones.
     if len(runs_map) > 200:
-        for key in sorted(runs_map)[: len(runs_map) - 200]:
+        by_age = sorted(runs_map, key=lambda key: str(runs_map[key].get("ts") or ""))
+        for key in by_age[: len(runs_map) - 200]:
             runs_map.pop(key, None)
     path.write_text(json.dumps(history, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(0o600)

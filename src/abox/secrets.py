@@ -299,7 +299,10 @@ def sync(
     """
     wanted = set(only) if only else None
     state = SyncState.load()
-    present = docker_secret_names() if not dry_run else set()
+    # Listing is a read, so the preview gets it too: a dry run against a
+    # fabricated empty store previewed deleted secrets as `unchanged`, and
+    # healthy `source: docker` / `source: prompt` mappings as missing.
+    present = docker_secret_names()
     reports: list[SecretReport] = []
 
     for mapping in config.mappings:
@@ -355,10 +358,13 @@ def sync(
         in_store = mapping.secret in present
 
         if dry_run:
+            # The same predicate the real path below uses, with the write
+            # suppressed — a preview that disagrees with the run it previews is
+            # worse than no preview.
             status = (
                 SecretStatus.unchanged
-                if old_digest == new_digest
-                else (SecretStatus.updated if old_digest else SecretStatus.created)
+                if in_store and old_digest == new_digest
+                else (SecretStatus.updated if in_store else SecretStatus.created)
             )
             reports.append(
                 SecretReport(mapping.secret, status, "dry run", mapping.reference, kind.value)
@@ -386,6 +392,11 @@ def sync(
             source=kind.value,
             reference=mapping.reference,
         )
+        # Persist as we go: a failure on a later mapping used to propagate past
+        # the trailing save() and lose the digests already written, leaving
+        # `secrets check` and `doctor` reporting permanent drift on current
+        # credentials.
+        state.save()
         reports.append(
             SecretReport(
                 mapping.secret,
@@ -500,8 +511,8 @@ class SecretUse:
 
     project: str
     workspace: str
-    kind: str  # "env" | "server" | "remote"
-    detail: str  # the env var name, or the server that needs it
+    kind: str  # "env" | "server" | "remote" | "mapping"
+    detail: str  # the env var name, the server that needs it, or the source
 
     def __str__(self) -> str:
         return f"{self.project} → {self.kind} {self.detail}"
@@ -510,10 +521,13 @@ class SecretUse:
 def usage_index(catalog: Catalog | None = None) -> dict[str, list[SecretUse]]:
     """secret name -> everywhere abox knows it is referenced.
 
-    Covers the three ways a secret gets consumed: handed to the agent as an
+    Covers the three ways a secret gets consumed — handed to the agent as an
     environment variable, required by a declared MCP server, or injected into a
-    remote server's headers. Projects abox has never seen cannot appear — the
-    index is only as complete as the registries.
+    remote server's headers — plus the mapping in ``secrets.yaml`` that would
+    put it back. ``abox secrets rm`` gates on this index, and a removal the very
+    next ``abox secrets sync`` silently undoes is not a revocation. Projects
+    abox has never seen cannot appear — the index is only as complete as the
+    registries.
     """
     from .gateway import known_projects
     from .manifest import Manifest
@@ -522,6 +536,21 @@ def usage_index(catalog: Catalog | None = None) -> dict[str, list[SecretUse]]:
 
     def add(name: str, use: SecretUse) -> None:
         index.setdefault(name, []).append(use)
+
+    for mapping in SecretsConfig.load().mappings:
+        # `source: docker` is the one mapping sync will not re-push — it only
+        # verifies presence — so listing it here would block a removal abox
+        # cannot undo, and a standing false refusal trains you past the gate.
+        if mapping.kind is not SecretSource.docker:
+            add(
+                mapping.secret,
+                SecretUse(
+                    "(global)",
+                    str(paths.secrets_config_path()),
+                    "mapping",
+                    f"{mapping.reference} in {paths.secrets_config_path().name}",
+                ),
+            )
 
     for known in known_projects():
         if not known.exists:

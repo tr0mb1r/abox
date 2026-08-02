@@ -216,6 +216,61 @@ def test_dry_run_writes_nothing(runner, tmp_path: Path) -> None:
     assert not secrets.state_path().exists()
 
 
+def test_dry_run_sees_a_secret_deleted_from_the_store(runner, tmp_path: Path) -> None:
+    """The preview used to be computed from the digest ledger alone, so a secret
+    someone had removed from the store previewed as `unchanged` — the operator
+    skipped the real sync and the container failed to start."""
+    path = _write_secret_file(tmp_path / "tok", "v1")
+    config = SecretsConfig(mappings=[SecretMapping(secret="demo.token", file=str(path))])
+    runner.expect(r"docker mcp secret ls", SECRET_LS)
+    assert secrets.sync(config)[0].status is secrets.SecretStatus.created
+
+    # The value is unchanged, but the store no longer has it.
+    report = secrets.sync(config, dry_run=True)[0]
+    assert report.status is secrets.SecretStatus.created
+    assert len(runner.find("docker mcp secret set demo.token")) == 1  # the real sync only
+
+
+def test_dry_run_does_not_fail_a_healthy_external_mapping(runner) -> None:
+    """The false-red half: a `source: docker` mapping that is present and a
+    `source: prompt` one already in the store previewed as not-ok, so a scripted
+    `--dry-run` pre-flight failed on a perfectly good install."""
+    runner.expect(
+        r"docker mcp secret ls",
+        "docker/mcp/ext.tok | docker-pass\ndocker/mcp/typed.tok | docker-pass\n",
+    )
+    config = SecretsConfig(
+        mappings=[
+            SecretMapping(secret="ext.tok", source=SecretSource.docker),
+            SecretMapping(secret="typed.tok", source=SecretSource.prompt),
+        ]
+    )
+    reports = {r.name: r for r in secrets.sync(config, dry_run=True)}
+    assert reports["ext.tok"].status is secrets.SecretStatus.external
+    assert reports["typed.tok"].status is secrets.SecretStatus.unchanged
+    assert all(r.ok for r in reports.values())
+
+
+def test_a_failed_write_keeps_the_digests_already_written(runner, tmp_path: Path) -> None:
+    """Digests lived in memory until the loop ended, so a daemon failure on the
+    second secret lost the first one's — and every later `secrets check`
+    reported drift on a credential that was exactly current."""
+    a = _write_secret_file(tmp_path / "a", "1")
+    b = _write_secret_file(tmp_path / "b", "2")
+    runner.expect(r"docker mcp secret ls", SECRET_LS)
+    runner.expect(r"docker mcp secret set b.key", "", returncode=1, stderr="daemon busy")
+    config = SecretsConfig(
+        mappings=[
+            SecretMapping(secret="a.key", file=str(a)),
+            SecretMapping(secret="b.key", file=str(b)),
+        ]
+    )
+    with pytest.raises(SecretsError, match=r"b\.key"):
+        secrets.sync(config)
+    assert runner.find("docker mcp secret set a.key")
+    assert secrets.SyncState.load().digest_of("a.key") == secrets.digest("1")
+
+
 def test_only_filters_the_sync(runner, tmp_path: Path) -> None:
     runner.expect(r"docker mcp secret ls", SECRET_LS)
     a = _write_secret_file(tmp_path / "a", "1")
@@ -393,6 +448,53 @@ def test_unreferenced_secrets_are_absent_from_the_index(tmp_path: Path) -> None:
     ws.mkdir()
     _bind(ws, Manifest(project="alpha", profile="dev"))
     assert secrets.usage_index() == {}
+
+
+def _write_secrets_yaml(body: str) -> Path:
+    from abox import paths
+
+    path = paths.secrets_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_a_mapping_that_would_recreate_the_secret_is_in_the_index() -> None:
+    """`abox secrets rm` gates on this index. A mapping left in secrets.yaml is
+    re-pushed by the very next `abox secrets sync`, so a removal that ignores it
+    is not a revocation — it is a revocation that undoes itself."""
+    _write_secrets_yaml("mappings:\n  - secret: github.pat\n    op: op://vault/gh/token\n")
+    uses = secrets.usage_index()["github.pat"]
+    assert [u.kind for u in uses] == ["mapping"]
+    assert "op://vault/gh/token" in uses[0].detail
+    assert "secrets.yaml" in uses[0].detail
+
+
+def test_an_externally_managed_mapping_is_not_a_false_refusal() -> None:
+    """`source: docker` is the one mapping sync will not re-push, so blocking on
+    it would be a standing false refusal that trains you past the gate."""
+    _write_secrets_yaml("mappings:\n  - secret: outside.key\n    source: docker\n")
+    assert secrets.usage_index() == {}
+
+
+def test_secrets_rm_refuses_a_secret_still_mapped_in_secrets_yaml(runner) -> None:
+    """The gate has to reach the command: the index is `secrets rm`'s only
+    refusal surface, so a mapping it cannot see is a mapping it cannot block."""
+    from typer.testing import CliRunner
+
+    from abox.cli import app
+
+    runner.expect(r"docker mcp secret ls", "docker/mcp/github.pat | docker-pass\n")
+    _write_secrets_yaml("mappings:\n  - secret: github.pat\n    op: op://vault/gh/token\n")
+
+    result = CliRunner().invoke(app, ["secrets", "rm", "github.pat"])
+    assert result.exit_code != 0
+    assert not runner.find("docker mcp secret rm")
+    assert "still referenced by" in result.output
+
+    forced = CliRunner().invoke(app, ["secrets", "rm", "github.pat", "--force"])
+    assert forced.exit_code == 0
+    assert runner.find("docker mcp secret rm")
 
 
 def test_a_moved_project_is_reported_as_stale(tmp_path: Path) -> None:

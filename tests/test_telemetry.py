@@ -168,6 +168,58 @@ def test_counters_history_is_bounded(workspace: Path) -> None:
     assert len(telemetry.counters(workspace)["runs"]) == 200
 
 
+def _stamp(workspace: Path, run_id: str, ts: str) -> None:
+    """Give one recorded run a known timestamp — _now() has one-second
+    resolution, and 260 records land in the same second."""
+    path = paths.project_state_dir(workspace) / telemetry.FW_COUNTERS
+    history = json.loads(path.read_text(encoding="utf-8"))
+    assert run_id in history["runs"], f"{run_id} was evicted by the write that recorded it"
+    history["runs"][run_id]["ts"] = ts
+    path.write_text(json.dumps(history, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def test_counters_history_evicts_the_oldest_runs_not_a_random_slice(workspace: Path) -> None:
+    """Run ids are random hex, so bounding the file by sorting the *keys* threw
+    away an arbitrary slice of the newest runs — sometimes the one just
+    written — and kept months-old ones in their place."""
+    import hashlib
+
+    paths.ensure_project_state(workspace)
+    # The same shape new_run_id() produces: eight hex chars, no relation to time.
+    ids = [hashlib.sha256(str(i).encode()).hexdigest()[:8] for i in range(260)]
+    for i, run_id in enumerate(ids):
+        telemetry.record_counters(
+            workspace, run_id, telemetry.parse_iptables_counters(IPTABLES)
+        )
+        _stamp(workspace, run_id, f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z")
+    kept = telemetry.counters(workspace)["runs"]
+    assert set(kept) == set(ids[-200:])
+
+
+def test_a_failed_counter_read_does_not_persist_as_zero_drops(workspace: Path) -> None:
+    """This is what the runner builds when `docker exec … iptables -L` fails.
+    Serialised without that fact it is indistinguishable from a run the firewall
+    never had to refuse — a zero presented as evidence of a clean run."""
+    paths.ensure_project_state(workspace)
+    failed = telemetry.FirewallCounters(raw="Error: No such container: abox-demo-dev")
+    assert not failed.read_ok
+    telemetry.record_counters(workspace, "run1", failed)
+    stored = telemetry.counters(workspace)["runs"]["run1"]
+    assert stored["read_ok"] is False
+    assert "No such container" in stored["error"]
+
+
+def test_a_real_counter_read_is_recorded_as_read(workspace: Path) -> None:
+    """The positive path through the same field: a counter that was genuinely
+    read must not be indistinguishable from one that was not."""
+    paths.ensure_project_state(workspace)
+    telemetry.record_counters(workspace, "run1", telemetry.parse_iptables_counters(IPTABLES))
+    stored = telemetry.counters(workspace)["runs"]["run1"]
+    assert stored["read_ok"] is True
+    assert stored["error"] == ""
+    assert stored["dropped_packets"] == 7
+
+
 def test_reset_current_run_clears_the_previous_run(workspace: Path) -> None:
     paths.ensure_project_state(workspace)
     stale = paths.current_run_dir(workspace) / "dns.log"
